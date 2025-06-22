@@ -1,0 +1,367 @@
+#!/usr/bin/swift
+
+// A really really basic macOS desktop pomodoro timer, inspired by Tomighty.
+//
+// You can execute this file directly (no need to compile, or use Xcode).
+//
+//   $ ./pomodoro
+//
+// Features:
+//   - Small timer, always visible in macOS menu bar
+//   - Start/stop timer anytime with global shortcut
+//   - Customizable countdown duration with sounds at start/end
+// 
+// Developed in 7 minutes using ChatGPT. The remaining 18 minutes spent
+// packaging up it up and publishing to GitHub.
+//
+// - Joe Walnes
+
+import Cocoa
+import Foundation
+
+// AIDEV-NOTE: User Configuration - Easy to modify settings
+// ========================================================
+
+struct PomodoroConfig {
+    // Timer Duration (can be overridden by CLI args) - stored in seconds for precision
+    static var pomodoroSeconds = 25 * 60         // Pomodoro session length in seconds
+    static var warningSeconds = 2 * 60           // Warning threshold in seconds (when to show orange)
+    
+    // Global Keyboard Shortcut (standard macOS approach)
+    static let shortcutKey = "p"                 // Key character
+    static let shortcutModifiers: NSEvent.ModifierFlags = [.control, .command]  // Modifier keys
+    // Examples: [.command], [.control, .command], [.option, .command], [.shift, .command]
+    
+    // Sound Settings
+    static let startSoundName = "Glass"          // Sound when timer starts
+    static let endSoundName = "Funk"             // Sound when timer ends
+    static let enableSounds = true               // Enable/disable all sounds
+    
+    // Display Settings
+    static let showSecondsInMenuBar = true       // Show seconds (MM:SS) or just minutes (MM)
+    static let menuBarPrefix = ""                // Text prefix for menu bar display (e.g., "🍅 ")
+    
+    // Color Settings (work in both light and dark mode) - prioritize warning/finished visibility
+    static let stoppedColor = NSColor.secondaryLabelColor     // Grayed out
+    static let runningColor = NSColor.systemGreen             // Subtle green (less attention-grabbing)
+    static let warningColor = NSColor.systemOrange            // Bright orange (more prominent)
+    static let finishedColor = NSColor.systemRed              // Bright red (most prominent)
+    
+    // Alternative color schemes (uncomment to try):
+    // Option 1: More muted running state
+    // static let runningColor = NSColor.systemBlue             // Calm blue
+    
+    // Option 2: Very subtle running state  
+    // static let runningColor = NSColor.labelColor             // Default text color (very subtle)
+    
+    // Option 3: Warmer palette
+    // static let runningColor = NSColor.systemTeal             // Calm teal
+    // static let warningColor = NSColor.systemYellow           // Bright yellow warning
+    // static let finishedColor = NSColor.systemRed             // Red alert
+}
+
+enum TimerState {
+    case stopped    // Initial state, grayed out
+    case running    // Timer is counting down, yellow
+    case warning    // <= warning threshold, orange
+    case finished   // Timer completed, red
+}
+
+class PomodoroTimerApp: NSObject, NSApplicationDelegate {
+    var statusItem: NSStatusItem!
+    var timer: Timer?
+    var timeRemaining: Int = PomodoroConfig.pomodoroSeconds
+    var timerState: TimerState = .stopped
+    static var shared: PomodoroTimerApp?
+    
+    override init() {
+        super.init()
+        
+        // Parse command line arguments
+        parseCommandLineArgs()
+        
+        // Update timeRemaining with potentially new config
+        timeRemaining = PomodoroConfig.pomodoroSeconds
+        
+        PomodoroTimerApp.shared = self
+        
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        updateDisplay()
+        
+        // Use monospace font to prevent width jumping during countdown
+        if let button = statusItem.button {
+            button.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        }
+        
+        let menu = NSMenu()
+        
+        // Create menu item with proper macOS shortcut display
+        let toggleItem = NSMenuItem(title: "Start/Stop Timer", action: #selector(toggleTimer), keyEquivalent: PomodoroConfig.shortcutKey)
+        toggleItem.keyEquivalentModifierMask = PomodoroConfig.shortcutModifiers
+        menu.addItem(toggleItem)
+        
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
+        statusItem.menu = menu
+
+        // Global shortcut monitoring (works system-wide when app is not active)
+        NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { (event) in
+            if event.charactersIgnoringModifiers == PomodoroConfig.shortcutKey &&
+               event.modifierFlags.contains(PomodoroConfig.shortcutModifiers) {
+                self.toggleTimer()
+            }
+        }
+        
+        // Local event monitor (handles events when app is active, prevents terminal output)
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { (event) in
+            if event.charactersIgnoringModifiers == PomodoroConfig.shortcutKey &&
+               event.modifierFlags.contains(PomodoroConfig.shortcutModifiers) {
+                self.toggleTimer()
+                return nil  // Consume the event to prevent terminal output
+            }
+            return event  // Pass through other events
+        }
+
+        // Set up signal handling for Ctrl-C
+        setupSignalHandler()
+    }
+    
+    @objc func toggleTimer() {
+        switch timerState {
+        case .stopped:
+            startTimer()
+        case .running, .warning:
+            stopTimer()
+        case .finished:
+            resetTimer()
+        }
+    }
+    
+    func startTimer() {
+        if PomodoroConfig.enableSounds {
+            playSound(named: PomodoroConfig.startSoundName)
+        }
+        timeRemaining = PomodoroConfig.pomodoroSeconds
+        timerState = .running
+        timer = Timer.scheduledTimer(timeInterval: 1.0, target: self, selector: #selector(updateTimer), userInfo: nil, repeats: true)
+        updateDisplay()
+    }
+    
+    func stopTimer() {
+        timer?.invalidate()
+        timer = nil
+        timerState = .stopped
+        timeRemaining = PomodoroConfig.pomodoroSeconds
+        updateDisplay()
+    }
+    
+    func resetTimer() {
+        timerState = .stopped
+        timeRemaining = PomodoroConfig.pomodoroSeconds
+        updateDisplay()
+    }
+    
+    @objc func updateTimer() {
+        timeRemaining -= 1
+        
+        // Update state based on time remaining
+        let warningThreshold = PomodoroConfig.warningSeconds
+        if timeRemaining <= 0 {
+            // Timer finished
+            timer?.invalidate()
+            timer = nil
+            timerState = .finished
+            timeRemaining = 0
+            if PomodoroConfig.enableSounds {
+                playSound(named: PomodoroConfig.endSoundName)
+            }
+        } else if timeRemaining <= warningThreshold {
+            timerState = .warning
+        } else {
+            timerState = .running
+        }
+        
+        updateDisplay()
+    }
+    
+    func formatTime(_ seconds: Int) -> String {
+        let minutes = seconds / 60
+        let remainingSeconds = seconds % 60
+        
+        let timeString = if PomodoroConfig.showSecondsInMenuBar {
+            String(format: "%02d:%02d", minutes, remainingSeconds)
+        } else {
+            String(format: "%02d", minutes)
+        }
+        
+        return PomodoroConfig.menuBarPrefix + timeString
+    }
+    
+    func updateDisplay() {
+        statusItem.button?.title = formatTime(timeRemaining)
+        
+        // Set color based on timer state
+        let color = switch timerState {
+        case .stopped: PomodoroConfig.stoppedColor
+        case .running: PomodoroConfig.runningColor
+        case .warning: PomodoroConfig.warningColor
+        case .finished: PomodoroConfig.finishedColor
+        }
+        
+        if let button = statusItem.button {
+            button.attributedTitle = NSAttributedString(
+                string: button.title,
+                attributes: [.foregroundColor: color]
+            )
+        }
+    }
+    
+    func parseCommandLineArgs() {
+        let args = CommandLine.arguments
+        var i = 1
+        
+        while i < args.count {
+            let arg = args[i]
+            
+            switch arg {
+            case "-h", "--help":
+                showHelp()
+                exit(0)
+            case "-d", "--duration":
+                if i + 1 < args.count {
+                    if let duration = parseDuration(args[i + 1]) {
+                        PomodoroConfig.pomodoroSeconds = duration
+                        i += 1
+                    } else {
+                        print("Error: Invalid duration format. Use formats like '25m', '90s', '1.5m'")
+                        exit(1)
+                    }
+                } else {
+                    print("Error: --duration requires a value")
+                    exit(1)
+                }
+            case "-w", "--warning":
+                if i + 1 < args.count {
+                    if let warning = parseDuration(args[i + 1]) {
+                        PomodoroConfig.warningSeconds = warning
+                        i += 1
+                    } else {
+                        print("Error: Invalid warning format. Use formats like '2m', '30s'")
+                        exit(1)
+                    }
+                } else {
+                    print("Error: --warning requires a value")
+                    exit(1)
+                }
+            default:
+                if arg.hasPrefix("-") {
+                    print("Error: Unknown option \(arg)")
+                    showHelp()
+                    exit(1)
+                }
+            }
+            i += 1
+        }
+    }
+    
+    func parseDuration(_ input: String) -> Int? {
+        let trimmed = input.trimmingCharacters(in: .whitespaces).lowercased()
+        
+        if trimmed.hasSuffix("m") {
+            // Minutes: "25m" or "1.5m"
+            let numberPart = String(trimmed.dropLast())
+            if let minutes = Double(numberPart) {
+                return Int(minutes * 60)
+            }
+        } else if trimmed.hasSuffix("s") {
+            // Seconds: "90s"
+            let numberPart = String(trimmed.dropLast())
+            if let seconds = Int(numberPart) {
+                return seconds
+            }
+        } else if let minutes = Double(trimmed) {
+            // Plain number, assume minutes
+            return Int(minutes * 60)
+        }
+        
+        return nil
+    }
+    
+    func showHelp() {
+        print("""
+        pomodoro - macOS menu bar Pomodoro timer
+        
+        Usage: pomodoro [options]
+        
+        Options:
+          -h, --help               Show this help
+          -d, --duration <time>    Timer duration (default: 25m)
+          -w, --warning <time>     Warning threshold (default: 2m)
+        
+        Time formats:
+          25m      25 minutes
+          90s      90 seconds  
+          1.5m     1.5 minutes (90 seconds)
+          30       30 minutes (plain number)
+        
+        Examples:
+          pomodoro                    # Standard 25-minute timer
+          pomodoro -d 45m             # 45-minute timer
+          pomodoro -d 5s -w 2s        # 5-second timer for testing
+          pomodoro -d 1.5m -w 30s     # 90-second timer, 30s warning
+          pomodoro &                  # Run in background (recommended)
+        
+        Controls:
+          Ctrl+Cmd+P    Start/stop/reset timer (works globally)
+          Menu click    Access timer controls
+          Ctrl+C        Quit (when running in foreground)
+        
+        Note: Run with '&' to avoid terminal interference with global shortcuts
+        """)
+    }
+    
+    @objc func quit() {
+        NSApplication.shared.terminate(self)
+    }
+    
+    func playSound(named name: String) {
+        if let sound = NSSound(named: NSSound.Name(name)) {
+            sound.play()
+        }
+    }
+}
+
+// Function to handle SIGINT signal
+func handleInterrupt(signal: Int32) {
+    if let app = PomodoroTimerApp.shared {
+        app.quit()
+    }
+}
+
+// Global function to set up signal handler
+func setupSignalHandler() {
+    signal(SIGINT, handleInterrupt)
+}
+
+let app = NSApplication.shared
+let delegate = PomodoroTimerApp()
+app.delegate = delegate
+
+// Set app as accessory (no dock icon, works better as menu bar only tool)
+app.setActivationPolicy(.accessory)
+
+// Check accessibility permissions and provide usage guidance
+if AXIsProcessTrusted() {
+    print("✓ Pomodoro timer started")
+    print("  Use Ctrl+Cmd+P to start/stop timer globally")
+    print("  Click the menu bar timer for options")
+    print("  Ctrl+C to quit")
+    print()
+    print("💡 Tip: Run in background with './macos/pomodoro &' to avoid terminal interference")
+} else {
+    print("⚠️  Accessibility permissions needed for global shortcuts")
+    print("   Go to: System Preferences → Security & Privacy → Privacy → Accessibility")
+    print("   Add this application to allow global keyboard monitoring")
+}
+
+app.run()
