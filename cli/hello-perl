@@ -1,0 +1,103 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use Getopt::Long qw(GetOptions);
+use Pod::Usage qw(pod2usage);
+use POSIX qw(strftime);
+
+# AIDEV-NOTE: Example Perl CLI tool demonstrating Onesies single-file principle
+# Uses only core Perl modules that come with Git's bundled perl
+
+our $VERSION = '1.0.0';
+
+sub main {
+    my %opts = (
+        help      => 0,
+        version   => 0,
+        uppercase => 0,
+        time      => 0,
+        name      => '',
+    );
+    
+    # Parse command line options
+    GetOptions(
+        'help|h'      => \$opts{help},
+        'version|v'   => \$opts{version},
+        'uppercase|u' => \$opts{uppercase},
+        'time|t'      => \$opts{time},
+    ) or pod2usage(2);
+    
+    # Handle help and version
+    pod2usage(1) if $opts{help};
+    
+    if ($opts{version}) {
+        print "hello-perl version $VERSION\n";
+        exit 0;
+    }
+    
+    # Get name from remaining arguments or default to current user
+    $opts{name} = shift @ARGV || $ENV{USER} || $ENV{USERNAME} || getlogin() || 'User';
+    
+    # Check for extra arguments
+    if (@ARGV) {
+        die "Error: Multiple names provided. Only one name allowed.\n";
+    }
+    
+    # Build greeting message
+    my $greeting = "Hello, $opts{name}!";
+    
+    # Add timestamp if requested
+    if ($opts{time}) {
+        my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
+        $greeting .= " (at $timestamp)";
+    }
+    
+    # Convert to uppercase if requested
+    if ($opts{uppercase}) {
+        $greeting = uc($greeting);
+    }
+    
+    print "$greeting\n";
+}
+
+# Run main function if script is executed directly
+main() unless caller;
+
+__END__
+
+=head1 NAME
+
+hello-perl - A simple greeting tool written in Perl
+
+=head1 SYNOPSIS
+
+hello-perl [OPTIONS] [NAME]
+
+ Options:
+   -h, --help      Show this help message
+   -v, --version   Show version information
+   -u, --uppercase Convert greeting to uppercase
+   -t, --time      Include current time in greeting
+
+=head1 DESCRIPTION
+
+A simple greeting tool that demonstrates the Onesies single-file principle.
+Written in Perl using only core modules bundled with Git.
+
+=head1 EXAMPLES
+
+ hello-perl                    # Greet the current user
+ hello-perl Alice              # Greet Alice
+ hello-perl -u Bob             # Greet Bob in uppercase
+ hello-perl -t Charlie         # Greet Charlie with timestamp
+ hello-perl --help             # Show help message
+
+=head1 AUTHOR
+
+Generated as part of the Onesies project
+
+=head1 VERSION
+
+Version 1.0.0
+
+=cut

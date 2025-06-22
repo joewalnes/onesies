@@ -1,0 +1,96 @@
+#!/bin/bash
+set -euo pipefail
+
+# AIDEV-NOTE: Example CLI tool demonstrating Onesies single-file principle
+# Simple greeting tool that follows Unix philosophy
+
+VERSION="1.0.0"
+
+show_help() {
+    cat << EOF
+hello - A simple greeting tool
+
+USAGE:
+    hello [OPTIONS] [NAME]
+
+OPTIONS:
+    -h, --help      Show this help message
+    -v, --version   Show version information
+    -u, --uppercase Convert greeting to uppercase
+    -t, --time      Include current time in greeting
+
+EXAMPLES:
+    hello                    # Greet the current user
+    hello Alice              # Greet Alice
+    hello -u Bob             # Greet Bob in uppercase
+    hello -t Charlie         # Greet Charlie with timestamp
+
+EOF
+}
+
+show_version() {
+    echo "hello version $VERSION"
+}
+
+main() {
+    local name=""
+    local uppercase=false
+    local include_time=false
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -v|--version)
+                show_version
+                exit 0
+                ;;
+            -u|--uppercase)
+                uppercase=true
+                shift
+                ;;
+            -t|--time)
+                include_time=true
+                shift
+                ;;
+            -*)
+                echo "Error: Unknown option $1" >&2
+                echo "Use 'hello --help' for usage information." >&2
+                exit 1
+                ;;
+            *)
+                if [[ -z "$name" ]]; then
+                    name="$1"
+                else
+                    echo "Error: Multiple names provided. Only one name allowed." >&2
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    if [[ -z "$name" ]]; then
+        name="${USER:-$(whoami)}"
+    fi
+    
+    local greeting="Hello, $name!"
+    
+    if [[ "$include_time" == true ]]; then
+        local timestamp
+        timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+        greeting="$greeting (at $timestamp)"
+    fi
+    
+    if [[ "$uppercase" == true ]]; then
+        greeting=$(echo "$greeting" | tr '[:lower:]' '[:upper:]')
+    fi
+    
+    echo "$greeting"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

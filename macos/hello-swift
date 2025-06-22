@@ -1,0 +1,202 @@
+#!/usr/bin/swift
+
+// AIDEV-NOTE: Example Swift macOS tool demonstrating Onesies single-file principle
+// Creates a native Cocoa app window with greeting interface
+
+import Cocoa
+import Foundation
+
+class HelloApp: NSObject, NSApplicationDelegate {
+    var window: NSWindow!
+    var nameField: NSTextField!
+    var timeCheckbox: NSButton!
+    var uppercaseCheckbox: NSButton!
+    var greetingLabel: NSTextField!
+    
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        setupWindow()
+        parseCommandLineArgs()
+    }
+    
+    func setupWindow() {
+        // Create main window
+        let windowRect = NSRect(x: 100, y: 100, width: 400, height: 300)
+        window = NSWindow(
+            contentRect: windowRect,
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Hello - Onesies Swift Tool"
+        window.center()
+        
+        // Create content view
+        let contentView = NSView(frame: windowRect)
+        window.contentView = contentView
+        
+        // Title label
+        let titleLabel = NSTextField(labelWithString: "👋 Hello Tool")
+        titleLabel.font = NSFont.boldSystemFont(ofSize: 18)
+        titleLabel.frame = NSRect(x: 20, y: 240, width: 360, height: 25)
+        titleLabel.alignment = .center
+        contentView.addSubview(titleLabel)
+        
+        // Name input
+        let nameLabel = NSTextField(labelWithString: "Name:")
+        nameLabel.frame = NSRect(x: 20, y: 200, width: 60, height: 20)
+        contentView.addSubview(nameLabel)
+        
+        nameField = NSTextField(frame: NSRect(x: 90, y: 200, width: 290, height: 22))
+        nameField.placeholderString = "Enter your name (or leave blank for current user)"
+        contentView.addSubview(nameField)
+        
+        // Options checkboxes
+        timeCheckbox = NSButton(checkboxWithTitle: "Include current time", target: self, action: #selector(updateGreeting))
+        timeCheckbox.frame = NSRect(x: 20, y: 160, width: 200, height: 20)
+        contentView.addSubview(timeCheckbox)
+        
+        uppercaseCheckbox = NSButton(checkboxWithTitle: "Use uppercase", target: self, action: #selector(updateGreeting))
+        uppercaseCheckbox.frame = NSRect(x: 20, y: 130, width: 200, height: 20)
+        contentView.addSubview(uppercaseCheckbox)
+        
+        // Greeting display
+        greetingLabel = NSTextField(labelWithString: "")
+        greetingLabel.font = NSFont.systemFont(ofSize: 14)
+        greetingLabel.frame = NSRect(x: 20, y: 70, width: 360, height: 40)
+        greetingLabel.alignment = .center
+        greetingLabel.backgroundColor = NSColor.controlBackgroundColor
+        greetingLabel.isEditable = false
+        greetingLabel.isSelectable = false
+        greetingLabel.cell?.wraps = true
+        contentView.addSubview(greetingLabel)
+        
+        // Greet button
+        let greetButton = NSButton(title: "Greet!", target: self, action: #selector(showGreeting))
+        greetButton.frame = NSRect(x: 160, y: 20, width: 80, height: 32)
+        greetButton.bezelStyle = .rounded
+        contentView.addSubview(greetButton)
+        
+        // Set up text field change notification
+        nameField.target = self
+        nameField.action = #selector(updateGreeting)
+        
+        // Show window
+        window.makeKeyAndOrderFront(nil)
+        
+        // Initial greeting update
+        updateGreeting()
+    }
+    
+    func parseCommandLineArgs() {
+        let args = CommandLine.arguments
+        var i = 1
+        
+        while i < args.count {
+            let arg = args[i]
+            
+            switch arg {
+            case "-h", "--help":
+                showHelp()
+                NSApp.terminate(nil)
+                return
+            case "-v", "--version":
+                print("hello-swift version 1.0.0")
+                NSApp.terminate(nil)
+                return
+            case "-t", "--time":
+                timeCheckbox.state = .on
+            case "-u", "--uppercase":
+                uppercaseCheckbox.state = .on
+            default:
+                if !arg.hasPrefix("-") && nameField.stringValue.isEmpty {
+                    nameField.stringValue = arg
+                }
+            }
+            i += 1
+        }
+        
+        updateGreeting()
+    }
+    
+    func showHelp() {
+        let helpText = """
+        hello-swift - macOS greeting tool
+        
+        Usage: hello-swift [options] [name]
+        
+        Options:
+          -h, --help      Show this help
+          -v, --version   Show version
+          -t, --time      Include current time
+          -u, --uppercase Use uppercase
+        
+        Examples:
+          hello-swift              # Show GUI with current user
+          hello-swift Alice        # Show GUI with Alice as default name
+          hello-swift -t Bob       # Show GUI with time option enabled
+          hello-swift -u Charlie   # Show GUI with uppercase option enabled
+        """
+        print(helpText)
+    }
+    
+    @objc func updateGreeting() {
+        let name = nameField.stringValue.isEmpty ? 
+            NSUserName() : nameField.stringValue
+        
+        var greeting = "Hello, \(name)!"
+        
+        if timeCheckbox.state == .on {
+            let formatter = DateFormatter()
+            formatter.dateStyle = .medium
+            formatter.timeStyle = .medium
+            let timeString = formatter.string(from: Date())
+            greeting += " (at \(timeString))"
+        }
+        
+        if uppercaseCheckbox.state == .on {
+            greeting = greeting.uppercased()
+        }
+        
+        greetingLabel.stringValue = greeting
+    }
+    
+    @objc func showGreeting() {
+        updateGreeting()
+        
+        let alert = NSAlert()
+        alert.messageText = "Greeting"
+        alert.informativeText = greetingLabel.stringValue
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+    
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        return true
+    }
+}
+
+// Signal handling for Ctrl+C
+signal(SIGINT) { _ in
+    print("\nReceived SIGINT, terminating...")
+    NSApp.terminate(nil)
+}
+
+signal(SIGTERM) { _ in
+    print("\nReceived SIGTERM, terminating...")
+    NSApp.terminate(nil)
+}
+
+// Create and run the application
+let app = NSApplication.shared
+let delegate = HelloApp()
+app.delegate = delegate
+
+// Prevent dock icon if running from terminal
+if CommandLine.arguments.contains("--no-dock") || ProcessInfo.processInfo.environment["TERM"] != nil {
+    app.setActivationPolicy(.accessory)
+} else {
+    app.setActivationPolicy(.regular)
+}
+
+app.run()
