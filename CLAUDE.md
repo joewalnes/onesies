@@ -113,3 +113,10 @@ Add specially formatted comments throughout the codebase, where appropriate, for
 - Keep screenshots in dedicated directory to maintain clean repo structure
 - Use "Featured Tools" section to highlight main capabilities
 - Always update README.md with new tool entries (per existing requirements)
+
+**5. Code Migration Patterns**
+- Always add comprehensive configuration section at top when migrating existing tools
+- Preserve original functionality while applying Onesies standards
+- Add AIDEV-NOTE comments to mark configuration sections
+- Include startup guidance messages for better user onboarding
+- Use accessory app policy for menu bar tools (no dock icon)
