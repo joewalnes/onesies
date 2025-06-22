@@ -84,3 +84,32 @@ Add specially formatted comments throughout the codebase, where appropriate, for
 ## Configuration Best Practices
 
 - In each script, ensure config a user may want to change is towards the top, and easy to understand. for example, key bindings, default values, timeouts, etc.
+
+## Development Process Requirements
+
+**CRITICAL**: Before any commit, you MUST update this CLAUDE.md file with lessons learned from the development process. This ensures institutional knowledge is captured and future development benefits from past experience.
+
+## General Development Lessons
+
+**1. Configuration Architecture**
+- Store values in their base units to avoid precision loss
+- Use `var` instead of `let` for CLI-configurable values
+- Group related config in a clear struct/section at the top of the file
+- Provide commented examples of alternative configurations
+
+**2. CLI Design Patterns**
+- Always include testing-friendly options for development (short durations, quick iterations)
+- Use flexible input parsing (multiple formats: 25m, 90s, 1.5m)
+- Provide comprehensive help with usage examples
+- Give immediate feedback on configuration parsing errors
+
+**3. User Experience**
+- Use monospace fonts for displays that change frequently to prevent UI jumping
+- Apply clear visual hierarchy (muted for normal, bright for important states)
+- Include startup messages that guide proper usage patterns
+- Make help text include best practices for the tool type
+
+**4. Documentation Structure**
+- Keep screenshots in dedicated directory to maintain clean repo structure
+- Use "Featured Tools" section to highlight main capabilities
+- Always update README.md with new tool entries (per existing requirements)
