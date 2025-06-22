@@ -1,0 +1,152 @@
+#!/usr/bin/swift
+
+// Multi-timezone display in macOS menu bar
+//
+// Shows multiple timezones in a compact menu bar widget with 2x2 grid layout.
+// Useful for distributed teams working across different time zones.
+//
+// Features:
+//   - Compact display showing 4 timezones in menu bar
+//   - Updates every second for accurate time
+//   - Customizable timezone list and display format
+//   - Clean monospace font for consistent spacing
+
+import Cocoa
+
+// AIDEV-NOTE: User Configuration - Easy to modify settings
+// ========================================================
+
+struct TimezoneConfig {
+    // Timezone Display List (short alias, timezone identifier)
+    static var timezones = [
+        ("SF", "America/Los_Angeles"),       // San Francisco / West Coast
+        ("CH", "America/Chicago"),           // Chicago / Central Time
+        ("NY", "America/New_York"),          // New York / East Coast
+        ("UK", "Europe/London")              // London / UK
+    ]
+    
+    // Display Settings
+    static let updateInterval: TimeInterval = 1.0     // Update frequency in seconds
+    static let displayWidth: CGFloat = 160            // Menu bar widget width
+    static let displayHeight: CGFloat = 22            // Menu bar widget height
+    static let fontSize: CGFloat = 9                  // Font size for time display
+    static let lineHeight: CGFloat = 11               // Spacing between time lines
+    
+    // Time Format Settings
+    static let timeFormat = "hh:mm:ss a"              // 12-hour format with AM/PM
+    // Alternative formats:
+    // "HH:mm:ss"        // 24-hour format
+    // "hh:mm a"         // 12-hour without seconds
+    // "HH:mm"           // 24-hour without seconds
+    
+    // Alternative timezone examples (uncomment and modify as needed):
+    // static var timezones = [
+    //     ("LA", "America/Los_Angeles"),
+    //     ("NY", "America/New_York"), 
+    //     ("LD", "Europe/London"),
+    //     ("TK", "Asia/Tokyo")
+    // ]
+}
+
+class TimeZoneView: NSView {
+    var timeStrings: [String] = []
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+
+        let font = NSFont(name: "Menlo", size: TimezoneConfig.fontSize) ?? NSFont.monospacedDigitSystemFont(ofSize: TimezoneConfig.fontSize, weight: .regular)
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.labelColor
+        ]
+
+        let totalHeight = TimezoneConfig.lineHeight * 2
+        let yOffset = (bounds.height - totalHeight) / 2
+
+        for (index, timeString) in timeStrings.enumerated() {
+            let x: CGFloat = index % 2 == 0 ? 2 : bounds.width / 2 + 2
+            let y = yOffset + (index < 2 ? TimezoneConfig.lineHeight : 0)
+
+            let attrString = NSAttributedString(string: timeString, attributes: attributes)
+            attrString.draw(at: NSPoint(x: x, y: y))
+        }
+    }
+}
+
+class StatusBarController {
+    private var statusItem: NSStatusItem
+    private var timer: Timer?
+    private var timeZoneView: TimeZoneView
+
+    init() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        timeZoneView = TimeZoneView(frame: NSRect(x: 0, y: 0, width: TimezoneConfig.displayWidth, height: TimezoneConfig.displayHeight))
+        statusItem.button?.addSubview(timeZoneView)
+
+        setupMenu()
+        updateTime()
+        timer = Timer.scheduledTimer(withTimeInterval: TimezoneConfig.updateInterval, repeats: true) { _ in self.updateTime() }
+    }
+
+    private func setupMenu() {
+        let menu = NSMenu()
+        
+        // Add timezone info to menu
+        menu.addItem(NSMenuItem(title: "Timezones Display", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem.separator())
+        
+        for (alias, identifier) in TimezoneConfig.timezones {
+            let timeZone = TimeZone(identifier: identifier)
+            let abbreviation = timeZone?.abbreviation() ?? "???"
+            menu.addItem(NSMenuItem(title: "\(alias): \(identifier) (\(abbreviation))", action: nil, keyEquivalent: ""))
+        }
+        
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        statusItem.menu = menu
+    }
+
+    private func updateTime() {
+        let formatter = DateFormatter()
+        formatter.dateFormat = TimezoneConfig.timeFormat
+        let times = TimezoneConfig.timezones.compactMap { (label, timezone) -> String? in
+            guard let timeZone = TimeZone(identifier: timezone) else { return nil }
+            formatter.timeZone = timeZone
+            return "\(label) \(formatter.string(from: Date()))"
+        }
+
+        timeZoneView.timeStrings = times
+        timeZoneView.setNeedsDisplay(timeZoneView.bounds)
+
+        if let button = statusItem.button {
+            button.frame.size.width = timeZoneView.frame.width
+        }
+    }
+}
+
+class AppDelegate: NSObject, NSApplicationDelegate {
+    var statusBarController: StatusBarController?
+    
+    func applicationDidFinishLaunching(_ aNotification: Notification) {
+        statusBarController = StatusBarController()
+        
+        print("✓ Timezone display started")
+        print("  Showing \(TimezoneConfig.timezones.count) timezones in menu bar")
+        print("  Click menu bar display for timezone details")
+        print("  Ctrl+C to quit")
+    }
+}
+
+// Signal handling for clean Ctrl+C termination
+signal(SIGINT) { _ in NSApplication.shared.terminate(nil) }
+
+let app = NSApplication.shared
+let delegate = AppDelegate()
+app.delegate = delegate
+
+// Set as accessory app (no dock icon, menu bar only)
+app.setActivationPolicy(.accessory)
+
+app.run()

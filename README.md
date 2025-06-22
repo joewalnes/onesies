@@ -123,6 +123,7 @@ When adding new tools:
 - **`hello`** - AppleScript greeting with dialog interface and argument parsing
 - **`hello-swift`** - Native Cocoa app with GUI form, checkboxes, and real-time greeting updates
 - **`pomodoro`** - Menu bar Pomodoro timer with color-coded states, global shortcuts, and CLI options for testing
+- **`timezones`** - Menu bar multi-timezone display with 2x2 grid layout and customizable timezone list
 
 ### Userscripts
 
