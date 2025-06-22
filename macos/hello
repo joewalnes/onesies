@@ -1,0 +1,86 @@
+#!/usr/bin/osascript
+
+-- AIDEV-NOTE: Example macOS tool demonstrating Onesies single-file principle
+-- Simple greeting dialog that can be run from terminal
+
+on run argv
+    -- Parse command line arguments
+    set userName to ""
+    set showTime to false
+    set useUppercase to false
+    
+    -- Simple argument parsing
+    repeat with i from 1 to count of argv
+        set arg to item i of argv
+        if arg is "-h" or arg is "--help" then
+            display dialog "hello - macOS greeting tool
+
+Usage: hello [options] [name]
+
+Options:
+  -h, --help      Show this help
+  -t, --time      Include current time
+  -u, --uppercase Use uppercase
+  
+Examples:
+  hello              # Greet current user
+  hello Alice        # Greet Alice
+  hello -t Bob       # Greet Bob with time
+  hello -u Charlie   # Greet Charlie in uppercase" with title "Hello Tool Help" buttons {"OK"} default button "OK"
+            return
+        else if arg is "-t" or arg is "--time" then
+            set showTime to true
+        else if arg is "-u" or arg is "--uppercase" then
+            set useUppercase to true
+        else if arg does not start with "-" then
+            set userName to arg
+        end if
+    end repeat
+    
+    -- Get user name if not provided
+    if userName is "" then
+        try
+            set userName to short user name of (system info)
+        on error
+            set userName to "User"
+        end try
+    end if
+    
+    -- Build greeting message
+    set greeting to "Hello, " & userName & "!"
+    
+    -- Add timestamp if requested
+    if showTime then
+        set currentTime to current date
+        set timeString to (currentTime as string)
+        set greeting to greeting & " (at " & timeString & ")"
+    end if
+    
+    -- Convert to uppercase if requested
+    if useUppercase then
+        set greeting to my toUppercase(greeting)
+    end if
+    
+    -- Show the greeting in a dialog
+    try
+        display dialog greeting with title "Hello!" buttons {"OK"} default button "OK" with icon note
+    on error number -128
+        -- User cancelled (Cmd+C or Cancel button)
+        return
+    end try
+end run
+
+-- Helper function to convert text to uppercase
+on toUppercase(theText)
+    set upperText to ""
+    repeat with i from 1 to length of theText
+        set theChar to character i of theText
+        set charCode to ASCII number theChar
+        if charCode ≥ 97 and charCode ≤ 122 then
+            set upperText to upperText & (ASCII character (charCode - 32))
+        else
+            set upperText to upperText & theChar
+        end if
+    end repeat
+    return upperText
+end toUppercase
