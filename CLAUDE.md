@@ -80,3 +80,7 @@ Add specially formatted comments throughout the codebase, where appropriate, for
   * very important, or
   * confusing, or
   * could have a bug
+
+## Configuration Best Practices
+
+- In each script, ensure config a user may want to change is towards the top, and easy to understand. for example, key bindings, default values, timeouts, etc.

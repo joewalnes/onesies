@@ -6,6 +6,31 @@ A collection of self-contained, single-file tools for everyday computing tasks.
 
 Each tool in this repository follows a simple principle: **one file, one tool, no dependencies**. Every tool can be installed by copying a single file to your system.
 
+## Featured Tools
+
+### 🍅 Pomodoro Timer
+
+A menu bar Pomodoro timer with customizable durations, color-coded states, and global shortcuts.
+
+<img src="screenshots/pomodoro-original.png" alt="Pomodoro Timer in macOS menu bar" width="300">
+
+**Features:**
+- Color-coded states: Gray (stopped) → Green (running) → Orange (warning) → Red (finished)
+- Global shortcut (Ctrl+Cmd+P) works system-wide
+- Customizable timer duration and warning threshold
+- Sound notifications at start/end
+- CLI options for testing: `./macos/pomodoro -d 5s -w 2s`
+
+**Usage:**
+```bash
+# Standard 25-minute timer
+./macos/pomodoro
+
+# Custom durations for testing
+./macos/pomodoro -d 5s -w 2s        # 5-second timer, 2-second warning
+./macos/pomodoro -d 45m -w 5m       # 45-minute timer, 5-minute warning
+```
+
 ## Tool Categories
 
 ### 📟 CLI Tools (`cli/`)
@@ -34,7 +59,9 @@ JavaScript snippets for enhancing web pages via browser developer console.
 - Paste and run in any browser's dev console
 - Enhance existing page functionality
 
-## Installation
+## Quick Start
+
+### Installation
 
 Copy any tool file to your system and make it executable:
 
@@ -49,6 +76,19 @@ chmod +x ~/bin/toolname
 
 # Userscripts
 # Copy and paste into browser developer console
+```
+
+### Examples
+
+```bash
+# Try the Pomodoro timer with a 10-second countdown
+./macos/pomodoro -d 10s -w 3s
+
+# Run a greeting tool
+./cli/hello Alice
+
+# Get help for any tool
+./macos/pomodoro --help
 ```
 
 ## Standard Environment
@@ -82,6 +122,7 @@ When adding new tools:
 
 - **`hello`** - AppleScript greeting with dialog interface and argument parsing
 - **`hello-swift`** - Native Cocoa app with GUI form, checkboxes, and real-time greeting updates
+- **`pomodoro`** - Menu bar Pomodoro timer with color-coded states, global shortcuts, and CLI options for testing
 
 ### Userscripts
 
