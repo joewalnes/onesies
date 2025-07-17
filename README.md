@@ -1,6 +1,12 @@
 # Onesies
+*Joe's collection of onesies. Command line tools, macOS desktop apps, and web-apps. Mostly built with AI.*
 
-A collection of self-contained, single-file tools for everyday computing tasks.
+
+### `onesie`  
+**_noun_**  /ˈwən-zē/
+
+**Definition:**  
+A standalone program written in a single file that performs a specific utility without requiring compilation, external dependencies, or additional setup. A _onesie_ can be copied and run on a new machine as-is, making it ideal for portability and simplicity.
 
 ## Philosophy
 
