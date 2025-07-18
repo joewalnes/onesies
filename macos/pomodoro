@@ -25,7 +25,6 @@ import Foundation
 struct PomodoroConfig {
     // Timer Duration (can be overridden by CLI args) - stored in seconds for precision
     static var pomodoroSeconds = 25 * 60         // Pomodoro session length in seconds
-    static var warningSeconds = 2 * 60           // Warning threshold in seconds (when to show orange)
     
     // Global Keyboard Shortcut (standard macOS approach)
     static let shortcutKey = "p"                 // Key character
@@ -41,11 +40,10 @@ struct PomodoroConfig {
     static let showSecondsInMenuBar = true       // Show seconds (MM:SS) or just minutes (MM)
     static let menuBarPrefix = ""                // Text prefix for menu bar display (e.g., "🍅 ")
     
-    // Color Settings (work in both light and dark mode) - prioritize warning/finished visibility
+    // Color Settings (work in both light and dark mode) 
     static let stoppedColor = NSColor.secondaryLabelColor     // Grayed out
-    static let runningColor = NSColor.systemGreen             // Subtle green (less attention-grabbing)
-    static let warningColor = NSColor.systemOrange            // Bright orange (more prominent)
-    static let finishedColor = NSColor.systemRed              // Bright red (most prominent)
+    static let runningColor = NSColor.systemGreen             // Green when running
+    static let finishedColor = NSColor.systemRed              // Red flash when finished
     
     // Alternative color schemes (uncomment to try):
     // Option 1: More muted running state
@@ -62,16 +60,17 @@ struct PomodoroConfig {
 
 enum TimerState {
     case stopped    // Initial state, grayed out
-    case running    // Timer is counting down, yellow
-    case warning    // <= warning threshold, orange
-    case finished   // Timer completed, red
+    case running    // Timer is counting down, green
+    case finished   // Timer completed, red flash then grey
 }
 
 class PomodoroTimerApp: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var timer: Timer?
+    var flashTimer: Timer?
     var timeRemaining: Int = PomodoroConfig.pomodoroSeconds
     var timerState: TimerState = .stopped
+    var isFlashing: Bool = false
     static var shared: PomodoroTimerApp?
     
     override init() {
@@ -130,10 +129,10 @@ class PomodoroTimerApp: NSObject, NSApplicationDelegate {
         switch timerState {
         case .stopped:
             startTimer()
-        case .running, .warning:
+        case .running:
             stopTimer()
         case .finished:
-            resetTimer()
+            startTimer()
         }
     }
     
@@ -150,6 +149,9 @@ class PomodoroTimerApp: NSObject, NSApplicationDelegate {
     func stopTimer() {
         timer?.invalidate()
         timer = nil
+        flashTimer?.invalidate()
+        flashTimer = nil
+        isFlashing = false
         timerState = .stopped
         timeRemaining = PomodoroConfig.pomodoroSeconds
         updateDisplay()
@@ -161,11 +163,32 @@ class PomodoroTimerApp: NSObject, NSApplicationDelegate {
         updateDisplay()
     }
     
+    func startFlashing() {
+        isFlashing = true
+        flashTimer = Timer.scheduledTimer(timeInterval: 0.5, target: self, selector: #selector(flashDisplay), userInfo: nil, repeats: true)
+        
+        // Stop flashing after 3 seconds and switch to grey
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+            self.stopFlashing()
+        }
+    }
+    
+    @objc func flashDisplay() {
+        isFlashing.toggle()
+        updateDisplay()
+    }
+    
+    func stopFlashing() {
+        flashTimer?.invalidate()
+        flashTimer = nil
+        isFlashing = false
+        updateDisplay()
+    }
+    
     @objc func updateTimer() {
         timeRemaining -= 1
         
         // Update state based on time remaining
-        let warningThreshold = PomodoroConfig.warningSeconds
         if timeRemaining <= 0 {
             // Timer finished
             timer?.invalidate()
@@ -175,8 +198,7 @@ class PomodoroTimerApp: NSObject, NSApplicationDelegate {
             if PomodoroConfig.enableSounds {
                 playSound(named: PomodoroConfig.endSoundName)
             }
-        } else if timeRemaining <= warningThreshold {
-            timerState = .warning
+            startFlashing()
         } else {
             timerState = .running
         }
@@ -200,12 +222,18 @@ class PomodoroTimerApp: NSObject, NSApplicationDelegate {
     func updateDisplay() {
         statusItem.button?.title = formatTime(timeRemaining)
         
-        // Set color based on timer state
+        // Set color based on timer state and flashing
         let color = switch timerState {
         case .stopped: PomodoroConfig.stoppedColor
         case .running: PomodoroConfig.runningColor
-        case .warning: PomodoroConfig.warningColor
-        case .finished: PomodoroConfig.finishedColor
+        case .finished: 
+            if flashTimer != nil {
+                // Currently flashing - alternate between red and grey
+                isFlashing ? PomodoroConfig.finishedColor : PomodoroConfig.stoppedColor
+            } else {
+                // Done flashing - stay grey
+                PomodoroConfig.stoppedColor
+            }
         }
         
         if let button = statusItem.button {
@@ -238,19 +266,6 @@ class PomodoroTimerApp: NSObject, NSApplicationDelegate {
                     }
                 } else {
                     print("Error: --duration requires a value")
-                    exit(1)
-                }
-            case "-w", "--warning":
-                if i + 1 < args.count {
-                    if let warning = parseDuration(args[i + 1]) {
-                        PomodoroConfig.warningSeconds = warning
-                        i += 1
-                    } else {
-                        print("Error: Invalid warning format. Use formats like '2m', '30s'")
-                        exit(1)
-                    }
-                } else {
-                    print("Error: --warning requires a value")
                     exit(1)
                 }
             default:
@@ -296,7 +311,6 @@ class PomodoroTimerApp: NSObject, NSApplicationDelegate {
         Options:
           -h, --help               Show this help
           -d, --duration <time>    Timer duration (default: 25m)
-          -w, --warning <time>     Warning threshold (default: 2m)
         
         Time formats:
           25m      25 minutes
@@ -307,12 +321,12 @@ class PomodoroTimerApp: NSObject, NSApplicationDelegate {
         Examples:
           pomodoro                    # Standard 25-minute timer
           pomodoro -d 45m             # 45-minute timer
-          pomodoro -d 5s -w 2s        # 5-second timer for testing
-          pomodoro -d 1.5m -w 30s     # 90-second timer, 30s warning
+          pomodoro -d 5s              # 5-second timer for testing
+          pomodoro -d 1.5m            # 90-second timer
           pomodoro &                  # Run in background (recommended)
         
         Controls:
-          Ctrl+Cmd+P    Start/stop/reset timer (works globally)
+          Ctrl+Cmd+P    Start/stop/restart timer (works globally)
           Menu click    Access timer controls
           Ctrl+C        Quit (when running in foreground)
         
