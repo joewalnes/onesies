@@ -1,0 +1,1310 @@
+#!/usr/bin/swift
+
+// macOS menu bar LLM token counter
+//
+// Counts tokens used by Claude Code and OpenAI Codex CLI by acting as a
+// lightweight OpenTelemetry (OTLP) HTTP JSON receiver on localhost.
+//
+// You can execute this file directly (no need to compile, or use Xcode).
+//
+//   $ ./token-counter
+//
+// Then configure your tools to send telemetry here (see startup message).
+//
+// Features:
+//   - Menu bar display of input/output token totals with "Tokens" label
+//   - Counting animation when new tokens arrive
+//   - Persistent data across restarts (~/.config/token-counter/data.json)
+//   - Click for breakdown by tool (Claude Code vs Codex)
+//   - Activity timeline chart (hourly stacked bar chart)
+//   - Token flow chart (input/output/cache proportion bars per source)
+//   - Built-in OTLP HTTP JSON receiver (no external collector needed)
+//   - Zero dependencies beyond macOS system frameworks
+//
+// - Joe Walnes
+
+import Cocoa
+import Network
+
+// AIDEV-NOTE: User Configuration - Easy to modify settings
+// ========================================================
+
+struct TokenCounterConfig {
+    // OTLP HTTP Receiver
+    static var port: UInt16 = 4318              // Localhost port for OTLP HTTP JSON
+    // AIDEV-NOTE: Standard OTLP HTTP port is 4318. Change if it conflicts
+    // with an existing OpenTelemetry Collector on your machine.
+
+    // Persistence
+    static let dataDir = "\(NSHomeDirectory())/.config/token-counter"
+    static let dataFile = "\(NSHomeDirectory())/.config/token-counter/data.json"
+
+    // Display Settings
+    static let showCost = true                  // Show cumulative cost in menu bar
+
+    // Animation Settings
+    static let animationDuration: TimeInterval = 0.6    // Count-up animation length
+    static let animationFPS: TimeInterval = 1.0 / 30.0  // ~30 frames per second
+    // AIDEV-NOTE: Ease-out cubic gives fast start, slow finish for satisfying count-up feel
+
+    // Color Settings (work in both light and dark mode)
+    static let idleColor = NSColor.secondaryLabelColor      // Muted when no activity
+    static let activeColor = NSColor.labelColor              // Normal text when active
+    static let animatingColor = NSColor.systemCyan           // Brief flash during count-up
+    // AIDEV-NOTE: Menu bar always has dark background, so use white with alpha.
+    // NSColor.labelColor.withAlphaComponent() resolves to black in some drawing contexts.
+    static let labelColor = NSColor.white.withAlphaComponent(0.5)     // "Tokens" label
+    // Alternative animating colors:
+    // static let animatingColor = NSColor.systemGreen
+    // static let animatingColor = NSColor.systemOrange
+
+    // Layout Settings (for the custom menu bar view)
+    static let displayHeight: CGFloat = 22          // Standard menu bar height
+    static let labelFontSize: CGFloat = 7.0         // "Tokens" label - tiny
+    static let numberFontSize: CGFloat = 10.0       // Token numbers
+    static let labelYOffset: CGFloat = 13.0         // "Tokens" baseline from bottom
+    static let numberYOffset: CGFloat = 2.0         // Numbers baseline from bottom
+    static let horizontalPadding: CGFloat = 4.0     // Left/right padding
+
+    // Update interval for periodic display refresh (seconds)
+    static let displayUpdateInterval: TimeInterval = 2.0
+
+    // Debug: log raw OTLP JSON to stderr on first receive from each source
+    static let debugLogFirstPayload = false
+
+    // AIDEV-NOTE: Chart settings for menu dropdown visualizations
+    // ============================================================
+    static let chartWidth: CGFloat = 260              // Width of chart views
+    static let activityChartHeight: CGFloat = 70      // Activity bar chart height
+    static let flowChartHeight: CGFloat = 50          // Min height of token flow chart
+    static let chartHours: Int = 24                   // Hours of history in activity chart
+    static let chartBarSpacing: CGFloat = 0           // No gap — pixel-dense bars for high resolution
+    static let chartCornerRadius: CGFloat = 2         // Rounded corners on bars
+    static let chartLabelFontSize: CGFloat = 8.0      // Tiny axis labels
+
+    // Chart Colors (NSColor.system* auto-adapts to dark/light mode)
+    static let chartInputColor = NSColor.systemBlue
+    static let chartOutputColor = NSColor.systemOrange
+    static let chartCacheReadColor = NSColor.systemGreen
+    static let chartCacheCreationColor = NSColor.systemPurple
+    static let chartBarBackground = NSColor.separatorColor.withAlphaComponent(0.15)
+    static let chartLabelColor = NSColor.secondaryLabelColor
+}
+
+// AIDEV-NOTE: Data model for token tracking
+// ==========================================
+
+enum ToolSource: String, CaseIterable {
+    case claudeCode = "Claude Code"
+    case codexCLI = "Codex CLI"
+    case unknown = "Unknown"
+}
+
+struct TokenRecord {
+    let timestamp: Date
+    let source: ToolSource
+    let sessionId: String?
+    let model: String?
+    let inputTokens: Int
+    let outputTokens: Int
+    let cacheReadTokens: Int
+    let cacheCreationTokens: Int
+    let costUsd: Double
+}
+
+// AIDEV-NOTE: Token aggregation with JSON file persistence
+// ========================================================
+// Records persist to ~/.config/token-counter/data.json
+// File is written after each new record; loaded on startup.
+
+class TokenStore {
+    private(set) var records: [TokenRecord] = []
+    private(set) var lastResetDate: Date?   // When counters were last reset (nil = never)
+    var onUpdate: (() -> Void)?     // Called when records change
+
+    var totalInput: Int { records.reduce(0) { $0 + $1.inputTokens } }
+    var totalOutput: Int { records.reduce(0) { $0 + $1.outputTokens } }
+    var totalCacheRead: Int { records.reduce(0) { $0 + $1.cacheReadTokens } }
+    var totalCacheCreation: Int { records.reduce(0) { $0 + $1.cacheCreationTokens } }
+    var totalCost: Double { records.reduce(0) { $0 + $1.costUsd } }
+
+    func totals(for source: ToolSource) -> (input: Int, output: Int, cacheRead: Int, cacheCreation: Int, cost: Double) {
+        let filtered = records.filter { $0.source == source }
+        return (
+            input: filtered.reduce(0) { $0 + $1.inputTokens },
+            output: filtered.reduce(0) { $0 + $1.outputTokens },
+            cacheRead: filtered.reduce(0) { $0 + $1.cacheReadTokens },
+            cacheCreation: filtered.reduce(0) { $0 + $1.cacheCreationTokens },
+            cost: filtered.reduce(0) { $0 + $1.costUsd }
+        )
+    }
+
+    func sessionCount(for source: ToolSource) -> Int {
+        Set(records.filter { $0.source == source }.compactMap { $0.sessionId }).count
+    }
+
+    func hasRecords(for source: ToolSource) -> Bool {
+        records.contains { $0.source == source }
+    }
+
+    func add(_ record: TokenRecord) {
+        records.append(record)
+        saveToDisk()
+        onUpdate?()
+    }
+
+    func reset() {
+        records.removeAll()
+        lastResetDate = Date()
+        saveToDisk()
+        onUpdate?()
+    }
+
+    // --- Persistence ---
+
+    // AIDEV-NOTE: Persistence format is {"records": [...], "lastReset": "ISO8601"}.
+    // Backward-compatible: if the top-level JSON is a plain array, treat it as old format.
+    func loadFromDisk() {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: TokenCounterConfig.dataFile)),
+              let json = try? JSONSerialization.jsonObject(with: data) else {
+            return
+        }
+        let dateFormatter = ISO8601DateFormatter()
+
+        // Determine record array: new format (dict with "records") or legacy (plain array)
+        let arr: [[String: Any]]
+        if let wrapper = json as? [String: Any] {
+            arr = wrapper["records"] as? [[String: Any]] ?? []
+            if let resetStr = wrapper["lastReset"] as? String {
+                lastResetDate = dateFormatter.date(from: resetStr)
+            }
+        } else if let legacy = json as? [[String: Any]] {
+            arr = legacy
+        } else {
+            return
+        }
+
+        for obj in arr {
+            let ts = (obj["ts"] as? String).flatMap { dateFormatter.date(from: $0) } ?? Date()
+            let src = ToolSource(rawValue: obj["src"] as? String ?? "") ?? .unknown
+            let rec = TokenRecord(
+                timestamp: ts,
+                source: src,
+                sessionId: obj["sid"] as? String,
+                model: obj["model"] as? String,
+                inputTokens: obj["in"] as? Int ?? 0,
+                outputTokens: obj["out"] as? Int ?? 0,
+                cacheReadTokens: obj["cr"] as? Int ?? 0,
+                cacheCreationTokens: obj["cc"] as? Int ?? 0,
+                costUsd: obj["cost"] as? Double ?? 0
+            )
+            records.append(rec)
+        }
+    }
+
+    func saveToDisk() {
+        // Ensure directory exists
+        let dir = TokenCounterConfig.dataDir
+        do {
+            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        } catch {
+            fputs("ERROR: Cannot create data dir \(dir): \(error)\n", stderr)
+            return
+        }
+
+        let dateFormatter = ISO8601DateFormatter()
+        let arr: [[String: Any]] = records.map { r in
+            var obj: [String: Any] = [
+                "ts": dateFormatter.string(from: r.timestamp),
+                "src": r.source.rawValue,
+                "in": r.inputTokens,
+                "out": r.outputTokens,
+            ]
+            if let sid = r.sessionId { obj["sid"] = sid }
+            if let model = r.model { obj["model"] = model }
+            if r.cacheReadTokens > 0 { obj["cr"] = r.cacheReadTokens }
+            if r.cacheCreationTokens > 0 { obj["cc"] = r.cacheCreationTokens }
+            if r.costUsd > 0 { obj["cost"] = r.costUsd }
+            return obj
+        }
+
+        var wrapper: [String: Any] = ["records": arr]
+        if let resetDate = lastResetDate {
+            wrapper["lastReset"] = dateFormatter.string(from: resetDate)
+        }
+
+        do {
+            let data = try JSONSerialization.data(withJSONObject: wrapper, options: [])
+            try data.write(to: URL(fileURLWithPath: TokenCounterConfig.dataFile), options: .atomic)
+        } catch {
+            fputs("ERROR: Cannot save data to \(TokenCounterConfig.dataFile): \(error)\n", stderr)
+        }
+    }
+
+    // --- Formatting helpers ---
+
+    static func formatCount(_ n: Int) -> String {
+        if n < 1000 { return "\(n)" }
+        if n < 1_000_000 {
+            let k = Double(n) / 1000.0
+            if k >= 100 { return "\(Int(k))K" }
+            if k >= 10 { return String(format: "%.0fK", k) }
+            return String(format: "%.1fK", k)
+        }
+        let m = Double(n) / 1_000_000.0
+        return String(format: "%.1fM", m)
+    }
+
+    static func formatCost(_ cost: Double) -> String {
+        if cost == 0 { return "$0.00" }
+        if cost < 0.01 { return String(format: "$%.3f", cost) }
+        return String(format: "$%.2f", cost)
+    }
+
+    static func formatRelativeTime(from date: Date) -> String {
+        let seconds = Int(Date().timeIntervalSince(date))
+        if seconds < 60 { return "just now" }
+        let minutes = seconds / 60
+        if minutes < 60 { return "\(minutes)m ago" }
+        let hours = minutes / 60
+        let remMin = minutes % 60
+        if hours < 24 {
+            return remMin > 0 ? "\(hours)h \(remMin)m ago" : "\(hours)h ago"
+        }
+        let days = hours / 24
+        let remHrs = hours % 24
+        return remHrs > 0 ? "\(days)d \(remHrs)h ago" : "\(days)d ago"
+    }
+
+    static func formatAbsoluteTime(_ date: Date) -> String {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "MMM d, h:mm a"
+        return fmt.string(from: date)
+    }
+
+    // AIDEV-NOTE: High-resolution bucketing for the activity chart.
+    // Creates one bucket per pixel column of chart width so bars map 1:1 to pixels.
+    // Over 24h with ~232px chart area, each bucket ≈ 6 minutes.
+    // Hour labels are computed from bucket positions for the axis.
+    func activityBuckets(hours: Int, pixelColumns: Int) -> [(hourLabel: String?, input: Int, output: Int)] {
+        let now = Date()
+        let totalSeconds = Double(hours) * 3600.0
+        let cutoff = now.addingTimeInterval(-totalSeconds)
+        let secondsPerBucket = totalSeconds / Double(pixelColumns)
+
+        let hourFormatter = DateFormatter()
+        hourFormatter.dateFormat = "ha"  // e.g. "3PM"
+
+        // Build empty buckets
+        var buckets: [(hourLabel: String?, input: Int, output: Int)] = []
+        for i in 0..<pixelColumns {
+            // Compute hour label: show label when bucket crosses an hour boundary
+            let bucketStart = cutoff.addingTimeInterval(Double(i) * secondsPerBucket)
+            let bucketEnd = cutoff.addingTimeInterval(Double(i + 1) * secondsPerBucket)
+            let startHour = Calendar.current.component(.hour, from: bucketStart)
+            let endHour = Calendar.current.component(.hour, from: bucketEnd)
+            let label: String? = (startHour != endHour) ? hourFormatter.string(from: bucketEnd).lowercased() : nil
+            buckets.append((hourLabel: label, input: 0, output: 0))
+        }
+
+        // Fill buckets from records
+        for record in records where record.timestamp >= cutoff {
+            let elapsed = record.timestamp.timeIntervalSince(cutoff)
+            let index = Int(elapsed / secondsPerBucket)
+            if index >= 0 && index < pixelColumns {
+                buckets[index].input += record.inputTokens
+                buckets[index].output += record.outputTokens
+            }
+        }
+        return buckets
+    }
+
+    // AIDEV-NOTE: Per-source token type breakdown for the flow proportion chart.
+    // Only includes sources with data. Adds "Total" row when >1 source active.
+    func tokenFlowBreakdown() -> [(label: String, input: Int, output: Int, cacheRead: Int, cacheCreation: Int, total: Int)] {
+        var rows: [(label: String, input: Int, output: Int, cacheRead: Int, cacheCreation: Int, total: Int)] = []
+
+        for source in ToolSource.allCases where hasRecords(for: source) {
+            let t = totals(for: source)
+            let total = t.input + t.output + t.cacheRead + t.cacheCreation
+            if total > 0 {
+                rows.append((label: source.rawValue, input: t.input, output: t.output,
+                             cacheRead: t.cacheRead, cacheCreation: t.cacheCreation, total: total))
+            }
+        }
+
+        if rows.count > 1 {
+            let allTotal = totalInput + totalOutput + totalCacheRead + totalCacheCreation
+            rows.insert((label: "Total", input: totalInput, output: totalOutput,
+                         cacheRead: totalCacheRead, cacheCreation: totalCacheCreation,
+                         total: allTotal), at: 0)
+        }
+
+        return rows
+    }
+}
+
+// AIDEV-NOTE: Custom NSView for menu bar — stacked "Tokens" label above numbers
+// ==============================================================================
+// Draws two lines:
+//   Top:    "Tokens"        (tiny, muted)
+//   Bottom: "12K/4K $0.42"  (monospace digits, changes color during animation)
+
+class TokenDisplayView: NSView {
+    var numberText: String = "0/0"
+    var numberColor: NSColor = TokenCounterConfig.idleColor
+    var hasData: Bool = false
+
+    private let labelFont = NSFont.systemFont(ofSize: TokenCounterConfig.labelFontSize, weight: .medium)
+    private let numberFont = NSFont.monospacedDigitSystemFont(ofSize: TokenCounterConfig.numberFontSize, weight: .regular)
+
+    func recalcWidth() {
+        let numAttrs: [NSAttributedString.Key: Any] = [.font: numberFont]
+        let numSize = (numberText as NSString).size(withAttributes: numAttrs)
+        let labelAttrs: [NSAttributedString.Key: Any] = [.font: labelFont]
+        let labelSize = ("Tokens" as NSString).size(withAttributes: labelAttrs)
+        let width = max(numSize.width, labelSize.width) + TokenCounterConfig.horizontalPadding * 2
+        frame.size.width = ceil(width)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        // Draw "Tokens" label
+        let labelAttrs: [NSAttributedString.Key: Any] = [
+            .font: labelFont,
+            .foregroundColor: TokenCounterConfig.labelColor
+        ]
+        let labelStr = NSAttributedString(string: "Tokens", attributes: labelAttrs)
+        let labelSize = labelStr.size()
+        let labelX = (bounds.width - labelSize.width) / 2
+        labelStr.draw(at: NSPoint(x: labelX, y: TokenCounterConfig.labelYOffset))
+
+        // Draw numbers
+        let numAttrs: [NSAttributedString.Key: Any] = [
+            .font: numberFont,
+            .foregroundColor: numberColor
+        ]
+        let numStr = NSAttributedString(string: numberText, attributes: numAttrs)
+        let numSize = numStr.size()
+        let numX = (bounds.width - numSize.width) / 2
+        numStr.draw(at: NSPoint(x: numX, y: TokenCounterConfig.numberYOffset))
+    }
+}
+
+// AIDEV-NOTE: Activity timeline — pixel-dense vertical bar chart (input/output)
+// =============================================================================
+// One bar per pixel column for maximum temporal resolution over 24 hours.
+// Hour labels drawn at hour boundaries detected during bucketing.
+
+class ActivityChartView: NSView {
+    var buckets: [(hourLabel: String?, input: Int, output: Int)] = []
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        let inset: CGFloat = 14
+        let rightInset: CGFloat = 14
+        let topPad: CGFloat = 4
+        let bottomPad: CGFloat = 14   // Room for hour labels
+        let labelFont = NSFont.monospacedDigitSystemFont(ofSize: TokenCounterConfig.chartLabelFontSize, weight: .regular)
+
+        let chartArea = NSRect(
+            x: inset, y: bottomPad,
+            width: bounds.width - inset - rightInset,
+            height: bounds.height - topPad - bottomPad
+        )
+
+        guard !buckets.isEmpty else { return }
+
+        let maxVal = buckets.map { $0.input + $0.output }.max() ?? 0
+
+        // No data — show placeholder
+        if maxVal == 0 {
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: labelFont,
+                .foregroundColor: TokenCounterConfig.chartLabelColor
+            ]
+            let text = NSAttributedString(string: "No activity in last \(TokenCounterConfig.chartHours)h", attributes: attrs)
+            let size = text.size()
+            text.draw(at: NSPoint(x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2))
+            return
+        }
+
+        let barCount = CGFloat(buckets.count)
+        let barWidth = chartArea.width / barCount  // ~1px per bar, no spacing
+
+        // Draw faint background for entire chart area
+        TokenCounterConfig.chartBarBackground.setFill()
+        NSBezierPath(roundedRect: chartArea, xRadius: TokenCounterConfig.chartCornerRadius, yRadius: TokenCounterConfig.chartCornerRadius).fill()
+
+        // Clip to chart area for clean edges
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(roundedRect: chartArea, xRadius: TokenCounterConfig.chartCornerRadius, yRadius: TokenCounterConfig.chartCornerRadius).addClip()
+
+        for (i, bucket) in buckets.enumerated() {
+            let x = chartArea.origin.x + CGFloat(i) * barWidth
+
+            let total = bucket.input + bucket.output
+            if total > 0 {
+                let scale = chartArea.height / CGFloat(maxVal)
+                let inputH = CGFloat(bucket.input) * scale
+                let outputH = CGFloat(bucket.output) * scale
+
+                // Input (bottom, blue)
+                if inputH > 0 {
+                    TokenCounterConfig.chartInputColor.setFill()
+                    NSBezierPath(rect: NSRect(x: x, y: chartArea.origin.y, width: max(barWidth, 1), height: inputH)).fill()
+                }
+                // Output (stacked on top, orange)
+                if outputH > 0 {
+                    TokenCounterConfig.chartOutputColor.setFill()
+                    NSBezierPath(rect: NSRect(x: x, y: chartArea.origin.y + inputH, width: max(barWidth, 1), height: outputH)).fill()
+                }
+            }
+        }
+
+        NSGraphicsContext.restoreGraphicsState()
+
+        // Draw hour labels at hour boundaries (skip if too close to edges or neighbors)
+        var lastLabelEndX: CGFloat = -100
+        for (i, bucket) in buckets.enumerated() {
+            guard let label = bucket.hourLabel else { continue }
+            let x = chartArea.origin.x + CGFloat(i) * barWidth
+
+            let labelAttrs: [NSAttributedString.Key: Any] = [
+                .font: labelFont,
+                .foregroundColor: TokenCounterConfig.chartLabelColor
+            ]
+            let labelStr = NSAttributedString(string: label, attributes: labelAttrs)
+            let labelSize = labelStr.size()
+            let labelX = x - labelSize.width / 2
+
+            // Skip if it would overlap the previous label or clip off the edge
+            if labelX < inset || labelX + labelSize.width > bounds.width - rightInset { continue }
+            if labelX < lastLabelEndX + 4 { continue }
+
+            labelStr.draw(at: NSPoint(x: labelX, y: 2))
+            lastLabelEndX = labelX + labelSize.width
+        }
+    }
+}
+
+// AIDEV-NOTE: Token flow — horizontal stacked proportion bars per source
+// ======================================================================
+
+class TokenFlowChartView: NSView {
+    var rows: [(label: String, input: Int, output: Int, cacheRead: Int, cacheCreation: Int, total: Int)] = []
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        let inset: CGFloat = 14
+        let rightInset: CGFloat = 14
+        let labelWidth: CGFloat = 72
+        let rowHeight: CGFloat = 14
+        let rowSpacing: CGFloat = 3
+        let barHeight: CGFloat = 10
+        let radius: CGFloat = 3
+
+        let labelFont = NSFont.systemFont(ofSize: 9, weight: .medium)
+        let legendFont = NSFont.systemFont(ofSize: 7, weight: .regular)
+        let barAreaX = inset + labelWidth
+        let barAreaWidth = bounds.width - barAreaX - rightInset
+
+        guard !rows.isEmpty else { return }
+
+        // Legend at bottom
+        let legendY: CGFloat = 2
+        let colors: [(NSColor, String)] = [
+            (TokenCounterConfig.chartInputColor, "In"),
+            (TokenCounterConfig.chartOutputColor, "Out"),
+            (TokenCounterConfig.chartCacheReadColor, "Cache"),
+            (TokenCounterConfig.chartCacheCreationColor, "Create"),
+        ]
+        var legendX = inset
+        for (color, name) in colors {
+            let dotRect = NSRect(x: legendX, y: legendY + 2, width: 6, height: 6)
+            color.setFill()
+            NSBezierPath(ovalIn: dotRect).fill()
+            legendX += 9
+
+            let attrs: [NSAttributedString.Key: Any] = [.font: legendFont, .foregroundColor: TokenCounterConfig.chartLabelColor]
+            let str = NSAttributedString(string: name, attributes: attrs)
+            str.draw(at: NSPoint(x: legendX, y: legendY))
+            legendX += str.size().width + 8
+        }
+
+        // Rows from top
+        for (i, row) in rows.enumerated() {
+            let y = bounds.height - CGFloat(i + 1) * (rowHeight + rowSpacing)
+
+            // Label
+            let labelAttrs: [NSAttributedString.Key: Any] = [
+                .font: labelFont,
+                .foregroundColor: NSColor.labelColor
+            ]
+            let labelStr = NSAttributedString(string: row.label, attributes: labelAttrs)
+            labelStr.draw(at: NSPoint(x: inset, y: y + (rowHeight - labelStr.size().height) / 2))
+
+            guard row.total > 0 else { continue }
+
+            // Background track
+            let trackRect = NSRect(x: barAreaX, y: y + (rowHeight - barHeight) / 2, width: barAreaWidth, height: barHeight)
+            let trackPath = NSBezierPath(roundedRect: trackRect, xRadius: radius, yRadius: radius)
+            TokenCounterConfig.chartBarBackground.setFill()
+            trackPath.fill()
+
+            // Stacked segments — clipped to rounded rect
+            let segments: [(Int, NSColor)] = [
+                (row.input, TokenCounterConfig.chartInputColor),
+                (row.output, TokenCounterConfig.chartOutputColor),
+                (row.cacheRead, TokenCounterConfig.chartCacheReadColor),
+                (row.cacheCreation, TokenCounterConfig.chartCacheCreationColor),
+            ].filter { $0.0 > 0 }
+
+            NSGraphicsContext.saveGraphicsState()
+            trackPath.addClip()
+
+            var segX = barAreaX
+            for (value, color) in segments {
+                let segWidth = barAreaWidth * CGFloat(value) / CGFloat(row.total)
+                color.setFill()
+                NSBezierPath(rect: NSRect(x: segX, y: y + (rowHeight - barHeight) / 2, width: segWidth, height: barHeight)).fill()
+                segX += segWidth
+            }
+
+            NSGraphicsContext.restoreGraphicsState()
+        }
+    }
+}
+
+// AIDEV-NOTE: Count-up animation state machine
+// =============================================
+// When new tokens arrive, animates displayed numbers from old values to new values
+// using cubic ease-out for a satisfying rapid-count-then-settle effect.
+// During animation, numbers briefly change color (e.g. cyan) then revert.
+
+class AnimationState {
+    var isAnimating = false
+    var startInput = 0
+    var startOutput = 0
+    var startCost: Double = 0
+    var targetInput = 0
+    var targetOutput = 0
+    var targetCost: Double = 0
+    var progress: Double = 0        // 0.0 to 1.0
+    var timer: Timer?
+
+    // Current interpolated values
+    var currentInput: Int { interpolate(start: startInput, end: targetInput) }
+    var currentOutput: Int { interpolate(start: startOutput, end: targetOutput) }
+    var currentCost: Double { interpolateDouble(start: startCost, end: targetCost) }
+
+    private func interpolate(start: Int, end: Int) -> Int {
+        let eased = easeOutCubic(progress)
+        return start + Int(Double(end - start) * eased)
+    }
+
+    private func interpolateDouble(start: Double, end: Double) -> Double {
+        let eased = easeOutCubic(progress)
+        return start + (end - start) * eased
+    }
+
+    // Cubic ease-out: fast start, gentle landing
+    private func easeOutCubic(_ t: Double) -> Double {
+        let p = 1.0 - t
+        return 1.0 - p * p * p
+    }
+
+    func startAnimation(fromInput: Int, fromOutput: Int, fromCost: Double,
+                         toInput: Int, toOutput: Int, toCost: Double,
+                         onFrame: @escaping () -> Void) {
+        // Don't animate if values didn't change
+        guard toInput != fromInput || toOutput != fromOutput else { return }
+
+        timer?.invalidate()
+        startInput = fromInput
+        startOutput = fromOutput
+        startCost = fromCost
+        targetInput = toInput
+        targetOutput = toOutput
+        targetCost = toCost
+        progress = 0
+        isAnimating = true
+
+        let step = TokenCounterConfig.animationFPS
+        let totalSteps = TokenCounterConfig.animationDuration / step
+
+        timer = Timer.scheduledTimer(withTimeInterval: step, repeats: true) { [weak self] t in
+            guard let self = self else { t.invalidate(); return }
+            self.progress += 1.0 / totalSteps
+            if self.progress >= 1.0 {
+                self.progress = 1.0
+                self.isAnimating = false
+                t.invalidate()
+                self.timer = nil
+            }
+            onFrame()
+        }
+    }
+
+    func cancel() {
+        timer?.invalidate()
+        timer = nil
+        isAnimating = false
+    }
+}
+
+// AIDEV-NOTE: OTLP HTTP JSON receiver using Network.framework NWListener
+// =======================================================================
+// Listens on localhost for OTLP HTTP POST requests and parses token data
+// from the JSON payloads. Handles /v1/logs and /v1/metrics endpoints.
+
+class OTLPReceiver {
+    let store: TokenStore
+    let port: UInt16
+    var listener: NWListener?
+    private var debugLoggedSources: Set<String> = []
+
+    init(port: UInt16, store: TokenStore) {
+        self.port = port
+        self.store = store
+    }
+
+    func start() {
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+            fputs("ERROR: Invalid port \(port)\n", stderr)
+            return
+        }
+
+        let params = NWParameters.tcp
+        params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: nwPort)
+
+        do {
+            listener = try NWListener(using: params)
+        } catch {
+            fputs("ERROR: Failed to create listener: \(error)\n", stderr)
+            return
+        }
+
+        listener?.newConnectionHandler = { [weak self] connection in
+            self?.handleConnection(connection)
+        }
+
+        listener?.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                break // listening
+            case .failed(let error):
+                fputs("ERROR: Listener failed: \(error)\n", stderr)
+            default:
+                break
+            }
+        }
+
+        listener?.start(queue: DispatchQueue(label: "otlp-receiver"))
+    }
+
+    func stop() {
+        listener?.cancel()
+    }
+
+    private func handleConnection(_ connection: NWConnection) {
+        connection.start(queue: DispatchQueue(label: "otlp-conn"))
+        receiveData(on: connection, accumulated: Data())
+    }
+
+    private func receiveData(on connection: NWConnection, accumulated: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1_048_576) { [weak self] data, _, isComplete, error in
+            guard let self = self else { return }
+
+            var buffer = accumulated
+            if let data = data { buffer.append(data) }
+
+            if let (path, body, contentType) = self.parseHTTPRequest(buffer) {
+                if contentType.contains("protobuf") {
+                    fputs("WARNING: Received protobuf payload. Set OTEL_EXPORTER_OTLP_PROTOCOL=http/json\n", stderr)
+                    self.sendHTTPResponse(connection, status: 200)
+                    return
+                }
+
+                DispatchQueue.main.async {
+                    if path.hasSuffix("/v1/logs") || path.hasSuffix("/v1/logs/") {
+                        self.handleLogsRequest(body)
+                    } else if path.hasSuffix("/v1/metrics") || path.hasSuffix("/v1/metrics/") {
+                        self.handleMetricsRequest(body)
+                    }
+                }
+                self.sendHTTPResponse(connection, status: 200)
+            } else if error != nil || isComplete {
+                connection.cancel()
+            } else {
+                self.receiveData(on: connection, accumulated: buffer)
+            }
+        }
+    }
+
+    // AIDEV-NOTE: Simple HTTP/1.1 request parser for POST requests
+    // Only needs to handle OTLP client POSTs (Content-Length based, no chunked)
+    private func parseHTTPRequest(_ data: Data) -> (path: String, body: Data, contentType: String)? {
+        let separator = Data([0x0D, 0x0A, 0x0D, 0x0A]) // \r\n\r\n
+        guard let separatorRange = data.range(of: separator) else { return nil }
+
+        let headerData = data[data.startIndex..<separatorRange.lowerBound]
+        guard let headerString = String(data: headerData, encoding: .utf8) else { return nil }
+
+        let headerLines = headerString.components(separatedBy: "\r\n")
+        guard let requestLine = headerLines.first else { return nil }
+
+        let parts = requestLine.split(separator: " ", maxSplits: 2)
+        guard parts.count >= 2 else { return nil }
+        let path = String(parts[1])
+
+        var contentLength = 0
+        var contentType = ""
+        for line in headerLines.dropFirst() {
+            let lower = line.lowercased()
+            if lower.hasPrefix("content-length:") {
+                contentLength = Int(line.dropFirst("content-length:".count).trimmingCharacters(in: .whitespaces)) ?? 0
+            } else if lower.hasPrefix("content-type:") {
+                contentType = String(line.dropFirst("content-type:".count).trimmingCharacters(in: .whitespaces))
+            }
+        }
+
+        let bodyStart = separatorRange.upperBound
+        let bodyData = data[bodyStart...]
+        if bodyData.count < contentLength { return nil }
+
+        return (path, Data(bodyData.prefix(contentLength)), contentType)
+    }
+
+    private func sendHTTPResponse(_ connection: NWConnection, status: Int) {
+        let statusText = status == 200 ? "OK" : "Bad Request"
+        let response = "HTTP/1.1 \(status) \(statusText)\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+        connection.send(content: response.data(using: .utf8), completion: .contentProcessed { _ in
+            connection.cancel()
+        })
+    }
+
+    // AIDEV-NOTE: OTLP Logs JSON parsing
+    // Structure: resourceLogs[].scopeLogs[].logRecords[].attributes[]
+    private func handleLogsRequest(_ body: Data) {
+        guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { return }
+
+        if TokenCounterConfig.debugLogFirstPayload { debugLogPayload(json, label: "logs") }
+
+        guard let resourceLogs = json["resourceLogs"] as? [[String: Any]] else { return }
+
+        for resourceLog in resourceLogs {
+            let source = detectSource(resourceLog)
+            let scopeLogs = resourceLog["scopeLogs"] as? [[String: Any]] ?? []
+            for scopeLog in scopeLogs {
+                let logRecords = scopeLog["logRecords"] as? [[String: Any]] ?? []
+                for logRecord in logRecords {
+                    if let record = extractTokenRecord(from: logRecord, source: source) {
+                        store.add(record)
+                    }
+                }
+            }
+        }
+    }
+
+    // AIDEV-NOTE: OTLP Metrics JSON parsing
+    // Structure: resourceMetrics[].scopeMetrics[].metrics[].sum.dataPoints[]
+    private func handleMetricsRequest(_ body: Data) {
+        guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { return }
+
+        if TokenCounterConfig.debugLogFirstPayload { debugLogPayload(json, label: "metrics") }
+
+        guard let resourceMetrics = json["resourceMetrics"] as? [[String: Any]] else { return }
+
+        for resourceMetric in resourceMetrics {
+            let source = detectSource(resourceMetric)
+            let scopeMetrics = resourceMetric["scopeMetrics"] as? [[String: Any]] ?? []
+            for scopeMetric in scopeMetrics {
+                let metrics = scopeMetric["metrics"] as? [[String: Any]] ?? []
+                for metric in metrics {
+                    handleMetric(metric, source: source)
+                }
+            }
+        }
+    }
+
+    private func handleMetric(_ metric: [String: Any], source: ToolSource) {
+        guard let sum = metric["sum"] as? [String: Any],
+              let dataPoints = sum["dataPoints"] as? [[String: Any]] else { return }
+
+        for dp in dataPoints {
+            let attrs = parseAttributes(dp["attributes"] as? [[String: Any]] ?? [])
+            let value = intFromOTLP(dp["asInt"]) ?? Int(dp["asDouble"] as? Double ?? 0)
+            let tokenType = attrs["type"] ?? attrs["token.type"] ?? ""
+
+            if value > 0 {
+                var input = 0, output = 0, cacheRead = 0, cacheCreation = 0
+                switch tokenType {
+                case "input": input = value
+                case "output": output = value
+                case "cacheRead": cacheRead = value
+                case "cacheCreation": cacheCreation = value
+                default: input = value
+                }
+                store.add(TokenRecord(
+                    timestamp: Date(), source: source, sessionId: attrs["session.id"],
+                    model: attrs["model"], inputTokens: input, outputTokens: output,
+                    cacheReadTokens: cacheRead, cacheCreationTokens: cacheCreation, costUsd: 0
+                ))
+            }
+        }
+    }
+
+    private func extractTokenRecord(from logRecord: [String: Any], source: ToolSource) -> TokenRecord? {
+        let attrs = parseAttributes(logRecord["attributes"] as? [[String: Any]] ?? [])
+        let eventName = attrs["event.name"] ?? ""
+
+        let isApiRequest = eventName.contains("api_request") ||
+                           eventName.contains("response.completed") ||
+                           eventName.contains("sse_event")
+
+        let inputTokens = intFromString(attrs["input_tokens"])
+                       ?? intFromString(attrs["input_token_count"])
+                       ?? intFromString(attrs["prompt_tokens"]) ?? 0
+        let outputTokens = intFromString(attrs["output_tokens"])
+                        ?? intFromString(attrs["output_token_count"])
+                        ?? intFromString(attrs["completion_tokens"]) ?? 0
+        let cacheRead = intFromString(attrs["cache_read_tokens"])
+                     ?? intFromString(attrs["cached_token_count"]) ?? 0
+        let cacheCreation = intFromString(attrs["cache_creation_tokens"]) ?? 0
+
+        guard isApiRequest || inputTokens > 0 || outputTokens > 0 else { return nil }
+
+        return TokenRecord(
+            timestamp: Date(), source: source,
+            sessionId: attrs["session.id"] ?? attrs["session_id"],
+            model: attrs["model"], inputTokens: inputTokens, outputTokens: outputTokens,
+            cacheReadTokens: cacheRead, cacheCreationTokens: cacheCreation,
+            costUsd: Double(attrs["cost_usd"] ?? "0") ?? 0
+        )
+    }
+
+    private func detectSource(_ resource: [String: Any]) -> ToolSource {
+        let resourceObj = resource["resource"] as? [String: Any] ?? [:]
+        let attrs = parseAttributes(resourceObj["attributes"] as? [[String: Any]] ?? [])
+        let serviceName = (attrs["service.name"] ?? "").lowercased()
+        if serviceName.contains("claude") { return .claudeCode }
+        if serviceName.contains("codex") { return .codexCLI }
+        return .unknown
+    }
+
+    private func parseAttributes(_ attrs: [[String: Any]]) -> [String: String] {
+        var result: [String: String] = [:]
+        for attr in attrs {
+            guard let key = attr["key"] as? String,
+                  let value = attr["value"] as? [String: Any] else { continue }
+            if let sv = value["stringValue"] as? String { result[key] = sv }
+            else if let iv = value["intValue"] { result[key] = "\(iv)" }
+            else if let dv = value["doubleValue"] as? Double { result[key] = "\(dv)" }
+            else if let bv = value["boolValue"] as? Bool { result[key] = "\(bv)" }
+        }
+        return result
+    }
+
+    private func intFromOTLP(_ value: Any?) -> Int? {
+        if let s = value as? String { return Int(s) }
+        if let i = value as? Int { return i }
+        if let i = value as? Int64 { return Int(i) }
+        return nil
+    }
+
+    private func intFromString(_ value: String?) -> Int? {
+        guard let v = value else { return nil }
+        if let i = Int(v) { return i }
+        if let d = Double(v) { return Int(d) }
+        return nil
+    }
+
+    private func debugLogPayload(_ json: [String: Any], label: String) {
+        if debugLoggedSources.contains(label) { return }
+        debugLoggedSources.insert(label)
+        if let data = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted]),
+           let str = String(data: data, encoding: .utf8) {
+            fputs("\n--- DEBUG: First \(label) payload ---\n\(str)\n--- END ---\n\n", stderr)
+        }
+    }
+}
+
+// AIDEV-NOTE: Menu bar UI controller
+// ===================================
+
+class TokenCounterApp: NSObject, NSApplicationDelegate {
+    var statusItem: NSStatusItem!
+    var displayView: TokenDisplayView!
+    var store: TokenStore!
+    var receiver: OTLPReceiver!
+    var animation: AnimationState!
+    var displayTimer: Timer?
+    // Snapshot of totals before most recent store change (for animation start values)
+    var prevInput = 0
+    var prevOutput = 0
+    var prevCost: Double = 0
+    static var shared: TokenCounterApp?
+
+    override init() {
+        super.init()
+        TokenCounterApp.shared = self
+
+        parseCommandLineArgs()
+
+        store = TokenStore()
+        store.loadFromDisk()
+
+        // Snapshot current totals so first real update can animate from here
+        prevInput = store.totalInput
+        prevOutput = store.totalOutput
+        prevCost = store.totalCost
+
+        animation = AnimationState()
+
+        // Set up status item with custom view
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        displayView = TokenDisplayView(
+            frame: NSRect(x: 0, y: 0,
+                          width: 60,
+                          height: TokenCounterConfig.displayHeight)
+        )
+        statusItem.button?.addSubview(displayView)
+
+        // Wire up store change -> animation trigger
+        store.onUpdate = { [weak self] in
+            self?.onStoreUpdated()
+        }
+
+        updateDisplay()
+        buildMenu()
+
+        // Start OTLP receiver
+        receiver = OTLPReceiver(port: TokenCounterConfig.port, store: store)
+        receiver.start()
+
+        // Periodic display refresh (for cost formatting, etc.)
+        displayTimer = Timer.scheduledTimer(withTimeInterval: TokenCounterConfig.displayUpdateInterval, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            if !self.animation.isAnimating {
+                self.updateDisplay()
+            }
+            self.buildMenu()
+        }
+
+        setupSignalHandler()
+    }
+
+    // Called when store gets new records — kicks off counting animation
+    func onStoreUpdated() {
+        let newInput = store.totalInput
+        let newOutput = store.totalOutput
+        let newCost = store.totalCost
+
+        animation.startAnimation(
+            fromInput: prevInput, fromOutput: prevOutput, fromCost: prevCost,
+            toInput: newInput, toOutput: newOutput, toCost: newCost
+        ) { [weak self] in
+            self?.updateDisplayAnimated()
+        }
+
+        // After animation completes, snapshot will be updated in updateDisplayAnimated
+        // when animation.isAnimating becomes false
+    }
+
+    func updateDisplayAnimated() {
+        let inp: Int
+        let out: Int
+        let cost: Double
+        let color: NSColor
+
+        if animation.isAnimating {
+            inp = animation.currentInput
+            out = animation.currentOutput
+            cost = animation.currentCost
+            color = TokenCounterConfig.animatingColor
+        } else {
+            // Animation just finished — update snapshots
+            inp = animation.targetInput
+            out = animation.targetOutput
+            cost = animation.targetCost
+            prevInput = inp
+            prevOutput = out
+            prevCost = cost
+            color = store.records.isEmpty ? TokenCounterConfig.idleColor : TokenCounterConfig.activeColor
+        }
+
+        var text = "\(TokenStore.formatCount(inp))/\(TokenStore.formatCount(out))"
+        if TokenCounterConfig.showCost && cost > 0 {
+            text += " \(TokenStore.formatCost(cost))"
+        }
+
+        displayView.numberText = text
+        displayView.numberColor = color
+        displayView.hasData = !store.records.isEmpty
+        displayView.recalcWidth()
+        displayView.setNeedsDisplay(displayView.bounds)
+
+        // Resize the button to match
+        if let button = statusItem.button {
+            button.frame.size.width = displayView.frame.width
+        }
+    }
+
+    func updateDisplay() {
+        let inp = store.totalInput
+        let out = store.totalOutput
+        let cost = store.totalCost
+        let hasData = !store.records.isEmpty
+
+        var text = hasData ? "\(TokenStore.formatCount(inp))/\(TokenStore.formatCount(out))" : "0/0"
+        if TokenCounterConfig.showCost && cost > 0 {
+            text += " \(TokenStore.formatCost(cost))"
+        }
+
+        displayView.numberText = text
+        displayView.numberColor = hasData ? TokenCounterConfig.activeColor : TokenCounterConfig.idleColor
+        displayView.hasData = hasData
+        displayView.recalcWidth()
+        displayView.setNeedsDisplay(displayView.bounds)
+
+        if let button = statusItem.button {
+            button.frame.size.width = displayView.frame.width
+        }
+    }
+
+    // AIDEV-NOTE: The env vars string used in both the menu and copy-to-clipboard
+    func envVarsString() -> String {
+        let port = TokenCounterConfig.port
+        return """
+        export CLAUDE_CODE_ENABLE_TELEMETRY=1
+        export OTEL_LOGS_EXPORTER=otlp
+        export OTEL_EXPORTER_OTLP_PROTOCOL=http/json
+        export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:\(port)
+        """.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.joined(separator: "\n")
+    }
+
+    func buildMenu() {
+        let menu = NSMenu()
+        let monoFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let smallFont = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+
+        if store.records.isEmpty {
+            addReadableItem(menu, "No token data received yet", font: monoFont)
+        } else {
+            addReadableItem(menu, "Totals", font: monoFont, bold: true)
+            addReadableItem(menu, formatLine("Input", store.totalInput), font: smallFont)
+            addReadableItem(menu, formatLine("Output", store.totalOutput), font: smallFont)
+            if store.totalCacheRead > 0 {
+                addReadableItem(menu, formatLine("Cache Read", store.totalCacheRead), font: smallFont)
+            }
+            if store.totalCacheCreation > 0 {
+                addReadableItem(menu, formatLine("Cache Create", store.totalCacheCreation), font: smallFont)
+            }
+            if store.totalCost > 0 {
+                addReadableItem(menu, formatLine("Cost", TokenStore.formatCost(store.totalCost)), font: smallFont)
+            }
+            addReadableItem(menu, formatLine("Requests", "\(store.records.count)"), font: smallFont)
+
+            for source in ToolSource.allCases where store.hasRecords(for: source) {
+                menu.addItem(NSMenuItem.separator())
+                let t = store.totals(for: source)
+                let sessions = store.sessionCount(for: source)
+                var summary = "\(source.rawValue)  \(TokenStore.formatCount(t.input))/\(TokenStore.formatCount(t.output))"
+                if t.cost > 0 { summary += "  \(TokenStore.formatCost(t.cost))" }
+                addReadableItem(menu, summary, font: monoFont, bold: true)
+                if sessions > 0 {
+                    addReadableItem(menu, "  \(sessions) session\(sessions == 1 ? "" : "s")", font: smallFont)
+                }
+            }
+
+            // Charts
+            menu.addItem(NSMenuItem.separator())
+
+            // Activity timeline (pixel-dense bar chart)
+            let chartPixelWidth = Int(TokenCounterConfig.chartWidth - 28) // subtract insets
+            let activityBuckets = store.activityBuckets(hours: TokenCounterConfig.chartHours, pixelColumns: chartPixelWidth)
+            let activityChart = ActivityChartView(frame: NSRect(
+                x: 0, y: 0,
+                width: TokenCounterConfig.chartWidth,
+                height: TokenCounterConfig.activityChartHeight
+            ))
+            activityChart.buckets = activityBuckets
+            addChartItem(menu, activityChart)
+
+            // Token flow proportion bars
+            let flowRows = store.tokenFlowBreakdown()
+            if !flowRows.isEmpty {
+                menu.addItem(NSMenuItem.separator())
+                let rowCount = CGFloat(flowRows.count)
+                let flowHeight = max(TokenCounterConfig.flowChartHeight, rowCount * 17 + 16)
+                let flowChart = TokenFlowChartView(frame: NSRect(
+                    x: 0, y: 0,
+                    width: TokenCounterConfig.chartWidth,
+                    height: flowHeight
+                ))
+                flowChart.rows = flowRows
+                addChartItem(menu, flowChart)
+            }
+        }
+
+        // Setup section: env vars with copy action
+        menu.addItem(NSMenuItem.separator())
+        addReadableItem(menu, "Setup (add to shell profile):", font: NSFont.menuFont(ofSize: 11), bold: true)
+        for line in envVarsString().split(separator: "\n") {
+            addReadableItem(menu, String(line), font: NSFont.monospacedSystemFont(ofSize: 10, weight: .regular))
+        }
+        menu.addItem(NSMenuItem(title: "Copy Setup to Clipboard", action: #selector(copySetup), keyEquivalent: ""))
+
+        menu.addItem(NSMenuItem.separator())
+        if let resetDate = store.lastResetDate {
+            let abs = TokenStore.formatAbsoluteTime(resetDate)
+            let rel = TokenStore.formatRelativeTime(from: resetDate)
+            addReadableItem(menu, "Last reset: \(abs) (\(rel))", font: NSFont.menuFont(ofSize: 10))
+        }
+        menu.addItem(NSMenuItem(title: "Reset Counters", action: #selector(resetCounters), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: ""))
+
+        statusItem.menu = menu
+    }
+
+    // AIDEV-NOTE: Adds a custom chart NSView as a menu item with standard padding.
+    private func addChartItem(_ menu: NSMenu, _ chartView: NSView) {
+        let item = NSMenuItem()
+        item.view = chartView
+        menu.addItem(item)
+    }
+
+    // AIDEV-NOTE: Uses a custom NSView (NSTextField) so menu items render at full
+    // brightness in dark mode. Disabled NSMenuItems get forced-grey by macOS.
+    private func addReadableItem(_ menu: NSMenu, _ text: String, font: NSFont, bold: Bool = false) {
+        let item = NSMenuItem()
+        let usedFont = bold ? NSFontManager.shared.convert(font, toHaveTrait: .boldFontMask) : font
+        let label = NSTextField(labelWithString: text)
+        label.font = usedFont
+        label.textColor = NSColor.labelColor
+        label.sizeToFit()
+        // Pad to match standard menu item insets
+        let padded = NSView(frame: NSRect(x: 0, y: 0, width: label.frame.width + 28, height: label.frame.height + 4))
+        label.frame.origin = NSPoint(x: 14, y: 2)
+        padded.addSubview(label)
+        item.view = padded
+        menu.addItem(item)
+    }
+
+    private func formatLine(_ label: String, _ value: Any) -> String {
+        let labelStr = "  \(label):"
+        let valueStr = "\(value)"
+        let padding = max(1, 20 - labelStr.count)
+        return labelStr + String(repeating: " ", count: padding) + valueStr
+    }
+
+    @objc func copySetup() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(envVarsString(), forType: .string)
+    }
+
+    @objc func resetCounters() {
+        animation.cancel()
+        store.reset()
+        prevInput = 0
+        prevOutput = 0
+        prevCost = 0
+        updateDisplay()
+        buildMenu()
+    }
+
+    @objc func quit() {
+        receiver?.stop()
+        NSApplication.shared.terminate(self)
+    }
+
+    func parseCommandLineArgs() {
+        let args = CommandLine.arguments
+        var i = 1
+        while i < args.count {
+            let arg = args[i]
+            switch arg {
+            case "-h", "--help":
+                showHelp()
+                exit(0)
+            case "-p", "--port":
+                if i + 1 < args.count, let p = UInt16(args[i + 1]) {
+                    TokenCounterConfig.port = p
+                    i += 1
+                } else {
+                    fputs("Error: --port requires a valid port number (1-65535)\n", stderr)
+                    exit(1)
+                }
+            default:
+                if arg.hasPrefix("-") {
+                    fputs("Error: Unknown option \(arg)\n", stderr)
+                    showHelp()
+                    exit(1)
+                }
+            }
+            i += 1
+        }
+    }
+
+    func showHelp() {
+        print("""
+        token-counter - macOS menu bar LLM token counter
+
+        Counts tokens from Claude Code and Codex CLI using OpenTelemetry.
+        Runs a lightweight OTLP HTTP receiver on localhost.
+        Data persists across restarts in ~/.config/token-counter/data.json
+
+        Usage: token-counter [options]
+
+        Options:
+          -h, --help           Show this help
+          -p, --port <port>    OTLP HTTP port (default: 4318)
+
+        Examples:
+          token-counter                  # Listen on default port 4318
+          token-counter -p 9999          # Listen on custom port
+          token-counter &                # Run in background
+
+        Setup - Claude Code:
+          export CLAUDE_CODE_ENABLE_TELEMETRY=1
+          export OTEL_LOGS_EXPORTER=otlp
+          export OTEL_EXPORTER_OTLP_PROTOCOL=http/json
+          export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+
+        Setup - Codex CLI:
+          export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+          export OTEL_EXPORTER_OTLP_PROTOCOL=http/json
+        """)
+    }
+}
+
+// Signal handling for clean Ctrl+C termination
+func handleInterrupt(signal: Int32) {
+    if let app = TokenCounterApp.shared { app.quit() }
+}
+
+func setupSignalHandler() {
+    signal(SIGINT, handleInterrupt)
+    signal(SIGTERM, handleInterrupt)
+}
+
+// Bootstrap
+let app = NSApplication.shared
+let delegate = TokenCounterApp()
+app.delegate = delegate
+
+// Menu bar only, no dock icon
+app.setActivationPolicy(.accessory)
+
+// Startup: print the env vars needed
+print("# Setup (add to shell profile)")
+print("export CLAUDE_CODE_ENABLE_TELEMETRY=1")
+print("export OTEL_LOGS_EXPORTER=otlp")
+print("export OTEL_EXPORTER_OTLP_PROTOCOL=http/json")
+print("export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:\(TokenCounterConfig.port)")
+
+app.run()

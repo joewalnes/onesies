@@ -120,3 +120,38 @@ Add specially formatted comments throughout the codebase, where appropriate, for
 - Add AIDEV-NOTE comments to mark configuration sections
 - Include startup guidance messages for better user onboarding
 - Use accessory app policy for menu bar tools (no dock icon)
+
+**6. Network & Protocol Handling in Single-File Tools**
+- Swift's `Network` framework (`NWListener`) works in shebang scripts and provides zero-dependency TCP server capability
+- For HTTP parsing on raw TCP, split on `\r\n\r\n` for header/body separation and use `Content-Length` for body framing
+- Always send response before cancelling connection (`send` then `cancel` in completion handler)
+- Use `DispatchQueue.main.async` for thread-safe UI updates from network callbacks
+- OTLP JSON can be parsed with `JSONSerialization` - avoids needing Codable structs for deeply nested protocol structures
+- Debug logging of first payload per source type is invaluable for validating protocol assumptions
+
+**7. OpenTelemetry Integration Patterns**
+- Both Claude Code and Codex CLI support OTLP HTTP JSON export for token usage tracking
+- Claude Code: set `CLAUDE_CODE_ENABLE_TELEMETRY=1`, `OTEL_LOGS_EXPORTER=otlp`, `OTEL_EXPORTER_OTLP_PROTOCOL=http/json`
+- OTLP attributes use a verbose format: `[{"key": "foo", "value": {"stringValue": "bar"}}]` - parse into flat dict for convenience
+- `intValue` in OTLP can be either a string or integer depending on the sender - handle both
+- Bind listener to loopback only (`NWEndpoint.hostPort(host: .ipv4(.loopback), port:)`) for security
+
+**8. Persistence & Animation in Menu Bar Tools**
+- Use `~/.config/<tool-name>/data.json` for simple JSON persistence (follows XDG conventions)
+- Use `FileManager.default.createDirectory(withIntermediateDirectories: true)` and explicit `do/catch` (not `try?`) so save failures are visible
+- Use `JSONSerialization` for persistence to stay consistent with OTLP parsing style
+- Write atomically (`.atomic` option) to prevent corruption from interrupted writes
+- For menu bar animations, use a custom `NSView` subview on `statusItem.button` with `draw(_ dirtyRect:)` override
+- Cubic ease-out (`1 - (1-t)^3`) provides satisfying count-up: fast start, gentle landing
+- Keep animation short (~0.6s at ~30fps) to feel responsive without being distracting
+- Use `onUpdate` callbacks rather than polling to trigger animations when data changes
+
+**9. Custom Chart Rendering in Menu Bar Apps**
+- Use `NSView` subclasses with `draw(_ dirtyRect:)` for charts in NSMenu items
+- `NSBezierPath(roundedRect:xRadius:yRadius:)` for bars with rounded corners
+- Clip to rounded rect (`addClip()`) before drawing stacked segments for clean bar ends
+- Always `saveGraphicsState()`/`restoreGraphicsState()` around clip operations
+- Use `NSColor.system*` colors (systemBlue, systemOrange, etc.) for automatic dark/light mode
+- `NSColor.separatorColor.withAlphaComponent(0.15)` is idiomatic for subtle background tracks
+- Bucket time-series data into fixed slots and show only a few axis labels to avoid clutter
+- Size chart views to fit menu dropdown width (~260px) with standard 14px insets
