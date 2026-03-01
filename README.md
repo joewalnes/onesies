@@ -37,6 +37,33 @@ A menu bar Pomodoro timer with customizable durations, color-coded states, and g
 ./macos/pomodoro -d 45m -w 5m       # 45-minute timer, 5-minute warning
 ```
 
+### 📊 Token Counter
+
+A menu bar app that tracks LLM token usage from Claude Code and Codex CLI, with activity charts and cost tracking.
+
+<img src="screenshots/token-counter.png" alt="Token Counter in macOS menu bar" width="300">
+
+**Features:**
+- Counts input/output tokens from Claude Code and OpenAI Codex CLI
+- Built-in OpenTelemetry (OTLP) HTTP receiver — no external collector needed
+- 24-hour activity timeline at pixel-level resolution
+- Token flow breakdown chart (input/output/cache per source)
+- Persistent data across restarts
+- Counting animation with color flash on new tokens
+- Per-source and per-session breakdowns with cost tracking
+
+**Usage:**
+```bash
+# Start the menu bar app
+./macos/token-counter
+
+# It prints the env vars to add to your shell profile:
+# export CLAUDE_CODE_ENABLE_TELEMETRY=1
+# export OTEL_LOGS_EXPORTER=otlp
+# export OTEL_EXPORTER_OTLP_PROTOCOL=http/json
+# export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+```
+
 ## Tool Categories
 
 ### 📟 CLI Tools (`cli/`)
@@ -130,6 +157,7 @@ When adding new tools:
 - **`hello-swift`** - Native Cocoa app with GUI form, checkboxes, and real-time greeting updates
 - **`pomodoro`** - Menu bar Pomodoro timer with color-coded states, global shortcuts, and CLI options for testing
 - **`timezones`** - Menu bar multi-timezone display with 2x2 grid layout and customizable timezone list
+- **`token-counter`** - Menu bar LLM token counter with activity timeline and token flow charts, built-in OTLP receiver for Claude Code and Codex CLI telemetry
 
 ### Userscripts
 
