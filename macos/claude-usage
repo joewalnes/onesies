@@ -1,0 +1,1012 @@
+#!/usr/bin/swift
+
+// macOS menu bar app showing Anthropic API usage and rate limits
+//
+// You can execute this file directly (no need to compile, or use Xcode).
+//
+//   $ ./claude-usage
+//
+// ============================================================
+// COST OF RUNNING THIS APP
+// ============================================================
+//
+// Anthropic has NO free "check my limits" endpoint. To read your rate
+// limit status, this app must make a real API call and inspect the
+// response headers. It uses the cheapest possible call: one message
+// to claude-haiku-4-5 requesting max_tokens=1.
+//
+// The app auto-discovers the cheapest model (Haiku) via GET /v1/models
+// on startup, so you never need to update a hardcoded model name.
+//
+// Cost per probe (Haiku pricing as of March 2026):
+//   ~10 input tokens × $1.00/MTok  = $0.00001
+//   ~1 output token  × $5.00/MTok  = $0.000005
+//   Total per probe                ≈ $0.000015
+//
+// At the default 5-minute refresh interval:
+//   Per day:   288 probes × $0.000015  ≈  $0.004
+//   Per month: 8,640 probes × $0.000015 ≈  $0.13
+//
+// So roughly 10–15 cents per month. Adjust refreshInterval below
+// to trade frequency for cost.
+//
+// With an Admin API key, the usage and cost data comes from the
+// Admin API which is free and does NOT count against rate limits.
+// Only the rate-limit probe costs money.
+//
+// ============================================================
+//
+// API key setup:
+//   On first run, click the ✳ menu bar icon and choose "Set API Key..."
+//   to paste your key. It will be stored in the macOS Keychain.
+//
+//   Alternatively, set an environment variable:
+//     export ANTHROPIC_API_KEY=sk-ant-...
+//     export ANTHROPIC_ADMIN_API_KEY=sk-ant-admin...  (for usage+cost)
+//
+// Features:
+//   - Menu bar ✳ with percentage showing remaining rate limit capacity
+//   - Color-coded warnings (default → orange → red as limits approach)
+//   - Progress bars for requests, input tokens, output tokens
+//   - Today's usage breakdown with Admin API key (tokens + cost)
+//   - API key stored securely in macOS Keychain
+//   - Auto-refresh on configurable interval
+//   - Zero dependencies beyond macOS system frameworks
+//
+// - Joe Walnes
+
+import Cocoa
+import Foundation
+import Security
+
+// AIDEV-NOTE: User Configuration - Easy to modify settings
+// ========================================================
+
+struct UsageConfig {
+    // Refresh interval: seconds between rate limit probes.
+    // See cost table in header comment. 300s ≈ $0.13/month with Haiku.
+    static var refreshInterval: TimeInterval = 300
+
+    // AIDEV-NOTE: probeModel is auto-discovered at startup by calling
+    // GET /v1/models and picking the cheapest (Haiku) model. This avoids
+    // hardcoding a model name that will go stale when new versions ship.
+    // The fallback is only used if the models endpoint fails.
+    static var probeModel = "claude-haiku-4-5"  // fallback if auto-discovery fails
+    static let probeModelFallback = "claude-haiku-4-5"
+
+    // Warning thresholds (fraction of capacity remaining)
+    static var warningThreshold = 0.25       // Orange below 25%
+    static var criticalThreshold = 0.10      // Red below 10%
+
+    // Display
+    static let menuBarFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+    static let menuItemFont = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+    static let sectionFont = NSFont.systemFont(ofSize: 12, weight: .semibold)
+
+    // Progress bar appearance
+    static let barWidth = 10                 // Characters wide
+    static let barFilled: Character = "█"
+    static let barEmpty: Character = "░"
+
+    // Keychain
+    static let keychainService = "claude-usage"
+    static let keychainAccount = "anthropic-api-key"
+
+    // Anthropic Console URL for getting API keys
+    static let apiKeysURL = "https://console.anthropic.com/settings/keys"
+}
+
+// ============================================================
+// MARK: - Helpers
+// ============================================================
+
+func formatTokens(_ n: Int) -> String {
+    if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000.0) }
+    if n >= 10_000 { return String(format: "%.0fK", Double(n) / 1_000.0) }
+    if n >= 1_000 { return String(format: "%.1fK", Double(n) / 1_000.0) }
+    return "\(n)"
+}
+
+func formatTimeUntil(_ date: Date) -> String {
+    let s = max(0, Int(date.timeIntervalSinceNow))
+    if s >= 3600 { return "\(s / 3600)h \((s % 3600) / 60)m" }
+    if s >= 60 { return "\(s / 60)m \(s % 60)s" }
+    return "\(s)s"
+}
+
+func progressBar(_ fraction: Double) -> String {
+    let clamped = max(0, min(1, fraction))
+    let filled = Int(clamped * Double(UsageConfig.barWidth))
+    let empty = UsageConfig.barWidth - filled
+    return String(repeating: UsageConfig.barFilled, count: filled)
+         + String(repeating: UsageConfig.barEmpty, count: empty)
+}
+
+// ============================================================
+// MARK: - Keychain
+// ============================================================
+
+// AIDEV-NOTE: Uses the Security framework directly (not the `security` CLI)
+// for non-interactive Keychain access. The key is stored as a generic password
+// under service "claude-usage". macOS handles encryption and access control.
+
+class Keychain {
+    static func save(_ key: String) {
+        guard let data = key.data(using: .utf8) else { return }
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: UsageConfig.keychainService,
+            kSecAttrAccount as String: UsageConfig.keychainAccount,
+        ]
+        // Remove existing entry first to avoid duplication errors
+        SecItemDelete(query as CFDictionary)
+
+        var addQuery = query
+        addQuery[kSecValueData as String] = data
+        let status = SecItemAdd(addQuery as CFDictionary, nil)
+        if status != errSecSuccess {
+            fputs("claude-usage: failed to save key to Keychain (status \(status))\n", stderr)
+        }
+    }
+
+    static func load() -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: UsageConfig.keychainService,
+            kSecAttrAccount as String: UsageConfig.keychainAccount,
+            kSecReturnData as String: true,
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess, let data = result as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    static func delete() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: UsageConfig.keychainService,
+            kSecAttrAccount as String: UsageConfig.keychainAccount,
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
+}
+
+// ============================================================
+// MARK: - Data Models
+// ============================================================
+
+enum KeySource { case env, keychain, none }
+
+struct RateLimits {
+    var requestsLimit = 0
+    var requestsRemaining = 0
+    var requestsReset: Date?
+    var tokensLimit = 0
+    var tokensRemaining = 0
+    var tokensReset: Date?
+    var inputTokensLimit = 0
+    var inputTokensRemaining = 0
+    var outputTokensLimit = 0
+    var outputTokensRemaining = 0
+
+    // AIDEV-NOTE: minRemainingFraction drives the menu bar percentage.
+    // It's the minimum across all tracked limit types so you see the
+    // most constrained resource at a glance.
+    var minRemainingFraction: Double {
+        var fracs: [Double] = []
+        if requestsLimit > 0 {
+            fracs.append(Double(requestsRemaining) / Double(requestsLimit))
+        }
+        if tokensLimit > 0 {
+            fracs.append(Double(tokensRemaining) / Double(tokensLimit))
+        }
+        return fracs.min() ?? 1.0
+    }
+
+    var hasData: Bool { requestsLimit > 0 || tokensLimit > 0 }
+
+    var earliestReset: Date? {
+        [requestsReset, tokensReset].compactMap { $0 }.min()
+    }
+}
+
+struct DailyUsage {
+    var inputTokens = 0
+    var cachedInputTokens = 0
+    var cacheCreationTokens = 0
+    var outputTokens = 0
+
+    var totalTokens: Int {
+        inputTokens + cachedInputTokens + cacheCreationTokens + outputTokens
+    }
+}
+
+// ============================================================
+// MARK: - API Client
+// ============================================================
+
+// AIDEV-NOTE: Two modes of operation:
+// 1. Regular API key → probe call reads rate limit headers
+// 2. Admin API key → also fetches usage report and cost data
+// The probe sends model=probeModel, max_tokens=1, message="h" — the
+// cheapest possible API call. See cost table in file header.
+
+class AnthropicClient {
+    let apiKey: String
+    let baseURL = "https://api.anthropic.com"
+    var isAdmin: Bool { apiKey.hasPrefix("sk-ant-admin") }
+
+    init(apiKey: String) {
+        self.apiKey = apiKey
+    }
+
+    /// Discover the cheapest available model by fetching /v1/models.
+    /// Looks for the newest Haiku model (always the cheapest tier).
+    /// This call is free — no tokens consumed.
+    func discoverCheapestModel(completion: @escaping (String?) -> Void) {
+        guard let url = URL(string: "\(baseURL)/v1/models?limit=100") else {
+            completion(nil); return
+        }
+
+        var req = URLRequest(url: url)
+        req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+
+        URLSession.shared.dataTask(with: req) { data, response, error in
+            guard error == nil,
+                  let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let models = json["data"] as? [[String: Any]] else {
+                completion(nil); return
+            }
+
+            // AIDEV-NOTE: Find the newest Haiku model by display_name containing
+            // "Haiku" and picking the most recent created_at. Haiku is always
+            // Anthropic's cheapest tier. We prefer alias IDs (no date suffix)
+            // so they auto-resolve to the latest snapshot.
+            let haikus = models.filter { model in
+                let name = model["display_name"] as? String ?? ""
+                return name.contains("Haiku")
+            }
+
+            // Prefer alias (no date suffix like -20251001) over pinned version
+            let aliases = haikus.filter { model in
+                let id = model["id"] as? String ?? ""
+                // Alias IDs don't end with a date pattern
+                return !id.contains(where: { $0.isNumber }) ||
+                       id.range(of: #"-\d{8}$"#, options: .regularExpression) == nil
+            }
+
+            let best = (aliases.isEmpty ? haikus : aliases)
+                .sorted { a, b in
+                    let da = a["created_at"] as? String ?? ""
+                    let db = b["created_at"] as? String ?? ""
+                    return da > db  // newest first
+                }
+                .first
+
+            completion(best?["id"] as? String)
+        }.resume()
+    }
+
+    /// Make a minimal API call to read rate limit response headers
+    func probeRateLimits(completion: @escaping (RateLimits?, String?) -> Void) {
+        guard let url = URL(string: "\(baseURL)/v1/messages") else {
+            completion(nil, "Invalid URL"); return
+        }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "model": UsageConfig.probeModel,
+            "max_tokens": 1,
+            "messages": [["role": "user", "content": "h"]]
+        ])
+
+        URLSession.shared.dataTask(with: req) { _, response, error in
+            if let error = error {
+                completion(nil, error.localizedDescription); return
+            }
+            guard let http = response as? HTTPURLResponse else {
+                completion(nil, "No HTTP response"); return
+            }
+            if http.statusCode == 401 {
+                completion(nil, "Invalid API key"); return
+            }
+            if http.statusCode == 404 {
+                completion(nil, "Model '\(UsageConfig.probeModel)' not found"); return
+            }
+            // Rate limit headers are present even on 429 responses
+            let rl = self.parseHeaders(http)
+            if !rl.hasData {
+                completion(nil, "No rate limit headers in response"); return
+            }
+            completion(rl, nil)
+        }.resume()
+    }
+
+    // AIDEV-NOTE: HTTP header keys can be case-normalized differently by Foundation.
+    // Build a lowercase lookup table for reliable access.
+    func parseHeaders(_ resp: HTTPURLResponse) -> RateLimits {
+        var lh: [String: String] = [:]
+        for (k, v) in resp.allHeaderFields {
+            if let ks = k as? String, let vs = v as? String {
+                lh[ks.lowercased()] = vs
+            }
+        }
+
+        func h(_ name: String) -> String? { lh[name] }
+        func hi(_ name: String) -> Int { Int(h(name) ?? "") ?? 0 }
+        func hd(_ name: String) -> Date? {
+            guard let s = h(name) else { return nil }
+            return ISO8601DateFormatter().date(from: s)
+        }
+
+        var rl = RateLimits()
+        rl.requestsLimit = hi("anthropic-ratelimit-requests-limit")
+        rl.requestsRemaining = hi("anthropic-ratelimit-requests-remaining")
+        rl.requestsReset = hd("anthropic-ratelimit-requests-reset")
+        rl.tokensLimit = hi("anthropic-ratelimit-tokens-limit")
+        rl.tokensRemaining = hi("anthropic-ratelimit-tokens-remaining")
+        rl.tokensReset = hd("anthropic-ratelimit-tokens-reset")
+        rl.inputTokensLimit = hi("anthropic-ratelimit-input-tokens-limit")
+        rl.inputTokensRemaining = hi("anthropic-ratelimit-input-tokens-remaining")
+        rl.outputTokensLimit = hi("anthropic-ratelimit-output-tokens-limit")
+        rl.outputTokensRemaining = hi("anthropic-ratelimit-output-tokens-remaining")
+        return rl
+    }
+
+    /// Fetch today's usage from the Admin API (free, no rate limit impact)
+    func fetchUsage(completion: @escaping (DailyUsage?, String?) -> Void) {
+        guard isAdmin else { completion(nil, nil); return }
+
+        let fmt = ISO8601DateFormatter()
+        let now = Date()
+        let start = Calendar.current.startOfDay(for: now)
+        let urlStr = "\(baseURL)/v1/organizations/usage_report/messages"
+            + "?starting_at=\(fmt.string(from: start))"
+            + "&ending_at=\(fmt.string(from: now))"
+            + "&bucket_width=1d"
+
+        guard let url = URL(string: urlStr) else { completion(nil, "Bad URL"); return }
+
+        var req = URLRequest(url: url)
+        req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+
+        URLSession.shared.dataTask(with: req) { data, response, error in
+            if let error = error { completion(nil, error.localizedDescription); return }
+            guard let http = response as? HTTPURLResponse else {
+                completion(nil, "No response"); return
+            }
+            if http.statusCode == 403 {
+                completion(nil, "Admin API access denied"); return
+            }
+            guard http.statusCode == 200,
+                  let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let rows = json["data"] as? [[String: Any]] else {
+                completion(nil, "HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)")
+                return
+            }
+
+            var usage = DailyUsage()
+            for row in rows {
+                usage.inputTokens += self.anyInt(row["uncached_input_tokens"])
+                usage.cachedInputTokens += self.anyInt(row["cached_input_tokens"])
+                usage.cacheCreationTokens += self.anyInt(row["cache_creation_input_tokens"])
+                usage.outputTokens += self.anyInt(row["output_tokens"])
+            }
+            completion(usage, nil)
+        }.resume()
+    }
+
+    /// Fetch today's cost from the Admin API (free, no rate limit impact)
+    func fetchCost(completion: @escaping (Double?, String?) -> Void) {
+        guard isAdmin else { completion(nil, nil); return }
+
+        let fmt = ISO8601DateFormatter()
+        let now = Date()
+        let start = Calendar.current.startOfDay(for: now)
+        let urlStr = "\(baseURL)/v1/organizations/cost_report"
+            + "?starting_at=\(fmt.string(from: start))"
+            + "&ending_at=\(fmt.string(from: now))"
+            + "&bucket_width=1d"
+
+        guard let url = URL(string: urlStr) else { completion(nil, nil); return }
+
+        var req = URLRequest(url: url)
+        req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let rows = json["data"] as? [[String: Any]] else {
+                completion(nil, nil); return
+            }
+            let total = rows.reduce(0.0) { sum, row in
+                if let s = row["cost_usd"] as? String { return sum + (Double(s) ?? 0) }
+                if let d = row["cost_usd"] as? Double { return sum + d }
+                return sum
+            }
+            completion(total > 0 ? total : nil, nil)
+        }.resume()
+    }
+
+    // AIDEV-NOTE: Handle Int, String, and Double values (same quirk as OTLP intValue)
+    private func anyInt(_ v: Any?) -> Int {
+        if let i = v as? Int { return i }
+        if let s = v as? String { return Int(s) ?? 0 }
+        if let d = v as? Double { return Int(d) }
+        return 0
+    }
+}
+
+// ============================================================
+// MARK: - App Delegate
+// ============================================================
+
+class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    var statusItem: NSStatusItem!
+    var menu: NSMenu!
+    var timer: Timer?
+    var client: AnthropicClient?
+    var keySource: KeySource = .none
+
+    var rateLimits: RateLimits?
+    var dailyUsage: DailyUsage?
+    var dailyCost: Double?
+    var lastError: String?
+    var lastRefresh: Date?
+    var isRefreshing = false
+
+    func applicationDidFinishLaunching(_ n: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+
+        loadAPIKey()
+
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let btn = statusItem.button {
+            btn.font = UsageConfig.menuBarFont
+        }
+
+        menu = NSMenu()
+        menu.delegate = self
+        statusItem.menu = menu
+
+        updateMenuBar()
+
+        if let client = client {
+            // Discover cheapest model before first probe, then start refresh loop
+            client.discoverCheapestModel { [weak self] model in
+                DispatchQueue.main.async {
+                    if let model = model {
+                        UsageConfig.probeModel = model
+                        fputs("claude-usage: auto-selected probe model: \(model)\n", stderr)
+                    }
+                    self?.refresh()
+                    self?.timer = Timer.scheduledTimer(
+                        withTimeInterval: UsageConfig.refreshInterval, repeats: true
+                    ) { [weak self] _ in
+                        self?.refresh()
+                    }
+                }
+            }
+        }
+    }
+
+    // AIDEV-NOTE: API key resolution order:
+    // 1. ANTHROPIC_ADMIN_API_KEY env var (enables usage + cost data)
+    // 2. ANTHROPIC_API_KEY env var (rate limits only)
+    // 3. macOS Keychain (set via the "Set API Key..." menu item)
+    func loadAPIKey() {
+        let env = ProcessInfo.processInfo.environment
+        var apiKey = ""
+
+        if let k = env["ANTHROPIC_ADMIN_API_KEY"], !k.isEmpty {
+            apiKey = k; keySource = .env
+        } else if let k = env["ANTHROPIC_API_KEY"], !k.isEmpty {
+            apiKey = k; keySource = .env
+        } else if let k = Keychain.load(), !k.isEmpty {
+            apiKey = k; keySource = .keychain
+        }
+
+        if !apiKey.isEmpty {
+            client = AnthropicClient(apiKey: apiKey)
+        } else {
+            keySource = .none
+        }
+    }
+
+    func setAPIKey(_ key: String) {
+        Keychain.save(key)
+        let newClient = AnthropicClient(apiKey: key)
+        client = newClient
+        keySource = .keychain
+        rateLimits = nil
+        dailyUsage = nil
+        dailyCost = nil
+        lastError = nil
+        updateMenuBar()
+        // Re-discover cheapest model for the new key (different org may have different models)
+        newClient.discoverCheapestModel { [weak self] model in
+            DispatchQueue.main.async {
+                if let model = model { UsageConfig.probeModel = model }
+                self?.refresh()
+            }
+        }
+    }
+
+    func clearAPIKey() {
+        Keychain.delete()
+        client = nil
+        keySource = .none
+        rateLimits = nil
+        dailyUsage = nil
+        dailyCost = nil
+        lastError = nil
+        updateMenuBar()
+    }
+
+    func refresh() {
+        guard let client = client, !isRefreshing else { return }
+        isRefreshing = true
+        updateMenuBar()
+
+        client.probeRateLimits { [weak self] limits, error in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.rateLimits = limits
+                self.lastError = error
+                self.lastRefresh = Date()
+                self.isRefreshing = false
+                self.updateMenuBar()
+            }
+        }
+
+        // Admin-only: fetch usage and cost in parallel (free API calls)
+        if client.isAdmin {
+            client.fetchUsage { [weak self] usage, _ in
+                DispatchQueue.main.async { if let u = usage { self?.dailyUsage = u } }
+            }
+            client.fetchCost { [weak self] cost, _ in
+                DispatchQueue.main.async { if let c = cost { self?.dailyCost = c } }
+            }
+        }
+    }
+
+    func updateMenuBar() {
+        guard let btn = statusItem.button else { return }
+
+        if client == nil {
+            btn.title = "✳ Set Key"
+            return
+        }
+        if isRefreshing && rateLimits == nil {
+            btn.title = "✳ ..."
+            return
+        }
+        guard let rl = rateLimits else {
+            if lastError != nil {
+                btn.title = "✳ Err"
+            } else {
+                btn.title = "✳ --"
+            }
+            return
+        }
+
+        let frac = rl.minRemainingFraction
+        let pct = Int(frac * 100)
+        let text = "✳ \(pct)%"
+
+        // AIDEV-NOTE: Use attributedTitle for color control. Omit foregroundColor
+        // in normal state so the system manages menu bar text appearance correctly
+        // across light/dark mode and active/inactive states.
+        var attrs: [NSAttributedString.Key: Any] = [
+            .font: UsageConfig.menuBarFont
+        ]
+        if frac < UsageConfig.criticalThreshold {
+            attrs[.foregroundColor] = NSColor.systemRed
+        } else if frac < UsageConfig.warningThreshold {
+            attrs[.foregroundColor] = NSColor.systemOrange
+        }
+
+        btn.attributedTitle = NSAttributedString(string: text, attributes: attrs)
+    }
+
+    // AIDEV-NOTE: Key entry uses a real NSWindow (not NSAlert) so that:
+    // 1. Cmd+V paste works — we install an Edit menu with standard shortcuts
+    // 2. The window shows in Exposé/Mission Control and Cmd+Tab
+    // 3. Switching to browser and back works naturally
+    // Temporarily switches to .regular activation policy for proper window
+    // management, then back to .accessory when done.
+    var keyEntryWindow: NSWindow?
+    var keyEntryField: NSTextField?
+    var savedMainMenu: NSMenu?
+
+    func showKeyEntryDialog() {
+        // If window already open, just bring it forward
+        if let w = keyEntryWindow, w.isVisible {
+            w.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        NSApp.setActivationPolicy(.regular)
+
+        // Install Edit menu so Cmd+V/C/X/A work in the text field
+        savedMainMenu = NSApp.mainMenu
+        let mainMenu = NSMenu()
+        let editMenuItem = NSMenuItem()
+        editMenuItem.submenu = {
+            let m = NSMenu(title: "Edit")
+            m.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+            m.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+            m.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+            m.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+            m.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+            return m
+        }()
+        mainMenu.addItem(editMenuItem)
+        NSApp.mainMenu = mainMenu
+
+        // Build window
+        let w = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 440, height: 200),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        w.title = "Claude Usage — API Key"
+        w.center()
+        w.isReleasedWhenClosed = false
+        w.delegate = self
+
+        let content = NSView(frame: w.contentView!.bounds)
+        content.autoresizingMask = [.width, .height]
+        w.contentView = content
+
+        let inset: CGFloat = 20
+        let fullWidth = content.bounds.width - inset * 2
+        var y: CGFloat = content.bounds.height - inset
+
+        // Instructions
+        let label = NSTextField(wrappingLabelWithString:
+            "Paste your Anthropic API key. It will be stored securely in the macOS Keychain.\n\n"
+            + "An Admin key (sk-ant-admin...) enables extra usage and cost tracking."
+        )
+        label.frame = NSRect(x: inset, y: y - 70, width: fullWidth, height: 70)
+        label.isEditable = false
+        label.isSelectable = false
+        label.isBordered = false
+        label.drawsBackground = false
+        label.font = NSFont.systemFont(ofSize: 13)
+        content.addSubview(label)
+        y -= 80
+
+        // Text field
+        let field = NSTextField(frame: NSRect(x: inset, y: y - 26, width: fullWidth, height: 26))
+        field.placeholderString = "sk-ant-..."
+        field.font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        content.addSubview(field)
+        keyEntryField = field
+        y -= 46
+
+        // Buttons row
+        let btnWidth: CGFloat = 110
+        let btnHeight: CGFloat = 32
+        let btnY = y - btnHeight
+
+        let getKeyBtn = NSButton(frame: NSRect(x: inset, y: btnY, width: btnWidth, height: btnHeight))
+        getKeyBtn.title = "Get API Key..."
+        getKeyBtn.bezelStyle = .rounded
+        getKeyBtn.target = self
+        getKeyBtn.action = #selector(openConsole)
+        content.addSubview(getKeyBtn)
+
+        let saveBtn = NSButton(frame: NSRect(
+            x: content.bounds.width - inset - btnWidth, y: btnY,
+            width: btnWidth, height: btnHeight
+        ))
+        saveBtn.title = "Save"
+        saveBtn.bezelStyle = .rounded
+        saveBtn.keyEquivalent = "\r"  // Enter key
+        saveBtn.target = self
+        saveBtn.action = #selector(saveKeyClicked)
+        content.addSubview(saveBtn)
+
+        let cancelBtn = NSButton(frame: NSRect(
+            x: content.bounds.width - inset - btnWidth * 2 - 10, y: btnY,
+            width: btnWidth, height: btnHeight
+        ))
+        cancelBtn.title = "Cancel"
+        cancelBtn.bezelStyle = .rounded
+        cancelBtn.keyEquivalent = "\u{1b}"  // Escape key
+        cancelBtn.target = self
+        cancelBtn.action = #selector(cancelKeyClicked)
+        content.addSubview(cancelBtn)
+
+        keyEntryWindow = w
+        w.makeKeyAndOrderFront(nil)
+        w.makeFirstResponder(field)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func dismissKeyEntryDialog() {
+        keyEntryWindow?.close()
+        keyEntryWindow = nil
+        keyEntryField = nil
+        if let m = savedMainMenu { NSApp.mainMenu = m; savedMainMenu = nil }
+        NSApp.setActivationPolicy(.accessory)
+    }
+
+    @objc func openConsole() {
+        if let url = URL(string: UsageConfig.apiKeysURL) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    @objc func saveKeyClicked() {
+        let key = (keyEntryField?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if key.isEmpty {
+            dismissKeyEntryDialog()
+            return
+        }
+        if !key.hasPrefix("sk-ant-") {
+            let err = NSAlert()
+            err.messageText = "Invalid Key"
+            err.informativeText = "Anthropic API keys start with \"sk-ant-\"."
+            err.beginSheetModal(for: keyEntryWindow!, completionHandler: nil)
+            return
+        }
+        dismissKeyEntryDialog()
+        setAPIKey(key)
+    }
+
+    @objc func cancelKeyClicked() {
+        dismissKeyEntryDialog()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        if (notification.object as? NSWindow) === keyEntryWindow {
+            dismissKeyEntryDialog()
+        }
+    }
+}
+
+// ============================================================
+// MARK: - Menu Construction
+// ============================================================
+// AIDEV-NOTE: Menu is rebuilt on each open for fresh data display.
+// Uses NSMenuDelegate.menuWillOpen which fires before the menu renders.
+
+extension AppDelegate: NSMenuDelegate {
+    func menuWillOpen(_ menu: NSMenu) {
+        menu.removeAllItems()
+
+        if client == nil {
+            buildNoKeyMenu()
+            return
+        }
+
+        if let error = lastError, rateLimits == nil {
+            addDisabled("Error: \(error)")
+            menu.addItem(.separator())
+            addAction("Retry", action: #selector(refreshClicked), key: "r")
+            menu.addItem(.separator())
+            buildKeyManagement()
+            menu.addItem(.separator())
+            addAction("Quit", action: #selector(quit), key: "q")
+            return
+        }
+
+        if let rl = rateLimits {
+            buildRateLimitsSection(rl)
+        }
+
+        if let usage = dailyUsage {
+            menu.addItem(.separator())
+            buildUsageSection(usage)
+        }
+
+        menu.addItem(.separator())
+        buildFooter()
+    }
+
+    func buildNoKeyMenu() {
+        addDisabled("No API key configured")
+        menu.addItem(.separator())
+        addAction("Set API Key...", action: #selector(setKeyClicked), key: "k")
+        menu.addItem(.separator())
+        addAction("Quit", action: #selector(quit), key: "q")
+    }
+
+    func buildRateLimitsSection(_ rl: RateLimits) {
+        addSectionHeader("Rate Limits  ·  \(UsageConfig.probeModel)")
+
+        // Requests
+        if rl.requestsLimit > 0 {
+            let frac = Double(rl.requestsRemaining) / Double(rl.requestsLimit)
+            addBarItem(
+                label: "Requests",
+                fraction: frac,
+                detail: "\(rl.requestsRemaining) / \(rl.requestsLimit)"
+            )
+        }
+
+        // Tokens (combined limit)
+        if rl.tokensLimit > 0 {
+            let frac = Double(rl.tokensRemaining) / Double(rl.tokensLimit)
+            addBarItem(
+                label: "Tokens",
+                fraction: frac,
+                detail: "\(formatTokens(rl.tokensRemaining)) / \(formatTokens(rl.tokensLimit))"
+            )
+        }
+
+        // Input tokens (separate limit if available)
+        if rl.inputTokensLimit > 0 {
+            let frac = Double(rl.inputTokensRemaining) / Double(rl.inputTokensLimit)
+            addBarItem(
+                label: "Input",
+                fraction: frac,
+                detail: "\(formatTokens(rl.inputTokensRemaining)) / \(formatTokens(rl.inputTokensLimit))"
+            )
+        } else if rl.inputTokensRemaining > 0 {
+            addMonoItem("  Input remaining:  \(formatTokens(rl.inputTokensRemaining))")
+        }
+
+        // Output tokens (separate limit if available)
+        if rl.outputTokensLimit > 0 {
+            let frac = Double(rl.outputTokensRemaining) / Double(rl.outputTokensLimit)
+            addBarItem(
+                label: "Output",
+                fraction: frac,
+                detail: "\(formatTokens(rl.outputTokensRemaining)) / \(formatTokens(rl.outputTokensLimit))"
+            )
+        } else if rl.outputTokensRemaining > 0 {
+            addMonoItem("  Output remaining: \(formatTokens(rl.outputTokensRemaining))")
+        }
+
+        // Reset time
+        if let reset = rl.earliestReset {
+            addMonoItem("  Resets in \(formatTimeUntil(reset))")
+        }
+    }
+
+    func buildUsageSection(_ usage: DailyUsage) {
+        addSectionHeader("Today's Usage")
+        addMonoItem("  Input:          \(formatTokens(usage.inputTokens))")
+        addMonoItem("  Output:         \(formatTokens(usage.outputTokens))")
+        if usage.cacheCreationTokens > 0 {
+            addMonoItem("  Cache created:  \(formatTokens(usage.cacheCreationTokens))")
+        }
+        if usage.cachedInputTokens > 0 {
+            addMonoItem("  Cache hits:     \(formatTokens(usage.cachedInputTokens))")
+        }
+        addMonoItem("  Total:          \(formatTokens(usage.totalTokens))")
+
+        if let cost = dailyCost {
+            addMonoItem("  Cost:           $\(String(format: "%.2f", cost))")
+        }
+    }
+
+    func buildFooter() {
+        if let t = lastRefresh {
+            let fmt = DateFormatter()
+            fmt.timeStyle = .medium
+            addDisabled("Updated \(fmt.string(from: t))")
+        }
+        if let error = lastError {
+            addDisabled("⚠ \(error)")
+        }
+
+        addAction("Refresh Now", action: #selector(refreshClicked), key: "r")
+        menu.addItem(.separator())
+        buildKeyManagement()
+        menu.addItem(.separator())
+        addAction("Quit", action: #selector(quit), key: "q")
+    }
+
+    func buildKeyManagement() {
+        addAction("Change API Key...", action: #selector(setKeyClicked), key: "k")
+        if keySource == .keychain {
+            addAction("Clear API Key", action: #selector(clearKeyClicked), key: "")
+        }
+        if keySource == .env {
+            addDisabled("  Key from environment variable")
+        }
+    }
+
+    // MARK: - Menu Item Helpers
+
+    func addSectionHeader(_ title: String) {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.attributedTitle = NSAttributedString(
+            string: title, attributes: [.font: UsageConfig.sectionFont]
+        )
+        item.isEnabled = false
+        menu.addItem(item)
+    }
+
+    /// Add a line with progress bar: "  ████████░░  82%  Requests: 41/50"
+    func addBarItem(label: String, fraction: Double, detail: String) {
+        let bar = progressBar(fraction)
+        let pct = String(format: "%3d%%", Int(fraction * 100))
+        let text = "  \(bar)  \(pct)  \(label): \(detail)"
+
+        let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+
+        var attrs: [NSAttributedString.Key: Any] = [
+            .font: UsageConfig.menuItemFont
+        ]
+        if fraction < UsageConfig.criticalThreshold {
+            attrs[.foregroundColor] = NSColor.systemRed
+        } else if fraction < UsageConfig.warningThreshold {
+            attrs[.foregroundColor] = NSColor.systemOrange
+        }
+
+        item.attributedTitle = NSAttributedString(string: text, attributes: attrs)
+        menu.addItem(item)
+    }
+
+    func addMonoItem(_ text: String) {
+        let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        item.attributedTitle = NSAttributedString(
+            string: text, attributes: [.font: UsageConfig.menuItemFont]
+        )
+        menu.addItem(item)
+    }
+
+    func addDisabled(_ text: String) {
+        let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        menu.addItem(item)
+    }
+
+    func addAction(_ title: String, action: Selector, key: String) {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        item.target = self
+        menu.addItem(item)
+    }
+
+    @objc func refreshClicked() { refresh() }
+    @objc func setKeyClicked() { showKeyEntryDialog() }
+    @objc func clearKeyClicked() { clearAPIKey() }
+    @objc func quit() { NSApp.terminate(nil) }
+}
+
+// ============================================================
+// MARK: - Main Entry Point
+// ============================================================
+
+signal(SIGINT) { _ in exit(0) }
+signal(SIGTERM) { _ in exit(0) }
+
+let app = NSApplication.shared
+let delegate = AppDelegate()
+app.delegate = delegate
+
+fputs("""
+claude-usage: Anthropic API rate limit & usage monitor
+  Refresh interval: \(Int(UsageConfig.refreshInterval))s (~$0.13/month)
+  Probe model: auto-discovered (cheapest Haiku)
+
+  API key sources (first found wins):
+    1. ANTHROPIC_ADMIN_API_KEY env var (enables usage + cost tracking)
+    2. ANTHROPIC_API_KEY env var (rate limits only)
+    3. macOS Keychain (set via menu bar → "Set API Key...")
+
+  Press Ctrl+C to quit
+
+""", stderr)
+
+app.run()
