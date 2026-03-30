@@ -150,6 +150,7 @@ When adding new tools:
 
 - **`hello`** - Bash greeting tool with options for uppercase, timestamps, and custom names
 - **`hello-perl`** - Perl greeting tool demonstrating POD documentation and core module usage
+- **`gmail-sync`** - Gmail-to-SQLite sync with OAuth2 auth, FTS5 search, incremental sync, watch mode, selective attachment download, and self-documenting database schema
 
 ### macOS Tools
 
@@ -158,6 +159,7 @@ When adding new tools:
 - **`pomodoro`** - Menu bar Pomodoro timer with color-coded states, global shortcuts, and CLI options for testing
 - **`timezones`** - Menu bar multi-timezone display with 2x2 grid layout and customizable timezone list
 - **`token-counter`** - Menu bar LLM token counter with activity timeline and token flow charts, built-in OTLP receiver for Claude Code and Codex CLI telemetry
+- **`claude-usage`** - Menu bar Anthropic API rate limit monitor with progress bars, color-coded warnings, and optional usage/cost tracking via Admin API
 
 ### Userscripts
 

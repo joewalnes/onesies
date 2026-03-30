@@ -1,0 +1,1263 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "google-api-python-client>=2.100.0",
+#     "google-auth-oauthlib>=1.1.0",
+#     "google-auth-httplib2>=0.1.1",
+# ]
+# ///
+
+"""
+gmail-sync - Sync Gmail to a local SQLite database
+
+A single-file tool that downloads your Gmail to a local SQLite DB for
+offline querying, full-text search, and backup. One-way sync only.
+
+AIDEV-NOTE: This tool uses uv inline script metadata (PEP 723) for
+dependency management. Run with: ./gmail-sync or uv run gmail-sync
+"""
+
+import argparse
+import base64
+import datetime
+import fnmatch
+import gzip
+import hashlib
+import json
+import os
+import re
+import signal
+import sqlite3
+import sys
+import textwrap
+import time
+
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+# ============================================================================
+# Configuration
+# AIDEV-NOTE: User-configurable values at the top for easy modification
+# ============================================================================
+
+VERSION = "1.0.0"
+GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+BATCH_SIZE = 10           # Messages per batch request (Gmail concurrency limit is strict)
+BATCH_DELAY = 0.5         # Seconds between batch requests to avoid concurrency errors
+POLL_INTERVAL = 1         # Seconds between watch mode polls
+MAX_RETRIES = 8           # Exponential backoff retry attempts
+INITIAL_BACKOFF = 1.0     # Starting backoff delay in seconds
+DEFAULT_SINCE = "30d"     # Default time range if neither --since nor --all given
+LIST_PAGE_SIZE = 500      # Results per messages.list page (max 500)
+AUTO_DOWNLOAD_SIZE = 102400  # Auto-download attachments smaller than this (100KB)
+
+# ============================================================================
+# Output helpers
+# ============================================================================
+
+class Output:
+    """Handles progress output: colored for TTY, plain for pipes, silent for --quiet."""
+
+    def __init__(self, quiet=False):
+        self.quiet = quiet
+        self.is_tty = sys.stderr.isatty()
+
+    def _write(self, msg, color=None):
+        if self.quiet:
+            return
+        if self.is_tty and color:
+            codes = {"red": "31", "green": "32", "yellow": "33", "blue": "34", "dim": "90"}
+            sys.stderr.write(f"\033[{codes.get(color, '0')}m{msg}\033[0m\n")
+        else:
+            sys.stderr.write(f"{msg}\n")
+        sys.stderr.flush()
+
+    def info(self, msg):
+        self._write(msg)
+
+    def success(self, msg):
+        self._write(f"✓ {msg}" if self.is_tty else msg, "green")
+
+    def warn(self, msg):
+        self._write(f"⚠ {msg}" if self.is_tty else f"WARN: {msg}", "yellow")
+
+    def error(self, msg):
+        self._write(f"✗ {msg}" if self.is_tty else f"ERROR: {msg}", "red")
+
+    def progress(self, msg):
+        """Overwriting progress line for TTY, regular line for pipes."""
+        if self.quiet:
+            return
+        if self.is_tty:
+            sys.stderr.write(f"\033[34m{msg}\033[0m\r")
+            sys.stderr.flush()
+        else:
+            sys.stderr.write(f"{msg}\n")
+            sys.stderr.flush()
+
+    def progress_done(self):
+        """Clear the progress line on TTY."""
+        if self.is_tty and not self.quiet:
+            sys.stderr.write("\033[2K\r")
+            sys.stderr.flush()
+
+# ============================================================================
+# Argument parsing
+# ============================================================================
+
+def parse_since(value):
+    """Parse --since value into a datetime. Supports: 7d, 3mo, 2y, 2020-01-01."""
+    if value is None:
+        return None
+    m = re.match(r'^(\d+)(d|w|mo|y)$', value)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if unit == 'd':
+            return now - datetime.timedelta(days=n)
+        elif unit == 'w':
+            return now - datetime.timedelta(weeks=n)
+        elif unit == 'mo':
+            return now - datetime.timedelta(days=n * 30)
+        elif unit == 'y':
+            return now - datetime.timedelta(days=n * 365)
+    # Try ISO date
+    try:
+        dt = datetime.datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError(f"Invalid --since value: {value!r}. Use e.g. 7d, 3mo, 2y, 2020-01-01")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        prog="gmail-sync",
+        description="Sync Gmail to a local SQLite database.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            examples:
+              gmail-sync mail.db                          # sync last 30 days
+              gmail-sync mail.db --all                    # sync everything
+              gmail-sync mail.db --since 7d               # last 7 days
+              gmail-sync mail.db --since 3mo              # last 3 months
+              gmail-sync mail.db --since 2020-01-01       # since a specific date
+              gmail-sync mail.db --watch                  # keep polling for new mail
+              gmail-sync mail.db --label INBOX             # only inbox
+              gmail-sync mail.db --from boss@co.com       # only from specific sender
+              gmail-sync mail.db --query "has:attachment"  # Gmail search query
+              gmail-sync mail.db --attachments "*.pdf"     # download PDF attachments
+              gmail-sync mail.db --attachments "*.pdf,*.csv" --since 1y
+              gmail-sync mail.db --fetch-attachments "*.pdf" --since 1y  # lazy download
+
+            attachment auto-download:
+              Attachments under 100KB are always downloaded (inline images, small
+              receipts). Override with --auto-download-size. Use --attachments for
+              selective download by pattern, or --fetch-attachments to retroactively
+              download attachments for messages already in the database.
+        """),
+    )
+
+    # Subcommands: default is "sync", but "fetch-attachments" is a separate mode
+    parser.add_argument("db", help="Path to SQLite database file (created if missing)")
+    parser.add_argument("--credentials", default=None,
+                        help="Path to OAuth2 credentials.json (default: ~/.config/gmail-sync/credentials.json)")
+    parser.add_argument("-V", "--version", action="version", version=f"%(prog)s {VERSION}")
+
+    time_group = parser.add_mutually_exclusive_group()
+    time_group.add_argument("--since", type=parse_since, default=None,
+                            help="How far back to sync (e.g. 7d, 3mo, 2y, 2020-01-01)")
+    time_group.add_argument("--all", action="store_true", help="Sync all messages")
+
+    parser.add_argument("--watch", action="store_true", help="Keep running, poll for new messages")
+    parser.add_argument("--label", action="append", default=[], help="Filter by label (repeatable)")
+    parser.add_argument("--from", dest="from_addr", action="append", default=[],
+                        help="Filter by sender (repeatable)")
+    parser.add_argument("--query", default=None, help="Gmail search query (passthrough)")
+    parser.add_argument("--attachments", default=None,
+                        help='Download attachments matching glob pattern during sync (e.g. "*.pdf,*.csv", "*" for all)')
+    parser.add_argument("--fetch-attachments", default=None, dest="fetch_attachments",
+                        help='Retroactively download attachments matching pattern from already-synced messages')
+    parser.add_argument("--auto-download-size", type=int, default=AUTO_DOWNLOAD_SIZE,
+                        help=f"Auto-download attachments smaller than this in bytes (default: {AUTO_DOWNLOAD_SIZE})")
+    parser.add_argument("--quiet", action="store_true", help="Suppress all output except errors")
+
+    args = parser.parse_args()
+
+    # Default to 30 days if neither --since nor --all specified
+    if not args.all and args.since is None and not args.fetch_attachments:
+        args.since = parse_since(DEFAULT_SINCE)
+
+    return args
+
+# ============================================================================
+# Authentication
+# ============================================================================
+
+AUTH_GUIDE = """\
+┌─────────────────────────────────────────────────────────┐
+│                Gmail Sync — First-Time Setup            │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  You need a Google Cloud OAuth2 credentials file.       │
+│  Here's how to get one:                                 │
+│                                                         │
+│  1. Go to https://console.cloud.google.com/             │
+│  2. Create a new project (or select an existing one)    │
+│  3. Enable the Gmail API:                               │
+│     → APIs & Services → Library → search "Gmail API"    │
+│     → click Enable                                      │
+│  4. Create OAuth credentials:                           │
+│     → APIs & Services → Credentials                     │
+│     → Create Credentials → OAuth client ID              │
+│     → Application type: Desktop app                     │
+│     → Download the JSON file                            │
+│  5. If prompted, configure the OAuth consent screen:    │
+│     → User type: External → fill in app name & email    │
+│     → Add scope: gmail.readonly                         │
+│     → Add yourself as a test user                       │
+│                                                         │
+│  Then run again with:                                   │
+│    gmail-sync mymail.db --credentials path/to/file.json │
+│                                                         │
+│  The credentials file will be copied to:                │
+│    ~/.config/gmail-sync/credentials.json                │
+│  and a token will be saved alongside it after login.    │
+│                                                         │
+└─────────────────────────────────────────────────────────┘"""
+
+
+def authenticate(credentials_path, output):
+    """Authenticate with Gmail API via OAuth2. Returns a Gmail service object."""
+    config_dir = os.path.expanduser("~/.config/gmail-sync")
+    os.makedirs(config_dir, exist_ok=True)
+    stored_creds = os.path.join(config_dir, "credentials.json")
+    token_path = os.path.join(config_dir, "token.json")
+
+    creds = None
+
+    # Try loading existing token
+    if os.path.exists(token_path):
+        try:
+            creds = Credentials.from_authorized_user_file(token_path, GMAIL_SCOPES)
+        except Exception:
+            output.warn("Stored token is invalid, re-authenticating...")
+            creds = None
+
+    # Refresh or re-auth
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            with open(token_path, "w") as f:
+                f.write(creds.to_json())
+        except Exception:
+            output.warn("Token refresh failed, re-authenticating...")
+            creds = None
+
+    if not creds or not creds.valid:
+        # Find credentials.json
+        creds_file = None
+        if credentials_path and os.path.exists(credentials_path):
+            creds_file = credentials_path
+            # Copy to config dir for future use
+            if os.path.abspath(credentials_path) != os.path.abspath(stored_creds):
+                import shutil
+                shutil.copy2(credentials_path, stored_creds)
+                output.info(f"Credentials saved to {stored_creds}")
+        elif os.path.exists(stored_creds):
+            creds_file = stored_creds
+        elif credentials_path:
+            output.error(f"Credentials file not found: {credentials_path}")
+            sys.exit(1)
+
+        if not creds_file:
+            output.error("No credentials file found.")
+            print(AUTH_GUIDE, file=sys.stderr)
+            sys.exit(1)
+
+        output.info("Opening browser for Google sign-in...")
+        flow = InstalledAppFlow.from_client_secrets_file(creds_file, GMAIL_SCOPES)
+        creds = flow.run_local_server(port=0)
+
+        with open(token_path, "w") as f:
+            f.write(creds.to_json())
+        output.success("Authentication successful, token saved.")
+
+    return build("gmail", "v1", credentials=creds)
+
+# ============================================================================
+# Database
+# ============================================================================
+
+SCHEMA_SQL = """\
+CREATE TABLE IF NOT EXISTS messages (
+    id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL,
+    history_id INTEGER,
+    labels TEXT NOT NULL DEFAULT '[]',
+    sender TEXT,
+    recipient TEXT,
+    cc TEXT,
+    bcc TEXT,
+    subject TEXT,
+    date_utc TEXT,
+    internal_date_ms INTEGER,
+    snippet TEXT,
+    body_text TEXT,
+    body_html TEXT,
+    size_estimate INTEGER,
+    synced_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS message_raw (
+    message_id TEXT PRIMARY KEY REFERENCES messages(id),
+    raw BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS attachments (
+    attachment_id TEXT NOT NULL,
+    message_id TEXT NOT NULL REFERENCES messages(id),
+    filename TEXT,
+    mime_type TEXT,
+    size INTEGER,
+    data BLOB,
+    PRIMARY KEY (message_id, attachment_id)
+);
+
+CREATE TABLE IF NOT EXISTS sync_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);
+CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date_utc);
+CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender);
+CREATE INDEX IF NOT EXISTS idx_messages_subject ON messages(subject);
+CREATE INDEX IF NOT EXISTS idx_messages_history ON messages(history_id);
+CREATE INDEX IF NOT EXISTS idx_messages_internal_date ON messages(internal_date_ms);
+CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
+"""
+
+# AIDEV-NOTE: FTS triggers keep the full-text index in sync with the messages
+# table automatically on INSERT, UPDATE, and DELETE. The content-sync approach
+# means FTS reads from the messages table on demand, keeping storage efficient.
+FTS_SQL = """\
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    subject, body_text, sender, recipient,
+    content='messages',
+    content_rowid='rowid'
+);
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, subject, body_text, sender, recipient)
+    VALUES (new.rowid, new.subject, new.body_text, new.sender, new.recipient);
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, subject, body_text, sender, recipient)
+    VALUES ('delete', old.rowid, old.subject, old.body_text, old.sender, old.recipient);
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, subject, body_text, sender, recipient)
+    VALUES ('delete', old.rowid, old.subject, old.body_text, old.sender, old.recipient);
+    INSERT INTO messages_fts(rowid, subject, body_text, sender, recipient)
+    VALUES (new.rowid, new.subject, new.body_text, new.sender, new.recipient);
+END;
+"""
+
+
+# AIDEV-NOTE: The _guide table provides self-documenting schema info for
+# LLM agents and other tools querying this database. Query it first to
+# understand the schema before writing queries.
+GUIDE_SQL = """\
+CREATE TABLE IF NOT EXISTS _guide (
+    topic TEXT PRIMARY KEY,
+    content TEXT NOT NULL
+);
+
+INSERT OR REPLACE INTO _guide (topic, content) VALUES
+('overview', 'This is a Gmail sync database created by gmail-sync. It contains downloaded
+emails with full-text search support. The database is read-only from the consumer
+perspective — gmail-sync is the sole writer. The database uses WAL mode so you can
+read while a sync is in progress.'),
+
+('quick_start', '-- Count messages
+SELECT COUNT(*) FROM messages;
+
+-- Search emails by content (uses FTS5 full-text index)
+SELECT id, date_utc, sender, subject, snippet
+FROM messages WHERE id IN (SELECT id FROM messages_fts WHERE messages_fts MATCH ''invoice'')
+ORDER BY date_utc DESC LIMIT 20;
+
+-- Search by sender
+SELECT id, date_utc, subject, snippet FROM messages
+WHERE sender LIKE ''%@example.com%'' ORDER BY date_utc DESC;
+
+-- Messages with attachments
+SELECT m.id, m.date_utc, m.sender, m.subject, a.filename, a.mime_type, a.size
+FROM messages m JOIN attachments a ON m.id = a.message_id
+ORDER BY m.date_utc DESC;
+
+-- Get PDF attachments (data may be NULL if not yet downloaded)
+SELECT a.*, m.subject, m.sender FROM attachments a
+JOIN messages m ON a.message_id = m.id
+WHERE a.filename LIKE ''%.pdf'' AND a.data IS NOT NULL;
+
+-- Messages by label (labels stored as JSON array)
+SELECT * FROM messages WHERE json_each.value = ''INBOX''
+  AND id IN (SELECT id FROM messages, json_each(messages.labels));
+-- Simpler but less precise:
+SELECT * FROM messages WHERE labels LIKE ''%"INBOX"%'';'),
+
+('tables', '- messages: Core table. One row per email. Fields: id (Gmail ID), thread_id,
+  history_id, labels (JSON array), sender, recipient, cc, bcc, subject, date_utc (ISO 8601),
+  internal_date_ms (epoch ms), snippet, body_text, body_html, size_estimate, synced_at.
+- message_raw: 1:1 with messages. Contains gzip-compressed raw RFC 2822 source.
+  Decompress with: import gzip; gzip.decompress(raw_blob).
+  Not included in SELECT * on messages by design — join explicitly when needed.
+- attachments: Attachment metadata and optional data. Fields: attachment_id, message_id,
+  filename, mime_type, size, data (BLOB, NULL if not downloaded). Small attachments
+  (<100KB) are auto-downloaded. Others can be fetched later with:
+  gmail-sync <db> --fetch-attachments "*.pdf"
+- sync_state: Key-value pairs tracking sync progress. Keys: last_history_id,
+  backfill_page_token, backfill_complete, query_hash, account_email.
+- _guide: This table. Schema documentation for humans and LLM agents.'),
+
+('fts_search', 'Full-text search uses SQLite FTS5. The messages_fts virtual table indexes:
+subject, body_text, sender, recipient.
+
+-- Basic search
+SELECT * FROM messages_fts WHERE messages_fts MATCH ''quarterly report'';
+
+-- Phrase search
+SELECT * FROM messages_fts WHERE messages_fts MATCH ''"quarterly report"'';
+
+-- Boolean operators
+SELECT * FROM messages_fts WHERE messages_fts MATCH ''invoice AND pdf'';
+SELECT * FROM messages_fts WHERE messages_fts MATCH ''invoice OR receipt'';
+SELECT * FROM messages_fts WHERE messages_fts MATCH ''invoice NOT spam'';
+
+-- Column-specific search
+SELECT * FROM messages_fts WHERE messages_fts MATCH ''sender:alice subject:meeting'';
+
+-- Join back to messages for full data
+SELECT m.* FROM messages m
+JOIN messages_fts f ON m.rowid = f.rowid
+WHERE f.messages_fts MATCH ''invoice''
+ORDER BY m.date_utc DESC;'),
+
+('labels', 'Gmail labels are stored as a JSON array in messages.labels.
+Common labels: INBOX, SENT, DRAFT, SPAM, TRASH, UNREAD, STARRED, IMPORTANT, CATEGORY_PERSONAL, etc.
+
+-- List all unique labels in the database
+SELECT DISTINCT j.value FROM messages, json_each(messages.labels) AS j ORDER BY j.value;
+
+-- Count messages per label
+SELECT j.value AS label, COUNT(*) AS cnt
+FROM messages, json_each(messages.labels) AS j
+GROUP BY j.value ORDER BY cnt DESC;'),
+
+('tips', '- date_utc is ISO 8601 and sorts lexicographically: WHERE date_utc > ''2024-01-01''
+- internal_date_ms is Unix epoch milliseconds, useful for precise sorting
+- body_text is best-effort plain text extraction; body_html has the original HTML
+- snippet is Gmail''s auto-generated preview (first ~100 chars, HTML stripped)
+- For thread views: GROUP BY thread_id, ORDER BY internal_date_ms
+- This DB is in WAL mode — safe to query while gmail-sync is running
+- Attachments with data IS NULL have metadata only; re-run gmail-sync with
+  --fetch-attachments to download them lazily');
+"""
+
+
+def init_db(db_path, output):
+    """Initialize SQLite database with schema, WAL mode, FTS, and guide."""
+    is_new = not os.path.exists(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.executescript(SCHEMA_SQL)
+    conn.executescript(FTS_SQL)
+    conn.executescript(GUIDE_SQL)
+    conn.commit()
+    if is_new:
+        output.success(f"Created database: {db_path}")
+    return conn
+
+# ============================================================================
+# Sync state management
+# ============================================================================
+
+def get_state(conn, key):
+    row = conn.execute("SELECT value FROM sync_state WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def set_state(conn, key, value):
+    conn.execute("INSERT OR REPLACE INTO sync_state (key, value) VALUES (?, ?)",
+                 (key, str(value)))
+
+
+def compute_query_hash(args):
+    """Hash of filter args to detect if user changed filters between runs."""
+    parts = [
+        str(args.since) if args.since else ("ALL" if args.all else ""),
+        ",".join(sorted(args.label)),
+        ",".join(sorted(args.from_addr)),
+        args.query or "",
+    ]
+    return hashlib.md5("|".join(parts).encode()).hexdigest()[:12]
+
+# ============================================================================
+# Gmail query builder
+# ============================================================================
+
+def build_gmail_query(args):
+    """Build a Gmail search query string from CLI args."""
+    parts = []
+    if args.since:
+        date_str = args.since.strftime("%Y/%m/%d")
+        parts.append(f"after:{date_str}")
+    for label in args.label:
+        parts.append(f"label:{label}")
+    if args.from_addr:
+        if len(args.from_addr) == 1:
+            parts.append(f"from:{args.from_addr[0]}")
+        else:
+            parts.append("{" + " ".join(f"from:{a}" for a in args.from_addr) + "}")
+    if args.query:
+        parts.append(args.query)
+    return " ".join(parts) if parts else None
+
+# ============================================================================
+# Rate-limited API caller
+# ============================================================================
+
+def api_call(fn, output, **kwargs):
+    """Execute a Gmail API call with exponential backoff on rate limit / server errors."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            return fn(**kwargs).execute()
+        except HttpError as e:
+            if e.resp.status in (429, 500, 503):
+                retry_after = e.resp.get("retry-after")
+                if retry_after:
+                    delay = float(retry_after)
+                else:
+                    delay = INITIAL_BACKOFF * (2 ** attempt)
+                output.warn(f"API error {e.resp.status}, retrying in {delay:.1f}s...")
+                time.sleep(delay)
+            else:
+                raise
+    raise RuntimeError(f"API call failed after {MAX_RETRIES} retries")
+
+# ============================================================================
+# Message parsing
+# AIDEV-NOTE: Gmail API base64url uses URL-safe alphabet without padding.
+# Always pad before decoding: data + '==' handles any padding case.
+# ============================================================================
+
+def _decode_b64(data):
+    """Decode Gmail's base64url-encoded data."""
+    if not data:
+        return b""
+    return base64.urlsafe_b64decode(data + "==")
+
+
+def _get_header(headers, name):
+    """Get a header value by name (case-insensitive)."""
+    name_lower = name.lower()
+    for h in headers:
+        if h.get("name", "").lower() == name_lower:
+            return h.get("value", "")
+    return None
+
+
+def _extract_bodies(payload):
+    """Recursively extract text/plain and text/html bodies from MIME parts."""
+    text_body = None
+    html_body = None
+
+    mime = payload.get("mimeType", "")
+    parts = payload.get("parts", [])
+
+    if not parts:
+        # Leaf node
+        body_data = payload.get("body", {}).get("data", "")
+        if mime == "text/plain" and body_data:
+            text_body = _decode_b64(body_data).decode("utf-8", errors="replace")
+        elif mime == "text/html" and body_data:
+            html_body = _decode_b64(body_data).decode("utf-8", errors="replace")
+    else:
+        for part in parts:
+            t, h = _extract_bodies(part)
+            if t and not text_body:
+                text_body = t
+            if h and not html_body:
+                html_body = h
+
+    return text_body, html_body
+
+
+def _extract_attachments(payload, message_id):
+    """Extract attachment metadata from MIME parts."""
+    attachments = []
+
+    def _walk(part):
+        filename = part.get("filename", "")
+        body = part.get("body", {})
+        if filename and body.get("attachmentId"):
+            attachments.append({
+                "attachment_id": body["attachmentId"],
+                "message_id": message_id,
+                "filename": filename,
+                "mime_type": part.get("mimeType", ""),
+                "size": body.get("size", 0),
+            })
+        for sub in part.get("parts", []):
+            _walk(sub)
+
+    _walk(payload)
+    return attachments
+
+
+def parse_message(msg):
+    """Parse a Gmail API message (format=full) into a dict for DB insertion."""
+    payload = msg.get("payload", {})
+    headers = payload.get("headers", [])
+
+    text_body, html_body = _extract_bodies(payload)
+    attachment_records = _extract_attachments(payload, msg["id"])
+
+    # Parse date header to UTC ISO 8601
+    date_str = _get_header(headers, "Date")
+    date_utc = None
+    if date_str:
+        # email.utils handles RFC 2822 dates
+        from email.utils import parsedate_to_datetime
+        try:
+            dt = parsedate_to_datetime(date_str)
+            date_utc = dt.astimezone(datetime.timezone.utc).isoformat()
+        except Exception:
+            pass
+
+    return {
+        "id": msg["id"],
+        "thread_id": msg.get("threadId", ""),
+        "history_id": msg.get("historyId"),
+        "labels": json.dumps(msg.get("labelIds", [])),
+        "sender": _get_header(headers, "From"),
+        "recipient": _get_header(headers, "To"),
+        "cc": _get_header(headers, "Cc"),
+        "bcc": _get_header(headers, "Bcc"),
+        "subject": _get_header(headers, "Subject"),
+        "date_utc": date_utc,
+        "internal_date_ms": int(msg.get("internalDate", 0)),
+        "snippet": msg.get("snippet", ""),
+        "body_text": text_body,
+        "body_html": html_body,
+        "size_estimate": msg.get("sizeEstimate"),
+        "synced_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "attachments": attachment_records,
+    }
+
+# ============================================================================
+# Batch message fetcher
+# AIDEV-NOTE: Gmail has a strict per-user concurrency limit (~10 concurrent
+# requests). Batch requests count each sub-request against this limit.
+# Individual 429 errors inside a batch are NOT retried by the batch API —
+# they arrive as exceptions in the callback. We collect failed IDs and
+# retry them individually with exponential backoff.
+# ============================================================================
+
+def fetch_messages_batch(service, message_ids, output, include_raw=True):
+    """Fetch messages in batches, return list of parsed message dicts."""
+    results = {}
+    failed_full = []
+    failed_raw = []
+
+    # Pass 1: full format (batched)
+    def _make_full_callback(mid):
+        def cb(req_id, response, exception):
+            if exception:
+                failed_full.append(mid)
+                return
+            results[mid] = {"full": response}
+        return cb
+
+    for i in range(0, len(message_ids), BATCH_SIZE):
+        batch = service.new_batch_http_request()
+        chunk = message_ids[i:i + BATCH_SIZE]
+        for mid in chunk:
+            batch.add(
+                service.users().messages().get(userId="me", id=mid, format="full"),
+                callback=_make_full_callback(mid),
+            )
+        _execute_batch_with_retry(batch, output)
+        if i + BATCH_SIZE < len(message_ids):
+            time.sleep(BATCH_DELAY)
+
+    # Retry failed full fetches individually with backoff
+    if failed_full:
+        output.info(f"Retrying {len(failed_full)} failed fetches individually...")
+        for mid in failed_full:
+            try:
+                resp = api_call(
+                    service.users().messages().get, output,
+                    userId="me", id=mid, format="full",
+                )
+                results[mid] = {"full": resp}
+            except Exception as e:
+                output.warn(f"Failed to fetch {mid} after retries: {e}")
+
+    # Pass 2: raw format (batched, for gzip storage)
+    if include_raw:
+        def _make_raw_callback(mid):
+            def cb(req_id, response, exception):
+                if exception:
+                    failed_raw.append(mid)
+                    return
+                if mid in results:
+                    results[mid]["raw"] = response.get("raw", "")
+            return cb
+
+        raw_ids = [mid for mid in message_ids if mid in results]
+        for i in range(0, len(raw_ids), BATCH_SIZE):
+            batch = service.new_batch_http_request()
+            chunk = raw_ids[i:i + BATCH_SIZE]
+            for mid in chunk:
+                batch.add(
+                    service.users().messages().get(userId="me", id=mid, format="raw"),
+                    callback=_make_raw_callback(mid),
+                )
+            _execute_batch_with_retry(batch, output)
+            if i + BATCH_SIZE < len(raw_ids):
+                time.sleep(BATCH_DELAY)
+
+        # Retry failed raw fetches individually (best-effort)
+        for mid in failed_raw:
+            try:
+                resp = api_call(
+                    service.users().messages().get, output,
+                    userId="me", id=mid, format="raw",
+                )
+                if mid in results:
+                    results[mid]["raw"] = resp.get("raw", "")
+            except Exception:
+                pass  # raw is best-effort
+
+    # Parse results
+    parsed = []
+    for mid, data in results.items():
+        full = data.get("full")
+        if not full:
+            continue
+        msg = parse_message(full)
+        raw_data = data.get("raw", "")
+        if raw_data:
+            msg["raw_gzip"] = gzip.compress(_decode_b64(raw_data))
+        else:
+            msg["raw_gzip"] = None
+        parsed.append(msg)
+
+    return parsed
+
+
+def _execute_batch_with_retry(batch, output):
+    """Execute a batch request with retry on transient errors."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            batch.execute()
+            return
+        except HttpError as e:
+            if e.resp.status in (429, 500, 503):
+                delay = INITIAL_BACKOFF * (2 ** attempt)
+                output.warn(f"Batch error {e.resp.status}, retrying in {delay:.1f}s...")
+                time.sleep(delay)
+            else:
+                raise
+    raise RuntimeError(f"Batch request failed after {MAX_RETRIES} retries")
+
+# ============================================================================
+# Database writes
+# ============================================================================
+
+def upsert_messages(conn, messages):
+    """Insert or update messages and their attachments."""
+    for msg in messages:
+        attachments = msg.pop("attachments", [])
+        raw_gzip = msg.pop("raw_gzip", None)
+
+        conn.execute("""
+            INSERT OR REPLACE INTO messages
+                (id, thread_id, history_id, labels, sender, recipient, cc, bcc,
+                 subject, date_utc, internal_date_ms, snippet, body_text, body_html,
+                 size_estimate, synced_at)
+            VALUES (:id, :thread_id, :history_id, :labels, :sender, :recipient,
+                    :cc, :bcc, :subject, :date_utc, :internal_date_ms, :snippet,
+                    :body_text, :body_html, :size_estimate, :synced_at)
+        """, msg)
+
+        if raw_gzip:
+            conn.execute("""
+                INSERT OR REPLACE INTO message_raw (message_id, raw) VALUES (?, ?)
+            """, (msg["id"], raw_gzip))
+
+        for att in attachments:
+            conn.execute("""
+                INSERT OR IGNORE INTO attachments
+                    (attachment_id, message_id, filename, mime_type, size)
+                VALUES (:attachment_id, :message_id, :filename, :mime_type, :size)
+            """, att)
+
+# ============================================================================
+# Attachment downloader
+# ============================================================================
+
+def _should_download_attachment(att, patterns, auto_size):
+    """Decide whether an attachment should be downloaded.
+
+    Returns True if:
+    - The attachment is smaller than auto_size (auto-download small files like
+      inline images, small receipts, etc.)
+    - The filename or MIME type matches one of the glob patterns
+    """
+    size = att.get("size", 0) or 0
+    if size > 0 and size <= auto_size:
+        return True
+    if patterns:
+        filename = att.get("filename", "")
+        mime = att.get("mime_type", "")
+        pattern_list = [p.strip() for p in patterns.split(",")]
+        if any(fnmatch.fnmatch(filename, p) or fnmatch.fnmatch(mime, p) for p in pattern_list):
+            return True
+    return False
+
+
+def download_attachments_for_message(service, conn, message_id, attachment_records, patterns, auto_size, output):
+    """Download attachment data for attachments that should be downloaded.
+
+    Auto-downloads small attachments (< auto_size) regardless of pattern.
+    Also downloads attachments matching glob patterns if specified.
+    """
+    if not attachment_records:
+        return 0
+
+    downloaded = 0
+    for att in attachment_records:
+        if not _should_download_attachment(att, patterns, auto_size):
+            continue
+
+        # Check if already downloaded
+        row = conn.execute(
+            "SELECT 1 FROM attachments WHERE message_id=? AND attachment_id=? AND data IS NOT NULL",
+            (message_id, att["attachment_id"]),
+        ).fetchone()
+        if row:
+            continue
+
+        try:
+            result = api_call(
+                service.users().messages().attachments().get,
+                output,
+                userId="me", messageId=message_id, id=att["attachment_id"],
+            )
+            data = _decode_b64(result.get("data", ""))
+            conn.execute(
+                "UPDATE attachments SET data=? WHERE message_id=? AND attachment_id=?",
+                (data, message_id, att["attachment_id"]),
+            )
+            downloaded += 1
+        except Exception as e:
+            output.warn(f"Failed to download attachment {att.get('filename', '?')}: {e}")
+
+    return downloaded
+
+
+# ============================================================================
+# Lazy attachment fetch (retroactive download for already-synced messages)
+# ============================================================================
+
+def fetch_attachments_retroactive(service, conn, patterns, auto_size, output):
+    """Download attachments matching patterns from messages already in the DB.
+
+    This is the --fetch-attachments mode: scan all attachment metadata in the
+    database and download data for any that match the pattern but haven't been
+    downloaded yet.
+    """
+    if not patterns:
+        output.error("--fetch-attachments requires a glob pattern (e.g. '*.pdf')")
+        sys.exit(1)
+
+    pattern_list = [p.strip() for p in patterns.split(",")]
+
+    # Find undownloaded attachments matching the pattern
+    rows = conn.execute("""
+        SELECT a.attachment_id, a.message_id, a.filename, a.mime_type, a.size
+        FROM attachments a
+        WHERE a.data IS NULL
+        ORDER BY a.message_id
+    """).fetchall()
+
+    candidates = []
+    for r in rows:
+        att = {"attachment_id": r[0], "message_id": r[1], "filename": r[2], "mime_type": r[3], "size": r[4]}
+        filename = att.get("filename", "")
+        mime = att.get("mime_type", "")
+        if any(fnmatch.fnmatch(filename, p) or fnmatch.fnmatch(mime, p) for p in pattern_list):
+            candidates.append(att)
+
+    if not candidates:
+        output.info("No matching undownloaded attachments found.")
+        return
+
+    output.info(f"Found {len(candidates)} attachments to download...")
+    downloaded = 0
+
+    for i, att in enumerate(candidates):
+        if shutdown_requested:
+            break
+
+        try:
+            result = api_call(
+                service.users().messages().attachments().get,
+                output,
+                userId="me", messageId=att["message_id"], id=att["attachment_id"],
+            )
+            data = _decode_b64(result.get("data", ""))
+            conn.execute(
+                "UPDATE attachments SET data=? WHERE message_id=? AND attachment_id=?",
+                (data, att["message_id"], att["attachment_id"]),
+            )
+            conn.commit()
+            downloaded += 1
+            output.progress(f"Downloaded {downloaded}/{len(candidates)}: {att.get('filename', '?')}")
+        except Exception as e:
+            output.warn(f"Failed to download {att.get('filename', '?')}: {e}")
+
+    output.progress_done()
+    output.success(f"Downloaded {downloaded} attachments")
+
+# ============================================================================
+# Graceful shutdown
+# ============================================================================
+
+shutdown_requested = False
+
+
+def _signal_handler(signum, frame):
+    global shutdown_requested
+    shutdown_requested = True
+
+
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+
+# ============================================================================
+# Backfill sync
+# ============================================================================
+
+def backfill(service, conn, args, output):
+    """Download messages matching the query, with resume support."""
+    query = build_gmail_query(args)
+    query_hash = compute_query_hash(args)
+
+    # AIDEV-NOTE: Always reset backfill when filters change. A completed 30d
+    # backfill should not block a subsequent 1y backfill from running.
+    stored_hash = get_state(conn, "query_hash")
+    if stored_hash and stored_hash != query_hash:
+        output.info("Filters changed since last sync, re-running backfill...")
+        set_state(conn, "backfill_page_token", "")
+        set_state(conn, "backfill_complete", "0")
+    set_state(conn, "query_hash", query_hash)
+    conn.commit()
+
+    # Check if backfill already completed
+    if get_state(conn, "backfill_complete") == "1":
+        output.info("Backfill already complete, running incremental sync...")
+        return incremental_sync(service, conn, args, output)
+
+    # Get current historyId before listing (needed for future incremental syncs)
+    profile = api_call(service.users().getProfile, output, userId="me")
+    current_history_id = profile["historyId"]
+    set_state(conn, "initial_history_id", str(current_history_id))
+    conn.commit()
+
+    # Resume from saved page token if available
+    page_token = get_state(conn, "backfill_page_token") or None
+
+    total_synced = 0
+    total_skipped = 0
+    page_num = 0
+
+    # Count existing messages for resume reporting
+    existing_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    if existing_count > 0 and page_token:
+        output.info(f"Resuming backfill ({existing_count} messages already synced)...")
+
+    output.info(f"Starting backfill{f' (query: {query})' if query else ''}...")
+
+    while not shutdown_requested:
+        page_num += 1
+
+        # List message IDs
+        list_kwargs = {"userId": "me", "maxResults": LIST_PAGE_SIZE}
+        if query:
+            list_kwargs["q"] = query
+        if page_token:
+            list_kwargs["pageToken"] = page_token
+
+        result = api_call(service.users().messages().list, output, **list_kwargs)
+
+        messages_meta = result.get("messages", [])
+        if not messages_meta:
+            break
+
+        # Filter out already-synced messages
+        msg_ids = [m["id"] for m in messages_meta]
+        existing = set()
+        for i in range(0, len(msg_ids), 900):
+            chunk = msg_ids[i:i + 900]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT id FROM messages WHERE id IN ({placeholders})", chunk
+            ).fetchall()
+            existing.update(r[0] for r in rows)
+
+        new_ids = [mid for mid in msg_ids if mid not in existing]
+        total_skipped += len(existing)
+
+        if new_ids:
+            # Batch fetch full messages
+            parsed = fetch_messages_batch(service, new_ids, output)
+
+            # Write to DB
+            upsert_messages(conn, parsed)
+
+            # Download attachments (auto-download small + pattern-matched)
+            for msg in parsed:
+                att_rows = conn.execute(
+                    "SELECT attachment_id, filename, mime_type, size FROM attachments WHERE message_id=?",
+                    (msg["id"],)
+                ).fetchall()
+                att_records = [
+                    {"attachment_id": r[0], "filename": r[1], "mime_type": r[2], "size": r[3]}
+                    for r in att_rows
+                ]
+                download_attachments_for_message(
+                    service, conn, msg["id"], att_records,
+                    args.attachments, args.auto_download_size, output,
+                )
+
+            total_synced += len(parsed)
+
+        # Save page token for resume
+        next_token = result.get("nextPageToken")
+        set_state(conn, "backfill_page_token", next_token or "")
+        conn.commit()
+
+        output.progress(f"Synced {total_synced} messages ({total_skipped} skipped, page {page_num})...")
+
+        if not next_token:
+            break
+
+        page_token = next_token
+
+    output.progress_done()
+
+    if shutdown_requested:
+        output.warn(f"Interrupted — {total_synced} messages synced so far. Resume by running again.")
+        return total_synced
+
+    # Mark backfill complete
+    set_state(conn, "backfill_complete", "1")
+    set_state(conn, "last_history_id", str(current_history_id))
+    set_state(conn, "backfill_page_token", "")
+    conn.commit()
+
+    total_in_db = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    output.success(f"Backfill complete: {total_synced} new messages synced ({total_in_db} total in database)")
+    return total_synced
+
+# ============================================================================
+# Incremental sync
+# ============================================================================
+
+def incremental_sync(service, conn, args, output):
+    """Sync new messages since last historyId using history.list API."""
+    last_history_id = get_state(conn, "last_history_id")
+    if not last_history_id:
+        output.warn("No history ID found, running full backfill...")
+        set_state(conn, "backfill_complete", "0")
+        conn.commit()
+        return backfill(service, conn, args, output)
+
+    try:
+        new_msg_ids = set()
+        page_token = None
+
+        while True:
+            kwargs = {
+                "userId": "me",
+                "startHistoryId": last_history_id,
+                "historyTypes": ["messageAdded"],
+            }
+            if page_token:
+                kwargs["pageToken"] = page_token
+
+            result = api_call(service.users().history().list, output, **kwargs)
+
+            for record in result.get("history", []):
+                for added in record.get("messagesAdded", []):
+                    new_msg_ids.add(added["message"]["id"])
+
+            # Track the latest historyId
+            if "historyId" in result:
+                last_history_id = result["historyId"]
+
+            page_token = result.get("nextPageToken")
+            if not page_token:
+                break
+
+        if not new_msg_ids:
+            set_state(conn, "last_history_id", str(last_history_id))
+            conn.commit()
+            return 0
+
+        # Filter by query if needed (history.list doesn't support queries)
+        # We fetch all new messages and rely on the user re-filtering at query time
+        msg_ids = list(new_msg_ids)
+
+        # Skip already-synced
+        existing = set()
+        for i in range(0, len(msg_ids), 900):
+            chunk = msg_ids[i:i + 900]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT id FROM messages WHERE id IN ({placeholders})", chunk
+            ).fetchall()
+            existing.update(r[0] for r in rows)
+
+        new_ids = [mid for mid in msg_ids if mid not in existing]
+
+        if new_ids:
+            parsed = fetch_messages_batch(service, new_ids, output)
+            upsert_messages(conn, parsed)
+
+            if args.attachments:
+                for msg in parsed:
+                    att_rows = conn.execute(
+                        "SELECT attachment_id, filename, mime_type, size FROM attachments WHERE message_id=?",
+                        (msg["id"],)
+                    ).fetchall()
+                    att_records = [
+                        {"attachment_id": r[0], "filename": r[1], "mime_type": r[2], "size": r[3]}
+                        for r in att_rows
+                    ]
+                    download_matching_attachments(service, conn, msg["id"], att_records, args.attachments, output)
+
+            output.success(f"Incremental sync: {len(new_ids)} new messages")
+
+        set_state(conn, "last_history_id", str(last_history_id))
+        conn.commit()
+        return len(new_ids)
+
+    except HttpError as e:
+        if e.resp.status == 404:
+            # AIDEV-NOTE: Gmail returns 404 when historyId is too old or invalid.
+            # Fall back to full re-backfill. Existing messages are preserved via upsert.
+            output.warn("History ID expired, falling back to full backfill...")
+            set_state(conn, "backfill_complete", "0")
+            set_state(conn, "backfill_page_token", "")
+            conn.commit()
+            return backfill(service, conn, args, output)
+        raise
+
+# ============================================================================
+# Watch mode
+# ============================================================================
+
+def watch_loop(service, conn, args, output):
+    """Poll for new messages every POLL_INTERVAL seconds."""
+    output.info(f"Watching for new messages (polling every {POLL_INTERVAL}s, Ctrl+C to stop)...")
+
+    while not shutdown_requested:
+        try:
+            count = incremental_sync(service, conn, args, output)
+            if count > 0:
+                total = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+                output.info(f"  ({total} total messages in database)")
+        except HttpError as e:
+            output.warn(f"API error during poll: {e}")
+        except Exception as e:
+            output.error(f"Unexpected error during poll: {e}")
+
+        # Sleep in small increments so Ctrl+C is responsive
+        for _ in range(POLL_INTERVAL * 10):
+            if shutdown_requested:
+                break
+            time.sleep(0.1)
+
+    output.info("Watch mode stopped.")
+
+# ============================================================================
+# Main
+# ============================================================================
+
+def main():
+    args = parse_args()
+    output = Output(quiet=args.quiet)
+
+    output.info(f"gmail-sync v{VERSION}")
+
+    # Authenticate
+    service = authenticate(args.credentials, output)
+
+    # Get account info
+    try:
+        profile = api_call(service.users().getProfile, output, userId="me")
+        output.info(f"Account: {profile['emailAddress']}")
+    except Exception as e:
+        output.error(f"Failed to get account info: {e}")
+        sys.exit(1)
+
+    # Initialize database
+    conn = init_db(args.db, output)
+
+    # Store account email
+    set_state(conn, "account_email", profile["emailAddress"])
+    conn.commit()
+
+    # Run sync or fetch-attachments mode
+    try:
+        if args.fetch_attachments:
+            fetch_attachments_retroactive(
+                service, conn, args.fetch_attachments,
+                args.auto_download_size, output,
+            )
+        else:
+            backfill(service, conn, args, output)
+
+            if args.watch and not shutdown_requested:
+                watch_loop(service, conn, args, output)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Final stats
+        total = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        att_count = conn.execute("SELECT COUNT(*) FROM attachments").fetchone()[0]
+        att_downloaded = conn.execute("SELECT COUNT(*) FROM attachments WHERE data IS NOT NULL").fetchone()[0]
+        output.info(f"Database: {total} messages, {att_count} attachments ({att_downloaded} downloaded)")
+        conn.close()
+
+    if shutdown_requested:
+        output.info("Graceful shutdown complete.")
+
+
+if __name__ == "__main__":
+    main()
