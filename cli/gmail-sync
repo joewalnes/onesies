@@ -554,6 +554,10 @@ def api_call(fn, output, **kwargs):
                 time.sleep(delay)
             else:
                 raise
+        except (ConnectionError, ConnectionResetError, OSError, TimeoutError) as e:
+            delay = INITIAL_BACKOFF * (2 ** attempt)
+            output.warn(f"Network error: {e}, retrying in {delay:.1f}s...")
+            time.sleep(delay)
     raise RuntimeError(f"API call failed after {MAX_RETRIES} retries")
 
 # ============================================================================
@@ -781,6 +785,12 @@ def _execute_batch_with_retry(batch, output):
                 time.sleep(delay)
             else:
                 raise
+        except (ConnectionError, ConnectionResetError, OSError, TimeoutError) as e:
+            # AIDEV-NOTE: Network errors (connection reset, timeout, etc.) are
+            # transient — retry with backoff just like HTTP 5xx errors.
+            delay = INITIAL_BACKOFF * (2 ** attempt)
+            output.warn(f"Network error: {e}, retrying in {delay:.1f}s...")
+            time.sleep(delay)
     raise RuntimeError(f"Batch request failed after {MAX_RETRIES} retries")
 
 # ============================================================================
