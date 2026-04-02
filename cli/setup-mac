@@ -1,0 +1,518 @@
+#!/bin/bash
+# setup-mac — Idempotent macOS setup script
+# Installs Homebrew, CLI tools, apps, and configures a fresh Mac.
+# Safe to re-run: skips anything already installed.
+#
+# Usage:
+#   ./cli/setup-mac
+#
+# AIDEV-NOTE: All user-configurable lists are at the top. Helper functions below.
+
+set -euo pipefail
+
+# ============================================================================
+# CONFIGURATION — Edit these lists to customize your setup
+# ============================================================================
+
+# --- Homebrew Formulae ---
+FORMULAE=(
+  # Dev languages & runtimes
+  go
+  rust
+  rustup
+  node
+  nodenv
+  node-build
+  "python@3.14"
+  uv
+  typescript
+  "llvm@21"
+
+  # Dev tools
+  git
+  gh
+  lazygit
+  tig
+  ripgrep
+  tree
+  tmux
+  mosh
+  socat
+
+  # Data & DBs
+  "postgresql@18"
+  duckdb
+  sqlite
+  yq
+
+  # Containers & infra
+  docker
+  docker-compose
+  docker-completion
+  terraform
+
+  # Monitoring
+  htop
+  bpytop
+
+  # Additional tools
+  httpie
+  fd
+  findutils
+  fzf
+  just
+  shellcheck
+  pandoc
+  ffmpeg
+  imagemagick
+  watch
+  zstd
+  websocketd
+
+  # Editor
+  "joewalnes/tap/zepto"
+
+  # Network — open-source tailscaled (supports SSH server + Funnel)
+  tailscale
+)
+
+# --- Homebrew Casks ---
+CASKS=(
+  1password
+  claude
+  claude-code
+  cleanshot
+  "font-jetbrains-mono-nerd-font"
+  ghostty
+  google-chrome
+  handy
+  raycast
+  utm
+  zed
+)
+
+# --- Mac App Store apps (name:id) ---
+# Get IDs from: https://mas.cjpais.com or `mas search <name>`
+MAS_APPS=(
+  "Bear:1091189122"
+  "Soulver 3:1508732804"
+  "Pages:409201541"
+  "Numbers:409203825"
+  "Keynote:409183694"
+  "Pixelmator Pro:1289583905"
+)
+
+# --- Shell config ---
+SHELL_PATHS=(
+  '$HOME/.local/bin'
+  '$HOME/go/bin'
+  '$HOME/.cargo/bin'
+)
+
+EDITOR_CMD="zepto"
+
+# --- Tailscale ---
+# The script will prompt interactively whether to set up Tailscale.
+# Pass --no-tailscale to skip without prompting.
+
+# ============================================================================
+# OUTPUT HELPERS
+# ============================================================================
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+installed_items=()
+skipped_items=()
+failed_items=()
+
+info()    { printf "${BLUE}ℹ️  %s${RESET}\n" "$*"; }
+success() { printf "${GREEN}✅ %s${RESET}\n" "$*"; }
+skip()    { printf "${YELLOW}⏭️  %s${RESET}\n" "$*"; }
+warn()    { printf "${YELLOW}⚠️  %s${RESET}\n" "$*"; }
+error()   { printf "${RED}❌ %s${RESET}\n" "$*"; }
+header()  { printf "\n${BOLD}${BLUE}══════════════════════════════════════════${RESET}\n${BOLD}  %s${RESET}\n${BOLD}${BLUE}══════════════════════════════════════════${RESET}\n\n" "$*"; }
+
+track_installed() { installed_items+=("$1"); }
+track_skipped()   { skipped_items+=("$1"); }
+track_failed()    { failed_items+=("$1"); }
+
+# ============================================================================
+# INSTALL FUNCTIONS
+# ============================================================================
+
+install_homebrew() {
+  header "Homebrew"
+  if command -v brew &>/dev/null; then
+    skip "Homebrew already installed"
+    track_skipped "Homebrew"
+  else
+    info "Installing Homebrew..."
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    # Add brew to PATH for the rest of this script
+    if [[ -f /opt/homebrew/bin/brew ]]; then
+      eval "$(/opt/homebrew/bin/brew shellenv)"
+    elif [[ -f /usr/local/bin/brew ]]; then
+      eval "$(/usr/local/bin/brew shellenv)"
+    fi
+    success "Homebrew installed"
+    track_installed "Homebrew"
+  fi
+
+  info "Updating Homebrew..."
+  brew update --quiet
+}
+
+install_mas() {
+  header "Mac App Store CLI (mas)"
+  if command -v mas &>/dev/null; then
+    skip "mas already installed"
+    track_skipped "mas"
+  else
+    info "Installing mas..."
+    brew install mas
+    success "mas installed"
+    track_installed "mas"
+  fi
+}
+
+install_formulae() {
+  header "Homebrew Formulae"
+  local installed
+  installed=$(brew list --formula 2>/dev/null)
+
+  for formula in "${FORMULAE[@]}"; do
+    # Extract the short name (e.g., "joewalnes/tap/zepto" -> "zepto")
+    local name="${formula##*/}"
+    if echo "$installed" | grep -qx "$name"; then
+      skip "$formula (already installed)"
+      track_skipped "formula: $formula"
+    else
+      info "Installing $formula..."
+      local output
+      if output=$(brew install "$formula" 2>&1); then
+        success "$formula installed"
+        track_installed "formula: $formula"
+      else
+        error "Failed to install $formula"
+        printf "      %s\n" "$output" | tail -5
+        track_failed "formula: $formula"
+      fi
+    fi
+  done
+}
+
+install_casks() {
+  header "Homebrew Casks"
+  local installed
+  installed=$(brew list --cask 2>/dev/null)
+
+  for cask in "${CASKS[@]}"; do
+    if echo "$installed" | grep -qx "$cask"; then
+      skip "$cask (already installed via brew)"
+      track_skipped "cask: $cask"
+    else
+      # Check if the app is already in /Applications (installed outside brew)
+      local app_name
+      app_name=$(brew info --cask "$cask" 2>/dev/null | grep -o '/Applications/.*\.app' | head -1 || true)
+      if [[ -n "$app_name" && -d "$app_name" ]]; then
+        skip "$cask (already installed at $app_name)"
+        track_skipped "cask: $cask"
+      else
+        info "Installing $cask..."
+        local output
+        if output=$(brew install --cask "$cask" 2>&1); then
+          success "$cask installed"
+          track_installed "cask: $cask"
+        else
+          # Check if it failed because the app already exists
+          if echo "$output" | grep -q "already an App"; then
+            skip "$cask (already installed)"
+            track_skipped "cask: $cask"
+          else
+            error "Failed to install $cask"
+            printf "      %s\n" "$output" | tail -5
+            track_failed "cask: $cask"
+          fi
+        fi
+      fi
+    fi
+  done
+}
+
+install_mas_apps() {
+  header "Mac App Store Apps"
+
+  if ! command -v mas &>/dev/null; then
+    error "mas not available, skipping App Store installs"
+    return
+  fi
+
+  local installed_ids
+  installed_ids=$(mas list 2>/dev/null | awk '{print $1}')
+
+  for entry in "${MAS_APPS[@]}"; do
+    local name="${entry%%:*}"
+    local id="${entry##*:}"
+    if echo "$installed_ids" | grep -qx "$id"; then
+      skip "$name (already installed)"
+      track_skipped "app store: $name"
+    else
+      info "Installing $name (ID: $id)..."
+      if mas install "$id" 2>/dev/null; then
+        success "$name installed"
+        track_installed "app store: $name"
+      else
+        error "Failed to install $name — you may need to sign in to the App Store first"
+        track_failed "app store: $name"
+      fi
+    fi
+  done
+}
+
+setup_shell() {
+  header "Shell & PATH"
+
+  # Ensure ~/.local/bin exists
+  if [[ ! -d "$HOME/.local/bin" ]]; then
+    mkdir -p "$HOME/.local/bin"
+    success "Created ~/.local/bin"
+    track_installed "directory: ~/.local/bin"
+  else
+    skip "~/.local/bin already exists"
+  fi
+
+  # Symlink ~/bin -> ~/.local/bin
+  if [[ -L "$HOME/bin" ]]; then
+    local target
+    target=$(readlink "$HOME/bin")
+    if [[ "$target" == "$HOME/.local/bin" || "$target" == ".local/bin" ]]; then
+      skip "~/bin already symlinked to ~/.local/bin"
+      track_skipped "symlink: ~/bin"
+    else
+      warn "~/bin is a symlink to $target (not touching it)"
+    fi
+  elif [[ -d "$HOME/bin" ]]; then
+    warn "~/bin is a real directory — not replacing with symlink (move contents to ~/.local/bin manually)"
+  else
+    ln -s "$HOME/.local/bin" "$HOME/bin"
+    success "Symlinked ~/bin -> ~/.local/bin"
+    track_installed "symlink: ~/bin -> ~/.local/bin"
+  fi
+
+  # Oh My Zsh
+  if [[ -d "$HOME/.oh-my-zsh" ]]; then
+    skip "Oh My Zsh already installed"
+    track_skipped "Oh My Zsh"
+  else
+    info "Installing Oh My Zsh..."
+    sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+    success "Oh My Zsh installed"
+    track_installed "Oh My Zsh"
+  fi
+
+  # Ensure PATH entries and EDITOR in .zshrc
+  local zshrc="$HOME/.zshrc"
+  local needs_change=false
+
+  # Build expected PATH export
+  local path_export='export PATH="$HOME/.local/bin:$HOME/go/bin:$HOME/.cargo/bin:$PATH"'
+  if ! grep -qF '.local/bin' "$zshrc" 2>/dev/null; then
+    needs_change=true
+  fi
+
+  # Check EDITOR
+  local editor_export="export EDITOR=$EDITOR_CMD"
+  if ! grep -qF "EDITOR=$EDITOR_CMD" "$zshrc" 2>/dev/null; then
+    needs_change=true
+  fi
+
+  if $needs_change; then
+    # Add PATH if missing
+    if ! grep -qF '.local/bin' "$zshrc" 2>/dev/null; then
+      # Replace existing PATH export or add new one
+      if grep -q '^export PATH=.*\.local/bin' "$zshrc" 2>/dev/null; then
+        skip "PATH already includes .local/bin"
+      else
+        # Add after the first comment block
+        printf '\n# PATH — local bins, Go, Cargo\n%s\n' "$path_export" >> "$zshrc"
+        success "Added PATH entries to .zshrc"
+        track_installed "shell: PATH config"
+      fi
+    fi
+
+    # Add EDITOR if missing
+    if ! grep -qF "EDITOR=$EDITOR_CMD" "$zshrc" 2>/dev/null; then
+      # Remove old EDITOR line if present
+      if grep -q '^export EDITOR=' "$zshrc" 2>/dev/null; then
+        sed -i '' "s|^export EDITOR=.*|export EDITOR=$EDITOR_CMD|" "$zshrc"
+        success "Updated EDITOR to $EDITOR_CMD in .zshrc"
+      else
+        printf '\n# Editor\nexport EDITOR=%s\n' "$EDITOR_CMD" >> "$zshrc"
+        success "Set EDITOR=$EDITOR_CMD in .zshrc"
+      fi
+      track_installed "shell: EDITOR=$EDITOR_CMD"
+    fi
+  else
+    skip "Shell PATH and EDITOR already configured"
+    track_skipped "shell: PATH + EDITOR"
+  fi
+
+  # fzf shell integration
+  if command -v fzf &>/dev/null; then
+    if ! grep -qF 'fzf' "$zshrc" 2>/dev/null; then
+      printf '\n# fzf shell integration\neval "$(fzf --zsh)"\n' >> "$zshrc"
+      success "Added fzf shell integration to .zshrc"
+      track_installed "shell: fzf integration"
+    else
+      skip "fzf integration already in .zshrc"
+    fi
+  fi
+}
+
+setup_tailscale() {
+  header "Tailscale (open-source tailscaled)"
+
+  if ! command -v tailscale &>/dev/null; then
+    error "tailscale formula not installed — cannot configure"
+    return
+  fi
+
+  # Already running and connected? Nothing to do.
+  if brew services list | grep -q 'tailscale.*started' && sudo tailscale status &>/dev/null; then
+    skip "Tailscale daemon running and connected"
+    track_skipped "tailscale"
+    return
+  fi
+
+  # Skip if --no-tailscale was passed
+  if $SKIP_TAILSCALE; then
+    skip "Tailscale setup skipped (--no-tailscale)"
+    return
+  fi
+
+  # Prompt — allow skipping interactively
+  printf "${BOLD}🌐 Set up Tailscale (open-source tailscaled)?${RESET}\n"
+  printf "   Supports SSH server and Funnel (CLI only, no GUI).\n"
+  printf "   [y]es / [n]o: "
+  read -r tailscale_answer
+  case "$tailscale_answer" in
+    [yY]|[yY][eE][sS]) ;;
+    *)
+      skip "Tailscale setup skipped"
+      track_skipped "tailscale"
+      return
+      ;;
+  esac
+
+  # Start the daemon via brew services
+  if ! brew services list | grep -q 'tailscale.*started'; then
+    info "Starting tailscale daemon (requires sudo)..."
+    sudo brew services start tailscale
+    success "Tailscale daemon started"
+    track_installed "tailscale daemon"
+  else
+    skip "Tailscale daemon already running"
+    track_skipped "tailscale daemon"
+  fi
+
+  # Check if already logged in
+  if sudo tailscale status &>/dev/null; then
+    skip "Tailscale already connected"
+    track_skipped "tailscale login"
+  else
+    printf "\n"
+    printf "${BOLD}What name would you like for this device on your tailnet?${RESET}\n"
+    printf "   (e.g., joes-macbook, studio, workstation)\n"
+    printf "   Device name: "
+    read -r device_name
+
+    if [[ -z "$device_name" ]]; then
+      device_name=$(scutil --get LocalHostName 2>/dev/null || hostname -s)
+      info "Using default name: $device_name"
+    fi
+
+    info "Logging in to Tailscale as '$device_name'..."
+    info "A browser window will open for authentication."
+    sudo tailscale up --hostname="$device_name"
+
+    if sudo tailscale status &>/dev/null; then
+      success "Tailscale connected as '$device_name'"
+      track_installed "tailscale: $device_name"
+
+      # Enable SSH
+      info "Enabling Tailscale SSH..."
+      sudo tailscale set --ssh
+      success "Tailscale SSH enabled"
+      track_installed "tailscale SSH"
+    else
+      error "Tailscale login may have failed — run 'sudo tailscale up' manually"
+      track_failed "tailscale login"
+    fi
+  fi
+}
+
+print_summary() {
+  header "Summary"
+
+  if [[ ${#installed_items[@]} -gt 0 ]]; then
+    printf "${GREEN}${BOLD}Installed (%d):${RESET}\n" "${#installed_items[@]}"
+    for item in "${installed_items[@]}"; do
+      printf "  ${GREEN}+ %s${RESET}\n" "$item"
+    done
+    printf "\n"
+  fi
+
+  if [[ ${#failed_items[@]} -gt 0 ]]; then
+    printf "${RED}${BOLD}Failed (%d):${RESET}\n" "${#failed_items[@]}"
+    for item in "${failed_items[@]}"; do
+      printf "  ${RED}✗ %s${RESET}\n" "$item"
+    done
+    printf "\n"
+  fi
+
+  if [[ ${#skipped_items[@]} -gt 0 ]]; then
+    printf "${YELLOW}${BOLD}Already installed (%d):${RESET}\n" "${#skipped_items[@]}"
+    for item in "${skipped_items[@]}"; do
+      printf "  ${YELLOW}· %s${RESET}\n" "$item"
+    done
+    printf "\n"
+  fi
+
+  if [[ ${#installed_items[@]} -eq 0 && ${#failed_items[@]} -eq 0 ]]; then
+    printf "${GREEN}${BOLD}🎉 Everything already set up! Nothing to do.${RESET}\n"
+  elif [[ ${#failed_items[@]} -eq 0 ]]; then
+    printf "${GREEN}${BOLD}🎉 All done! Restart your terminal for shell changes to take effect.${RESET}\n"
+  else
+    printf "${YELLOW}${BOLD}⚠️  Done with some failures. Check the items above.${RESET}\n"
+  fi
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+# Parse flags
+SKIP_TAILSCALE=false
+for arg in "$@"; do
+  case "$arg" in
+    --no-tailscale) SKIP_TAILSCALE=true ;;
+  esac
+done
+
+header "macOS Setup"
+printf "  This script will install and configure your Mac.\n"
+printf "  It's idempotent — safe to run again anytime.\n\n"
+
+install_homebrew
+install_mas
+install_formulae
+install_casks
+install_mas_apps
+setup_shell
+setup_tailscale
+print_summary
