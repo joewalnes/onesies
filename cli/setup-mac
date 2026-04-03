@@ -44,6 +44,7 @@ FORMULAE=(
   duckdb
   sqlite
   yq
+  jq
 
   # Containers & infra
   docker
@@ -96,9 +97,6 @@ CASKS=(
 MAS_APPS=(
   "Bear:1091189122"
   "Soulver 3:1508732804"
-  "Pages:409201541"
-  "Numbers:409203825"
-  "Keynote:409183694"
   "Pixelmator Pro:1289583905"
 )
 
