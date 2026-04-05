@@ -447,10 +447,51 @@ setup_tailscale() {
       sudo tailscale set --ssh
       success "Tailscale SSH enabled"
       track_installed "tailscale SSH"
+
+      # Set operator so non-sudo tailscale commands work
+      sudo tailscale set --operator="$USER"
     else
       error "Tailscale login may have failed — run 'sudo tailscale up' manually"
       track_failed "tailscale login"
     fi
+  fi
+
+  # AIDEV-NOTE: Open-source tailscaled doesn't configure macOS system DNS
+  # like the standalone app's network extension does. We create /etc/resolver/
+  # entries so MagicDNS names (e.g. "ssh joe-macstudio") resolve correctly.
+  setup_tailscale_dns
+}
+
+setup_tailscale_dns() {
+  # Get the tailnet MagicDNS domain from tailscale status
+  local tailnet
+  tailnet=$(tailscale status --json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('MagicDNSSuffix',''))" 2>/dev/null)
+
+  if [[ -z "$tailnet" ]]; then
+    warn "Could not detect tailnet domain — skipping MagicDNS resolver setup"
+    return
+  fi
+
+  local resolver_dir="/etc/resolver"
+  local needs_setup=false
+
+  if [[ ! -f "$resolver_dir/$tailnet" ]] || ! grep -q '100.100.100.100' "$resolver_dir/$tailnet" 2>/dev/null; then
+    needs_setup=true
+  fi
+  if [[ ! -f "$resolver_dir/ts.net" ]] || ! grep -q '100.100.100.100' "$resolver_dir/ts.net" 2>/dev/null; then
+    needs_setup=true
+  fi
+
+  if $needs_setup; then
+    info "Setting up MagicDNS resolvers for $tailnet..."
+    sudo mkdir -p "$resolver_dir"
+    echo "nameserver 100.100.100.100" | sudo tee "$resolver_dir/$tailnet" >/dev/null
+    echo "nameserver 100.100.100.100" | sudo tee "$resolver_dir/ts.net" >/dev/null
+    success "MagicDNS resolvers configured (tailnet names will resolve)"
+    track_installed "tailscale MagicDNS"
+  else
+    skip "MagicDNS resolvers already configured"
+    track_skipped "tailscale MagicDNS"
   fi
 }
 
