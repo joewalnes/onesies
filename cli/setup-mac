@@ -29,6 +29,7 @@ FORMULAE=(
   "llvm@21"
 
   # Dev tools
+  1password-cli
   git
   gh
   lazygit
