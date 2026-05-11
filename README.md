@@ -138,7 +138,7 @@ Tools assume these programs are available:
 
 When adding new tools:
 
-1. **One file rule**: Entire tool must be in a single file
+1. **One file rule**: Entire tool must be in a single file (with an optional single-file test suite named `<toolname>-test`)
 2. **No external dependencies**: Use only standard system programs
 3. **Cross-platform**: Test on both Linux and macOS
 4. **Documentation**: Include usage examples in comments
@@ -161,6 +161,7 @@ When adding new tools:
 - **`timezones`** - Menu bar multi-timezone display with 2x2 grid layout and customizable timezone list
 - **`token-counter`** - Menu bar LLM token counter with activity timeline and token flow charts, built-in OTLP receiver for Claude Code and Codex CLI telemetry
 - **`claude-usage`** - Menu bar Anthropic API rate limit monitor with progress bars, color-coded warnings, and optional usage/cost tracking via Admin API
+- **`apple-ai-api`** - OpenAI-compatible HTTP API server for Apple's on-device Foundation Models, with streaming, chat web UI, and API key auth
 
 ### Userscripts
 

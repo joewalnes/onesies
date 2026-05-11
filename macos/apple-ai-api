@@ -1,0 +1,987 @@
+#!/usr/bin/swift
+
+// apple-ai-api — OpenAI-compatible HTTP API for Apple's on-device Foundation Models
+//
+// Usage:
+//   ./macos/apple-ai-api [options]
+//
+// Options:
+//   -p, --port PORT       Port to listen on (default: 8080)
+//   -k, --api-key KEY     Require this API key for all requests (optional)
+//   -d, --debug           Enable debug logging of requests and responses
+//   -h, --help            Show this help message
+//
+// Exposes Apple's on-device LLM via an OpenAI-compatible REST API.
+// Point any OpenAI client at http://localhost:8080 and it just works.
+
+import Foundation
+import Network
+@preconcurrency import FoundationModels
+
+// AIDEV-NOTE: User Configuration - Easy to modify settings
+struct Config {
+    static var port: UInt16 = 8080
+    static var apiKey: String? = nil
+    static var debug: Bool = false
+    static var skipModelCheck: Bool = false // for testing the HTTP layer without Apple Intelligence
+    static let host: NWEndpoint.Host = .ipv4(.loopback) // localhost only for security
+    static let maxRequestSize = 10 * 1024 * 1024 // 10 MB
+    static let modelId = "apple-foundation-model"
+    static let modelName = "Apple Foundation Model (~3B on-device)"
+}
+
+// MARK: - CLI argument parsing
+
+func printHelp() {
+    let help = """
+    apple-ai-api — OpenAI-compatible API for Apple's on-device Foundation Models
+
+    USAGE:
+      ./apple-ai-api [options]
+
+    OPTIONS:
+      -p, --port PORT       Port to listen on (default: \(Config.port))
+      -k, --api-key KEY     Require this API key for all requests
+      -d, --debug           Enable debug logging of requests/responses
+      -h, --help            Show this help message
+
+    EXAMPLES:
+      ./apple-ai-api                          # Start on port 8080
+      ./apple-ai-api -p 9090                  # Custom port
+      ./apple-ai-api -k sk-my-secret          # Require API key
+      ./apple-ai-api -d                       # Debug logging
+
+    ENDPOINTS:
+      POST /v1/chat/completions               # Chat completions (OpenAI-compatible)
+      GET  /v1/models                         # List available models
+
+    CLIENT EXAMPLE:
+      curl http://localhost:8080/v1/chat/completions \\
+        -H "Content-Type: application/json" \\
+        -d '{"model":"anything","messages":[{"role":"user","content":"Hello!"}]}'
+
+    Or use any OpenAI SDK:
+      from openai import OpenAI
+      client = OpenAI(base_url="http://localhost:8080/v1", api_key="none")
+      r = client.chat.completions.create(model="apple", messages=[{"role":"user","content":"Hi"}])
+    """
+    print(help)
+}
+
+func parseArgs() {
+    var args = CommandLine.arguments.dropFirst().makeIterator()
+    while let arg = args.next() {
+        switch arg {
+        case "-h", "--help":
+            printHelp()
+            exit(0)
+        case "-p", "--port":
+            guard let val = args.next(), let p = UInt16(val) else {
+                fputs("ERROR: --port requires a number\n", stderr)
+                exit(1)
+            }
+            Config.port = p
+        case "-k", "--api-key":
+            guard let val = args.next(), !val.isEmpty else {
+                fputs("ERROR: --api-key requires a value\n", stderr)
+                exit(1)
+            }
+            Config.apiKey = val
+        case "-d", "--debug":
+            Config.debug = true
+        case "--skip-model-check":
+            Config.skipModelCheck = true
+        default:
+            fputs("ERROR: Unknown option: \(arg)\n", stderr)
+            printHelp()
+            exit(1)
+        }
+    }
+}
+
+// MARK: - Debug logging
+
+func debugLog(_ message: String) {
+    if Config.debug {
+        let ts = ISO8601DateFormatter().string(from: Date())
+        fputs("[DEBUG \(ts)] \(message)\n", stderr)
+    }
+}
+
+// MARK: - HTTP Server
+
+// AIDEV-NOTE: HTTP server using Network.framework NWListener
+// Same pattern as token-counter but handles GET and POST, parses method,
+// and routes to OpenAI-compatible endpoints.
+
+class HTTPServer {
+    var listener: NWListener?
+
+    func start() {
+        guard let nwPort = NWEndpoint.Port(rawValue: Config.port) else {
+            fputs("ERROR: Invalid port \(Config.port)\n", stderr)
+            exit(1)
+        }
+
+        let params = NWParameters.tcp
+        params.requiredLocalEndpoint = NWEndpoint.hostPort(host: Config.host, port: nwPort)
+
+        do {
+            listener = try NWListener(using: params)
+        } catch {
+            fputs("ERROR: Failed to create listener: \(error)\n", stderr)
+            exit(1)
+        }
+
+        listener?.newConnectionHandler = { [weak self] connection in
+            self?.handleConnection(connection)
+        }
+
+        listener?.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                let key = Config.apiKey ?? "none"
+                let base = "http://localhost:\(Config.port)"
+                let banner = """
+
+                Local FoundationModels
+                ======================
+
+                Model:  \(Config.modelId)
+                        \(Config.modelName)
+
+                Server: \(base)
+                Chat:   \(base)/
+
+                API Settings:
+                  Base URL:  \(base)/v1
+                  API Key:   \(key)
+                  Model:     \(Config.modelId)
+
+                Example:
+                  curl \(base)/v1/chat/completions \\
+                    -H "Content-Type: application/json" \\
+                    -H "Authorization: Bearer \(key)" \\
+                    -d '{"model":"\(Config.modelId)","messages":[{"role":"user","content":"Hello!"}]}'
+
+                """
+                fputs(banner, stderr)
+            case .failed(let error):
+                fputs("ERROR: Listener failed: \(error)\n", stderr)
+                exit(1)
+            default:
+                break
+            }
+        }
+
+        listener?.start(queue: DispatchQueue(label: "http-server"))
+    }
+
+    private func handleConnection(_ connection: NWConnection) {
+        connection.start(queue: DispatchQueue(label: "http-conn"))
+        receiveData(on: connection, accumulated: Data())
+    }
+
+    private func receiveData(on connection: NWConnection, accumulated: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1_048_576) { [weak self] data, _, isComplete, error in
+            guard let self = self else { return }
+
+            var buffer = accumulated
+            if let data = data { buffer.append(data) }
+
+            if buffer.count > Config.maxRequestSize {
+                self.sendJSON(connection, status: 413, body: self.errorJSON("Request too large"))
+                return
+            }
+
+            if let request = self.parseHTTPRequest(buffer) {
+                self.route(request: request, connection: connection)
+            } else if error != nil || isComplete {
+                connection.cancel()
+            } else {
+                self.receiveData(on: connection, accumulated: buffer)
+            }
+        }
+    }
+
+    // AIDEV-NOTE: HTTP request parser — handles GET and POST with Content-Length framing
+    struct HTTPRequest {
+        let method: String
+        let path: String
+        let headers: [(String, String)]
+        let body: Data
+    }
+
+    private func parseHTTPRequest(_ data: Data) -> HTTPRequest? {
+        let separator = Data([0x0D, 0x0A, 0x0D, 0x0A]) // \r\n\r\n
+        guard let separatorRange = data.range(of: separator) else { return nil }
+
+        let headerData = data[data.startIndex..<separatorRange.lowerBound]
+        guard let headerString = String(data: headerData, encoding: .utf8) else { return nil }
+
+        let headerLines = headerString.components(separatedBy: "\r\n")
+        guard let requestLine = headerLines.first else { return nil }
+
+        let parts = requestLine.split(separator: " ", maxSplits: 2)
+        guard parts.count >= 2 else { return nil }
+        let method = String(parts[0])
+        let path = String(parts[1])
+
+        var headers: [(String, String)] = []
+        var contentLength = 0
+        for line in headerLines.dropFirst() {
+            if let colonIndex = line.firstIndex(of: ":") {
+                let name = String(line[line.startIndex..<colonIndex]).trimmingCharacters(in: .whitespaces)
+                let value = String(line[line.index(after: colonIndex)...]).trimmingCharacters(in: .whitespaces)
+                headers.append((name, value))
+                if name.lowercased() == "content-length" {
+                    contentLength = Int(value) ?? 0
+                }
+            }
+        }
+
+        let bodyStart = separatorRange.upperBound
+        let bodyData = data[bodyStart...]
+        if method == "POST" && bodyData.count < contentLength { return nil } // need more data
+
+        return HTTPRequest(
+            method: method,
+            path: path,
+            headers: headers,
+            body: Data(bodyData.prefix(contentLength))
+        )
+    }
+
+    // MARK: - Routing
+
+    private func route(request: HTTPRequest, connection: NWConnection) {
+        debugLog("\(request.method) \(request.path)")
+        if Config.debug && !request.body.isEmpty {
+            if let bodyStr = String(data: request.body, encoding: .utf8) {
+                debugLog("Request body: \(bodyStr)")
+            }
+        }
+
+        // CORS preflight
+        if request.method == "OPTIONS" {
+            sendCORS(connection)
+            return
+        }
+
+        // Auth check
+        if let requiredKey = Config.apiKey {
+            let authHeader = request.headers.first(where: { $0.0.lowercased() == "authorization" })?.1 ?? ""
+            let providedKey = authHeader.hasPrefix("Bearer ") ? String(authHeader.dropFirst(7)) : ""
+            if providedKey != requiredKey {
+                sendJSON(connection, status: 401, body: errorJSON("Invalid API key"))
+                return
+            }
+        }
+
+        let path = request.path.split(separator: "?").first.map(String.init) ?? request.path
+
+        switch (request.method, path) {
+        case ("GET", "/v1/models"):
+            handleModels(connection)
+        case ("POST", "/v1/chat/completions"):
+            handleChatCompletions(request: request, connection: connection)
+        case ("GET", "/"):
+            handleIndex(connection)
+        default:
+            sendJSON(connection, status: 404, body: errorJSON("Unknown endpoint: \(request.method) \(path)"))
+        }
+    }
+
+    // MARK: - /v1/models
+
+    // AIDEV-TODO: Explore SystemLanguageModel API for capability introspection
+    private func handleModels(_ connection: NWConnection) {
+        let response: [String: Any] = [
+            "object": "list",
+            "data": [
+                [
+                    "id": Config.modelId,
+                    "object": "model",
+                    "created": Int(Date().timeIntervalSince1970),
+                    "owned_by": "apple",
+                    "name": Config.modelName,
+                ]
+            ]
+        ]
+        sendJSON(connection, status: 200, body: response)
+    }
+
+    // MARK: - /v1/chat/completions
+
+    // AIDEV-NOTE: Chat completions handler — maps OpenAI message format to FoundationModels sessions.
+    // Creates a fresh session per request. System messages become the session instruction.
+    // Multi-turn is replayed by sending prior assistant/user messages sequentially.
+    private func handleChatCompletions(request: HTTPRequest, connection: NWConnection) {
+        guard let json = try? JSONSerialization.jsonObject(with: request.body) as? [String: Any],
+              let messages = json["messages"] as? [[String: Any]] else {
+            sendJSON(connection, status: 400, body: errorJSON("Invalid request: 'messages' array required"))
+            return
+        }
+
+        let maxTokens = json["max_tokens"] as? Int ?? json["max_completion_tokens"] as? Int
+        let stream = json["stream"] as? Bool ?? false
+
+        // Extract system prompt and conversation messages
+        let parsed = Self.parseMessages(messages)
+
+        guard !parsed.conversation.isEmpty else {
+            sendJSON(connection, status: 400, body: errorJSON("No user/assistant messages provided"))
+            return
+        }
+
+        guard let lastIdx = parsed.conversation.lastIndex(where: { $0.role == "user" }) else {
+            sendJSON(connection, status: 400, body: errorJSON("No user message found"))
+            return
+        }
+
+        if stream {
+            handleStreamingCompletion(
+                systemPrompt: parsed.system, conversation: parsed.conversation,
+                lastIdx: lastIdx, maxTokens: maxTokens, connection: connection
+            )
+        } else {
+            handleNonStreamingCompletion(
+                systemPrompt: parsed.system, conversation: parsed.conversation,
+                lastIdx: lastIdx, maxTokens: maxTokens, connection: connection
+            )
+        }
+    }
+
+    // AIDEV-NOTE: Message parsing — handles string content and array-of-parts content format
+    private static func parseMessages(_ messages: [[String: Any]]) -> (system: String?, conversation: [(role: String, content: String)]) {
+        var systemPrompt: String? = nil
+        var conversationMessages: [(role: String, content: String)] = []
+
+        for msg in messages {
+            guard let role = msg["role"] as? String else { continue }
+            let content: String
+            if let s = msg["content"] as? String {
+                content = s
+            } else if let parts = msg["content"] as? [[String: Any]] {
+                content = parts.compactMap { part -> String? in
+                    if part["type"] as? String == "text" {
+                        return part["text"] as? String
+                    }
+                    return nil
+                }.joined(separator: "\n")
+            } else {
+                continue
+            }
+
+            if role == "system" {
+                systemPrompt = content
+            } else {
+                conversationMessages.append((role: role, content: content))
+            }
+        }
+        return (systemPrompt, conversationMessages)
+    }
+
+    // AIDEV-NOTE: For multi-turn, we replay prior turns via respond() calls.
+    // This is somewhat wasteful but the simplest correct approach — each prior
+    // user message gets a respond() call so the session builds up history.
+    private func replayHistory(
+        session: LanguageModelSession,
+        conversation: [(role: String, content: String)],
+        upTo lastIdx: Int,
+        maxTokens: Int?
+    ) async throws {
+        for i in 0..<lastIdx {
+            let msg = conversation[i]
+            if msg.role == "user" {
+                var options = GenerationOptions()
+                if let maxTokens = maxTokens {
+                    options = GenerationOptions(maximumResponseTokens: maxTokens)
+                }
+                let _ = try await session.respond(to: msg.content, options: options)
+            }
+        }
+    }
+
+    private func makeSession(systemPrompt: String?) -> LanguageModelSession {
+        if let systemPrompt = systemPrompt {
+            return LanguageModelSession() { systemPrompt }
+        } else {
+            return LanguageModelSession()
+        }
+    }
+
+    private func handleNonStreamingCompletion(
+        systemPrompt: String?,
+        conversation: [(role: String, content: String)],
+        lastIdx: Int,
+        maxTokens: Int?,
+        connection: NWConnection
+    ) {
+        Task {
+            do {
+                let session = makeSession(systemPrompt: systemPrompt)
+                try await replayHistory(session: session, conversation: conversation, upTo: lastIdx, maxTokens: maxTokens)
+
+                var options = GenerationOptions()
+                if let maxTokens = maxTokens {
+                    options = GenerationOptions(maximumResponseTokens: maxTokens)
+                }
+                let response = try await session.respond(to: conversation[lastIdx].content, options: options)
+                let responseText = response.content
+
+                debugLog("Response: \(responseText)")
+
+                let completionId = "chatcmpl-\(UUID().uuidString.prefix(12))"
+                let result: [String: Any] = [
+                    "id": completionId,
+                    "object": "chat.completion",
+                    "created": Int(Date().timeIntervalSince1970),
+                    "model": Config.modelId,
+                    "choices": [
+                        [
+                            "index": 0,
+                            "message": [
+                                "role": "assistant",
+                                "content": responseText,
+                            ],
+                            "finish_reason": "stop",
+                        ]
+                    ],
+                    "usage": [
+                        "prompt_tokens": 0,    // AIDEV-TODO: Get actual token counts if API exposes them
+                        "completion_tokens": 0,
+                        "total_tokens": 0,
+                    ],
+                ]
+
+                self.sendJSON(connection, status: 200, body: result)
+            } catch {
+                fputs("ERROR: Generation failed: \(error)\n", stderr)
+                self.sendJSON(connection, status: 500, body: self.errorJSON("Generation failed: \(error.localizedDescription)"))
+            }
+        }
+    }
+
+    // AIDEV-NOTE: SSE streaming implementation.
+    // Apple's ResponseStream<String> yields cumulative snapshots (not deltas),
+    // so we track previousLength and slice out the new characters for each SSE chunk.
+    // Format follows OpenAI's streaming protocol: each chunk is a "data: {json}\n\n" line
+    // with a final "data: [DONE]\n\n" sentinel.
+    private func handleStreamingCompletion(
+        systemPrompt: String?,
+        conversation: [(role: String, content: String)],
+        lastIdx: Int,
+        maxTokens: Int?,
+        connection: NWConnection
+    ) {
+        Task {
+            do {
+                let session = makeSession(systemPrompt: systemPrompt)
+                try await replayHistory(session: session, conversation: conversation, upTo: lastIdx, maxTokens: maxTokens)
+
+                var options = GenerationOptions()
+                if let maxTokens = maxTokens {
+                    options = GenerationOptions(maximumResponseTokens: maxTokens)
+                }
+
+                let completionId = "chatcmpl-\(UUID().uuidString.prefix(12))"
+                let created = Int(Date().timeIntervalSince1970)
+
+                // Send SSE headers
+                let header = "HTTP/1.1 200 OK\r\n" +
+                    "Content-Type: text/event-stream\r\n" +
+                    "Cache-Control: no-cache\r\n" +
+                    "Access-Control-Allow-Origin: *\r\n" +
+                    "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" +
+                    "Connection: keep-alive\r\n" +
+                    "\r\n"
+                self.sendRaw(connection, data: header.data(using: .utf8)!)
+
+                let stream = session.streamResponse(to: conversation[lastIdx].content, options: options)
+                var previousLength = 0
+
+                for try await snapshot in stream {
+                    let text = snapshot.content
+                    let newContent = String(text.dropFirst(previousLength))
+                    previousLength = text.count
+
+                    if !newContent.isEmpty {
+                        let chunk: [String: Any] = [
+                            "id": completionId,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": Config.modelId,
+                            "choices": [
+                                [
+                                    "index": 0,
+                                    "delta": ["content": newContent],
+                                    "finish_reason": NSNull(),
+                                ]
+                            ],
+                        ]
+                        if let jsonData = try? JSONSerialization.data(withJSONObject: chunk),
+                           let jsonStr = String(data: jsonData, encoding: .utf8) {
+                            debugLog("Stream chunk: \(newContent)")
+                            self.sendRaw(connection, data: "data: \(jsonStr)\n\n".data(using: .utf8)!)
+                        }
+                    }
+                }
+
+                // Send final chunk with finish_reason
+                let finalChunk: [String: Any] = [
+                    "id": completionId,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": Config.modelId,
+                    "choices": [
+                        [
+                            "index": 0,
+                            "delta": [String: String](),
+                            "finish_reason": "stop",
+                        ]
+                    ],
+                ]
+                if let jsonData = try? JSONSerialization.data(withJSONObject: finalChunk),
+                   let jsonStr = String(data: jsonData, encoding: .utf8) {
+                    self.sendRaw(connection, data: "data: \(jsonStr)\n\n".data(using: .utf8)!)
+                }
+
+                // Send done sentinel and close
+                self.sendRaw(connection, data: "data: [DONE]\n\n".data(using: .utf8)!) {
+                    connection.cancel()
+                }
+            } catch {
+                fputs("ERROR: Streaming generation failed: \(error)\n", stderr)
+                let errChunk = "data: {\"error\":{\"message\":\"\(error.localizedDescription)\"}}\n\n"
+                self.sendRaw(connection, data: errChunk.data(using: .utf8)!) {
+                    connection.cancel()
+                }
+            }
+        }
+    }
+
+    private func sendRaw(_ connection: NWConnection, data: Data, then: (() -> Void)? = nil) {
+        connection.send(content: data, completion: .contentProcessed { _ in
+            then?()
+        })
+    }
+
+    // MARK: - Chat Web UI
+
+    // AIDEV-NOTE: Self-contained chat UI with streaming support.
+    // Uses SSE via fetch() + ReadableStream to display tokens as they arrive.
+    // No external dependencies — pure HTML/CSS/JS inlined in the Swift binary.
+    private func handleIndex(_ connection: NWConnection) {
+        let html = chatHTML()
+        sendHTTP(connection, status: 200, contentType: "text/html; charset=utf-8", body: html.data(using: .utf8)!)
+    }
+
+    private func chatHTML() -> String {
+        let apiKey = Config.apiKey ?? "none"
+        return """
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Local FoundationModels</title>
+        <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        :root {
+            --bg: #f5f5f7; --chat-bg: #fff; --user-bg: #007aff; --user-fg: #fff;
+            --assistant-bg: #e9e9eb; --assistant-fg: #1d1d1f; --border: #d2d2d7;
+            --muted: #86868b; --input-bg: #fff;
+        }
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #1d1d1f; --chat-bg: #2c2c2e; --user-bg: #0a84ff; --user-fg: #fff;
+                --assistant-bg: #3a3a3c; --assistant-fg: #f5f5f7; --border: #48484a;
+                --muted: #98989d; --input-bg: #2c2c2e;
+            }
+        }
+        html, body { height: 100%; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
+            background: var(--bg); color: var(--assistant-fg);
+            display: flex; flex-direction: column;
+        }
+        header {
+            padding: 12px 16px; border-bottom: 1px solid var(--border);
+            background: var(--chat-bg); display: flex; align-items: center; gap: 8px;
+            flex-shrink: 0;
+        }
+        header h1 { font-size: 16px; font-weight: 600; flex: 1; }
+        .hdr-btn {
+            font-size: 13px; background: var(--assistant-bg); color: var(--assistant-fg);
+            border: none; padding: 4px 12px; border-radius: 10px; cursor: pointer;
+            font-family: inherit;
+        }
+        .hdr-btn:hover { opacity: 0.8; }
+        .badge {
+            font-size: 11px; background: var(--assistant-bg); color: var(--muted);
+            padding: 2px 8px; border-radius: 10px;
+        }
+        #system-bar {
+            padding: 8px 16px; border-bottom: 1px solid var(--border);
+            background: var(--chat-bg); flex-shrink: 0; display: none;
+        }
+        #system-bar.visible { display: block; }
+        #system-bar input {
+            width: 100%; padding: 6px 10px; font-size: 13px; border: 1px solid var(--border);
+            border-radius: 8px; background: var(--bg); color: var(--assistant-fg);
+            outline: none; font-family: inherit;
+        }
+        #system-bar input:focus { border-color: var(--user-bg); }
+        #system-bar label {
+            font-size: 11px; color: var(--muted); margin-bottom: 4px; display: block;
+        }
+        #messages {
+            flex: 1; overflow-y: auto; padding: 16px; display: flex;
+            flex-direction: column; gap: 8px;
+        }
+        .msg {
+            max-width: 80%; padding: 10px 14px; border-radius: 18px;
+            font-size: 15px; line-height: 1.4; white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        .msg.user {
+            align-self: flex-end; background: var(--user-bg); color: var(--user-fg);
+            border-bottom-right-radius: 6px;
+        }
+        .msg.assistant {
+            align-self: flex-start; background: var(--assistant-bg); color: var(--assistant-fg);
+            border-bottom-left-radius: 6px;
+        }
+        .msg.error {
+            align-self: center; background: #ff3b30; color: #fff;
+            font-size: 13px; border-radius: 8px;
+        }
+        #input-bar {
+            padding: 12px 16px; border-top: 1px solid var(--border);
+            background: var(--chat-bg); display: flex; gap: 8px;
+            flex-shrink: 0;
+        }
+        #input-bar textarea {
+            flex: 1; padding: 10px 14px; font-size: 15px; border: 1px solid var(--border);
+            border-radius: 20px; background: var(--input-bg); color: var(--assistant-fg);
+            outline: none; resize: none; font-family: inherit;
+            min-height: 20px; max-height: 120px; line-height: 1.4;
+        }
+        #input-bar textarea:focus { border-color: var(--user-bg); }
+        #input-bar button {
+            padding: 0 16px; background: var(--user-bg); color: #fff; border: none;
+            border-radius: 20px; font-size: 15px; font-weight: 600; cursor: pointer;
+            flex-shrink: 0;
+        }
+        #input-bar button:disabled { opacity: 0.4; cursor: default; }
+        /* Modal overlay */
+        .modal-overlay {
+            display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.4);
+            z-index: 100; align-items: center; justify-content: center;
+        }
+        .modal-overlay.visible { display: flex; }
+        .modal {
+            background: var(--chat-bg); border-radius: 14px; padding: 24px;
+            max-width: 520px; width: 90%; max-height: 80vh; overflow-y: auto;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        .modal h2 { font-size: 18px; margin-bottom: 16px; }
+        .modal h3 { font-size: 14px; color: var(--muted); margin: 16px 0 8px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .modal table { width: 100%; border-collapse: collapse; font-size: 14px; }
+        .modal td { padding: 6px 0; vertical-align: top; }
+        .modal td:first-child { color: var(--muted); width: 100px; }
+        .modal pre {
+            background: var(--bg); padding: 12px; border-radius: 8px;
+            font-size: 13px; overflow-x: auto; line-height: 1.5;
+            font-family: 'SF Mono', Menlo, monospace; white-space: pre;
+        }
+        .modal .close-btn {
+            float: right; background: none; border: none; font-size: 20px;
+            color: var(--muted); cursor: pointer; padding: 0 4px;
+        }
+        .modal .close-btn:hover { color: var(--assistant-fg); }
+        </style>
+        </head>
+        <body>
+        <header>
+            <h1>Local FoundationModels</h1>
+            <span class="badge">on-device</span>
+            <button class="hdr-btn" id="btn-system" title="System prompt">System</button>
+            <button class="hdr-btn" id="btn-clear" title="Clear conversation">Clear</button>
+            <button class="hdr-btn" id="btn-api" title="API connection info">API</button>
+        </header>
+        <div id="system-bar">
+            <label>System prompt</label>
+            <input id="system" type="text" placeholder="e.g. You are a helpful assistant. Be concise.">
+        </div>
+        <div id="messages"></div>
+        <div id="input-bar">
+            <textarea id="input" rows="1" placeholder="Message..." autofocus></textarea>
+            <button id="send">Send</button>
+        </div>
+
+        <!-- API Info Modal -->
+        <div class="modal-overlay" id="api-modal">
+        <div class="modal">
+            <button class="close-btn" id="api-close">&times;</button>
+            <h2>API Connection</h2>
+            <p style="font-size:14px;color:var(--muted);margin-bottom:12px;">
+                OpenAI-compatible API. Use any client that supports a custom base URL.
+            </p>
+
+            <h3>Settings</h3>
+            <table>
+                <tr><td>Base URL</td><td><code>http://localhost:\(Config.port)/v1</code></td></tr>
+                <tr><td>API Key</td><td><code>\(apiKey)</code></td></tr>
+                <tr><td>Model</td><td><code>\(Config.modelId)</code></td></tr>
+            </table>
+
+            <h3>curl</h3>
+            <pre>curl http://localhost:\(Config.port)/v1/chat/completions \\
+          -H "Content-Type: application/json" \\
+          -H "Authorization: Bearer \(apiKey)" \\
+          -d '{
+            "model": "\(Config.modelId)",
+            "messages": [{"role": "user", "content": "Hello!"}]
+          }'</pre>
+
+            <h3>Python (OpenAI SDK)</h3>
+            <pre>from openai import OpenAI
+
+        client = OpenAI(
+            base_url="http://localhost:\(Config.port)/v1",
+            api_key="\(apiKey)",
+        )
+
+        r = client.chat.completions.create(
+            model="\(Config.modelId)",
+            messages=[{"role": "user", "content": "Hello!"}],
+        )
+        print(r.choices[0].message.content)</pre>
+        </div>
+        </div>
+
+        <script>
+        const $msgs = document.getElementById('messages');
+        const $input = document.getElementById('input');
+        const $send = document.getElementById('send');
+        const $system = document.getElementById('system');
+        const $systemBar = document.getElementById('system-bar');
+        const $apiModal = document.getElementById('api-modal');
+        let busy = false;
+        let history = [];
+
+        // Header buttons
+        document.getElementById('btn-system').addEventListener('click', () => {
+            $systemBar.classList.toggle('visible');
+            if ($systemBar.classList.contains('visible')) $system.focus();
+        });
+
+        document.getElementById('btn-clear').addEventListener('click', () => {
+            history = [];
+            $msgs.innerHTML = '';
+            $input.focus();
+        });
+
+        document.getElementById('btn-api').addEventListener('click', () => {
+            $apiModal.classList.add('visible');
+        });
+        document.getElementById('api-close').addEventListener('click', () => {
+            $apiModal.classList.remove('visible');
+        });
+        $apiModal.addEventListener('click', (e) => {
+            if (e.target === $apiModal) $apiModal.classList.remove('visible');
+        });
+
+        function addMsg(role, text) {
+            const div = document.createElement('div');
+            div.className = 'msg ' + role;
+            div.textContent = text;
+            $msgs.appendChild(div);
+            $msgs.scrollTop = $msgs.scrollHeight;
+            return div;
+        }
+
+        $input.addEventListener('input', () => {
+            $input.style.height = 'auto';
+            $input.style.height = Math.min($input.scrollHeight, 120) + 'px';
+        });
+
+        $input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+        });
+        $send.addEventListener('click', send);
+
+        async function send() {
+            const text = $input.value.trim();
+            if (!text || busy) return;
+            busy = true;
+            $send.disabled = true;
+            $input.value = '';
+            $input.style.height = 'auto';
+
+            addMsg('user', text);
+            history.push({ role: 'user', content: text });
+
+            const messages = [];
+            const sys = $system.value.trim();
+            if (sys) messages.push({ role: 'system', content: sys });
+            messages.push(...history);
+
+            const el = addMsg('assistant', '');
+
+            try {
+                const res = await fetch('/v1/chat/completions', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ messages, stream: true }),
+                });
+
+                if (!res.ok) {
+                    const err = await res.json();
+                    throw new Error(err.error?.message || res.statusText);
+                }
+
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let full = '';
+                let buf = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    buf += decoder.decode(value, { stream: true });
+                    const lines = buf.split('\\n');
+                    buf = lines.pop();
+                    for (const line of lines) {
+                        if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
+                        try {
+                            const chunk = JSON.parse(line.slice(6));
+                            const delta = chunk.choices?.[0]?.delta?.content;
+                            if (delta) { full += delta; el.textContent = full; }
+                        } catch {}
+                    }
+                    $msgs.scrollTop = $msgs.scrollHeight;
+                }
+
+                history.push({ role: 'assistant', content: full });
+            } catch (err) {
+                el.remove();
+                addMsg('error', err.message);
+            }
+
+            busy = false;
+            $send.disabled = false;
+            $input.focus();
+        }
+        </script>
+        </body>
+        </html>
+        """
+    }
+
+    // MARK: - Response helpers
+
+    private func errorJSON(_ message: String) -> [String: Any] {
+        return [
+            "error": [
+                "message": message,
+                "type": "server_error",
+                "code": NSNull(),
+            ]
+        ]
+    }
+
+    private func sendJSON(_ connection: NWConnection, status: Int, body: [String: Any]) {
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys]) else {
+            connection.cancel()
+            return
+        }
+        if Config.debug {
+            debugLog("Response (\(status)): \(String(data: jsonData, encoding: .utf8) ?? "?")")
+        }
+        sendHTTP(connection, status: status, contentType: "application/json", body: jsonData)
+    }
+
+    private func sendHTTP(_ connection: NWConnection, status: Int, contentType: String, body: Data) {
+        let statusText: String
+        switch status {
+        case 200: statusText = "OK"
+        case 400: statusText = "Bad Request"
+        case 401: statusText = "Unauthorized"
+        case 404: statusText = "Not Found"
+        case 413: statusText = "Payload Too Large"
+        case 503: statusText = "Service Unavailable"
+        default: statusText = "Error"
+        }
+
+        var header = "HTTP/1.1 \(status) \(statusText)\r\n"
+        header += "Content-Type: \(contentType)\r\n"
+        header += "Content-Length: \(body.count)\r\n"
+        header += "Access-Control-Allow-Origin: *\r\n"
+        header += "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+        header += "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        header += "Connection: close\r\n"
+        header += "\r\n"
+
+        var responseData = header.data(using: .utf8)!
+        responseData.append(body)
+
+        connection.send(content: responseData, completion: .contentProcessed { _ in
+            connection.cancel()
+        })
+    }
+
+    private func sendCORS(_ connection: NWConnection) {
+        sendHTTP(connection, status: 200, contentType: "text/plain", body: Data())
+    }
+}
+
+// MARK: - Main
+
+parseArgs()
+
+// AIDEV-NOTE: Check model availability early and exit with actionable instructions.
+// There is no CLI way to enable Apple Intelligence — it requires the GUI setup flow
+// (accept terms, download model weights). The defaults write trick
+// (com.apple.CloudSubscriptionFeatures.optIn / 545129924) sets the pref but doesn't
+// trigger the actual model download or terms acceptance.
+if !Config.skipModelCheck {
+    let model = SystemLanguageModel.default
+    if model.availability != .available {
+        fputs("""
+        ERROR: Apple Foundation Model is not available.
+
+        To enable Apple Intelligence:
+          1. Open System Settings (on the Mac itself, not over SSH)
+          2. Go to "Apple Intelligence & Siri"
+          3. Turn on Apple Intelligence and accept the terms
+          4. Wait for the on-device model to finish downloading
+
+        Note: There is no command-line way to enable this — the GUI setup flow
+        is required to accept Apple's terms and trigger the model download.
+
+        If you're connected via SSH, you can open System Settings remotely:
+          ssh <host> 'open "x-apple.systempreferences:com.apple.Siri-Settings"'
+
+        Requirements:
+          - macOS 26+ (Tahoe) on Apple Silicon
+          - Apple Intelligence enabled in System Settings
+          - Sufficient disk space for the on-device model
+
+        """, stderr)
+        exit(1)
+    }
+}
+
+signal(SIGINT) { _ in
+    print("\nShutting down.")
+    exit(0)
+}
+
+let server = HTTPServer()
+server.start()
+
+// Keep the process alive
+dispatchMain()

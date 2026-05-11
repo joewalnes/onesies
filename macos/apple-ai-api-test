@@ -1,0 +1,386 @@
+#!/bin/bash
+set -euo pipefail
+
+# apple-ai-api-test — Integration tests for apple-ai-api
+#
+# Usage:
+#   ./macos/apple-ai-api-test
+#
+# Tests all endpoints, error handling, auth, and CORS.
+# Does NOT test actual model inference (requires Apple Intelligence enabled).
+# Tests are designed to work even when the model is unavailable — they test
+# the HTTP server layer, routing, auth, and request validation.
+
+# AIDEV-NOTE: User Configuration - Easy to modify settings
+PORT=18913  # High port to avoid conflicts
+API_KEY="test-key-$(date +%s)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SERVER="$SCRIPT_DIR/apple-ai-api"
+SERVER_FLAGS="--skip-model-check"  # allows testing HTTP layer without Apple Intelligence
+SERVER_PID=""
+PASS=0
+FAIL=0
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+cleanup() {
+    if [[ -n "$SERVER_PID" ]]; then
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
+# Wait for server to accept connections (up to 30s for Swift compilation)
+wait_for_server() {
+    local max_attempts=30
+    for i in $(seq 1 $max_attempts); do
+        if curl -s -o /dev/null -w "" "http://localhost:$PORT/v1/models" 2>/dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+    printf "${RED}  Server failed to start within %ds${RESET}\n" "$max_attempts"
+    exit 1
+}
+
+assert_eq() {
+    local label="$1" expected="$2" actual="$3"
+    if [[ "$expected" == "$actual" ]]; then
+        printf "${GREEN}  PASS${RESET} %s\n" "$label"
+        PASS=$((PASS + 1))
+    else
+        printf "${RED}  FAIL${RESET} %s\n" "$label"
+        printf "       expected: %s\n" "$expected"
+        printf "       actual:   %s\n" "$actual"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+assert_contains() {
+    local label="$1" needle="$2" haystack="$3"
+    if echo "$haystack" | grep -q "$needle"; then
+        printf "${GREEN}  PASS${RESET} %s\n" "$label"
+        PASS=$((PASS + 1))
+    else
+        printf "${RED}  FAIL${RESET} %s\n" "$label"
+        printf "       expected to contain: %s\n" "$needle"
+        printf "       actual: %s\n" "$haystack"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+assert_status() {
+    local label="$1" expected="$2" actual="$3"
+    assert_eq "$label (HTTP $expected)" "$expected" "$actual"
+}
+
+# Helper: curl with status code capture
+fetch() {
+    curl -s -w "\n%{http_code}" "$@"
+}
+
+parse_status() {
+    echo "$1" | tail -1
+}
+
+parse_body() {
+    echo "$1" | sed '$d'
+}
+
+json_field() {
+    # Simple JSON field extractor (no jq dependency)
+    python3 -c "import json,sys; d=json.load(sys.stdin); print($1)" <<< "$2"
+}
+
+# ============================================================
+printf "${BOLD}apple-ai-api integration tests${RESET}\n\n"
+
+# ============================================================
+printf "${BOLD}[1/6] Server without API key${RESET}\n"
+# ============================================================
+
+# Start server without auth
+"$SERVER" $SERVER_FLAGS -p "$PORT" &>/dev/null &
+SERVER_PID=$!
+wait_for_server
+
+# --- GET /v1/models ---
+result=$(fetch "http://localhost:$PORT/v1/models")
+status=$(parse_status "$result")
+body=$(parse_body "$result")
+
+assert_status "/v1/models returns 200" "200" "$status"
+assert_contains "/v1/models has model id" "apple-foundation-model" "$body"
+assert_contains "/v1/models has object:list" '"object":"list"' "$body"
+assert_contains "/v1/models has owned_by:apple" '"owned_by":"apple"' "$body"
+
+# --- GET / (chat UI) ---
+result=$(fetch "http://localhost:$PORT/")
+status=$(parse_status "$result")
+body=$(parse_body "$result")
+
+assert_status "/ returns 200" "200" "$status"
+assert_contains "/ serves HTML" "<!DOCTYPE html>" "$body"
+assert_contains "/ has chat UI" "Local FoundationModels" "$body"
+assert_contains "/ has message input" 'id="input"' "$body"
+
+# --- 404 ---
+result=$(fetch "http://localhost:$PORT/v1/nonexistent")
+status=$(parse_status "$result")
+body=$(parse_body "$result")
+
+assert_status "unknown endpoint returns 404" "404" "$status"
+assert_contains "404 has error message" '"error"' "$body"
+
+# --- POST /v1/chat/completions with missing messages ---
+result=$(fetch -X POST "http://localhost:$PORT/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"test"}')
+status=$(parse_status "$result")
+body=$(parse_body "$result")
+
+assert_status "missing messages returns 400" "400" "$status"
+assert_contains "error mentions messages" "messages" "$body"
+
+# --- POST /v1/chat/completions with empty messages ---
+result=$(fetch -X POST "http://localhost:$PORT/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"messages":[{"role":"system","content":"hi"}]}')
+status=$(parse_status "$result")
+body=$(parse_body "$result")
+
+assert_status "no user messages returns 400" "400" "$status"
+assert_contains "error mentions user/assistant" "user" "$body"
+
+# --- POST /v1/chat/completions with invalid JSON ---
+result=$(fetch -X POST "http://localhost:$PORT/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d 'not json')
+status=$(parse_status "$result")
+
+assert_status "invalid JSON returns 400" "400" "$status"
+
+# --- OPTIONS (CORS preflight) ---
+result=$(fetch -X OPTIONS "http://localhost:$PORT/v1/chat/completions" \
+    -H "Origin: http://example.com")
+status=$(parse_status "$result")
+
+assert_status "OPTIONS returns 200" "200" "$status"
+
+# --- CORS headers on normal response ---
+headers=$(curl -s -D - -o /dev/null "http://localhost:$PORT/v1/models")
+assert_contains "CORS Allow-Origin header" "Access-Control-Allow-Origin: *" "$headers"
+assert_contains "CORS Allow-Methods header" "Access-Control-Allow-Methods" "$headers"
+
+# Stop server
+kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true
+SERVER_PID=""
+sleep 1
+
+# ============================================================
+printf "\n${BOLD}[2/6] Server with API key${RESET}\n"
+# ============================================================
+
+"$SERVER" $SERVER_FLAGS -p "$PORT" -k "$API_KEY" &>/dev/null &
+SERVER_PID=$!
+wait_for_server
+
+# --- Request without key ---
+result=$(fetch "http://localhost:$PORT/v1/models")
+status=$(parse_status "$result")
+body=$(parse_body "$result")
+
+assert_status "no API key returns 401" "401" "$status"
+assert_contains "401 has error message" "Invalid API key" "$body"
+
+# --- Request with wrong key ---
+result=$(fetch "http://localhost:$PORT/v1/models" \
+    -H "Authorization: Bearer wrong-key")
+status=$(parse_status "$result")
+
+assert_status "wrong API key returns 401" "401" "$status"
+
+# --- Request with correct key ---
+result=$(fetch "http://localhost:$PORT/v1/models" \
+    -H "Authorization: Bearer $API_KEY")
+status=$(parse_status "$result")
+
+assert_status "correct API key returns 200" "200" "$status"
+
+# --- OPTIONS should bypass auth ---
+result=$(fetch -X OPTIONS "http://localhost:$PORT/v1/chat/completions")
+status=$(parse_status "$result")
+
+assert_status "OPTIONS bypasses auth" "200" "$status"
+
+kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true
+SERVER_PID=""
+sleep 1
+
+# ============================================================
+printf "\n${BOLD}[3/6] CLI argument parsing${RESET}\n"
+# ============================================================
+
+# --- Help flag ---
+help_output=$("$SERVER" --help 2>&1)
+assert_contains "--help shows usage" "USAGE:" "$help_output"
+assert_contains "--help shows endpoints" "/v1/chat/completions" "$help_output"
+assert_contains "--help shows python example" "OpenAI" "$help_output"
+
+# --- Bad flag ---
+bad_output=$("$SERVER" --bogus 2>&1 || true)
+assert_contains "bad flag shows error" "Unknown option" "$bad_output"
+
+# --- Bad port ---
+bad_port=$("$SERVER" -p abc 2>&1 || true)
+assert_contains "bad port shows error" "requires a number" "$bad_port"
+
+# ============================================================
+printf "\n${BOLD}[4/6] Content-type handling${RESET}\n"
+# ============================================================
+
+"$SERVER" $SERVER_FLAGS -p "$PORT" &>/dev/null &
+SERVER_PID=$!
+wait_for_server
+
+# --- /v1/models returns JSON ---
+ct=$(curl -s -D - -o /dev/null "http://localhost:$PORT/v1/models" | grep -i "content-type")
+assert_contains "/v1/models content-type is JSON" "application/json" "$ct"
+
+# --- / returns HTML ---
+ct=$(curl -s -D - -o /dev/null "http://localhost:$PORT/" | grep -i "content-type")
+assert_contains "/ content-type is HTML" "text/html" "$ct"
+
+kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true
+SERVER_PID=""
+sleep 1
+
+# ============================================================
+printf "\n${BOLD}[5/6] Message format parsing${RESET}\n"
+# ============================================================
+
+# These tests verify request validation — actual inference may fail
+# if Apple Intelligence isn't enabled, but the parsing should work.
+
+"$SERVER" $SERVER_FLAGS -p "$PORT" &>/dev/null &
+SERVER_PID=$!
+wait_for_server
+
+# --- Array content parts format ---
+result=$(fetch -X POST "http://localhost:$PORT/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{
+        "messages": [
+            {"role":"user","content":[
+                {"type":"text","text":"Hello"},
+                {"type":"text","text":"World"}
+            ]}
+        ]
+    }')
+status=$(parse_status "$result")
+# Should either succeed (200) or fail at model level (500), not at parsing level (400)
+if [[ "$status" == "200" || "$status" == "500" ]]; then
+    printf "${GREEN}  PASS${RESET} array content parts parsed (status %s)\n" "$status"
+    PASS=$((PASS + 1))
+else
+    printf "${RED}  FAIL${RESET} array content parts should parse (got %s)\n" "$status"
+    FAIL=$((FAIL + 1))
+fi
+
+# --- System + user messages ---
+result=$(fetch -X POST "http://localhost:$PORT/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{
+        "messages": [
+            {"role":"system","content":"Be brief"},
+            {"role":"user","content":"Hi"}
+        ]
+    }')
+status=$(parse_status "$result")
+if [[ "$status" == "200" || "$status" == "500" ]]; then
+    printf "${GREEN}  PASS${RESET} system + user messages parsed (status %s)\n" "$status"
+    PASS=$((PASS + 1))
+else
+    printf "${RED}  FAIL${RESET} system + user should parse (got %s)\n" "$status"
+    FAIL=$((FAIL + 1))
+fi
+
+# --- Multi-turn conversation ---
+result=$(fetch -X POST "http://localhost:$PORT/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{
+        "messages": [
+            {"role":"user","content":"Hi"},
+            {"role":"assistant","content":"Hello!"},
+            {"role":"user","content":"How are you?"}
+        ]
+    }')
+status=$(parse_status "$result")
+if [[ "$status" == "200" || "$status" == "500" ]]; then
+    printf "${GREEN}  PASS${RESET} multi-turn conversation parsed (status %s)\n" "$status"
+    PASS=$((PASS + 1))
+else
+    printf "${RED}  FAIL${RESET} multi-turn should parse (got %s)\n" "$status"
+    FAIL=$((FAIL + 1))
+fi
+
+# --- max_tokens parameter ---
+result=$(fetch -X POST "http://localhost:$PORT/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{
+        "messages": [{"role":"user","content":"Hi"}],
+        "max_tokens": 10
+    }')
+status=$(parse_status "$result")
+if [[ "$status" == "200" || "$status" == "500" ]]; then
+    printf "${GREEN}  PASS${RESET} max_tokens accepted (status %s)\n" "$status"
+    PASS=$((PASS + 1))
+else
+    printf "${RED}  FAIL${RESET} max_tokens should be accepted (got %s)\n" "$status"
+    FAIL=$((FAIL + 1))
+fi
+
+kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true
+SERVER_PID=""
+sleep 1
+
+# ============================================================
+printf "\n${BOLD}[6/6] Debug logging${RESET}\n"
+# ============================================================
+
+LOGFILE=$(mktemp)
+"$SERVER" $SERVER_FLAGS -p "$PORT" -d 2>"$LOGFILE" &
+SERVER_PID=$!
+wait_for_server
+
+curl -s "http://localhost:$PORT/v1/models" > /dev/null
+sleep 1
+
+debug_output=$(cat "$LOGFILE")
+assert_contains "debug logs contain request" "GET /v1/models" "$debug_output"
+assert_contains "debug logs contain response" "Response (200)" "$debug_output"
+assert_contains "debug logs have timestamp" '\[DEBUG' "$debug_output"
+
+kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true
+SERVER_PID=""
+rm -f "$LOGFILE"
+
+# ============================================================
+printf "\n${BOLD}Results${RESET}\n"
+# ============================================================
+TOTAL=$((PASS + FAIL))
+printf "  %s passed, %s failed (out of %s)\n" "$PASS" "$FAIL" "$TOTAL"
+
+if [[ "$FAIL" -gt 0 ]]; then
+    printf "${RED}  FAILED${RESET}\n"
+    exit 1
+else
+    printf "${GREEN}  ALL PASSED${RESET}\n"
+    exit 0
+fi
