@@ -4,7 +4,7 @@ set -euo pipefail
 # apple-ai-api-test — Integration tests for apple-ai-api
 #
 # Usage:
-#   ./macos/apple-ai-api-test
+#   ./cli/apple-ai-api-test
 #
 # Tests all endpoints, error handling, auth, and CORS.
 # Does NOT test actual model inference (requires Apple Intelligence enabled).
