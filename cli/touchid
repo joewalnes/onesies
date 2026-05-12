@@ -25,7 +25,7 @@ let reason = CommandLine.arguments.count > 1
     : "authenticate"
 
 guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) else {
-    fputs("error: Touch ID not available: \(error?.localizedDescription ?? "unknown")\n", stderr)
+    fputs("ERROR: Touch ID not available: \(error?.localizedDescription ?? "unknown")\n", stderr)
     exit(2)
 }
 
@@ -36,7 +36,7 @@ context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason
     if success {
         exitCode = 0
     } else {
-        fputs("error: \(authError?.localizedDescription ?? "authentication failed")\n", stderr)
+        fputs("ERROR: \(authError?.localizedDescription ?? "authentication failed")\n", stderr)
     }
     semaphore.signal()
 }

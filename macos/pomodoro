@@ -262,16 +262,16 @@ class PomodoroTimerApp: NSObject, NSApplicationDelegate {
                         PomodoroConfig.pomodoroSeconds = duration
                         i += 1
                     } else {
-                        print("Error: Invalid duration format. Use formats like '25m', '90s', '1.5m'")
+                        fputs("ERROR: Invalid duration format. Use formats like '25m', '90s', '1.5m'\n", stderr)
                         exit(1)
                     }
                 } else {
-                    print("Error: --duration requires a value")
+                    fputs("ERROR: --duration requires a value\n", stderr)
                     exit(1)
                 }
             default:
                 if arg.hasPrefix("-") {
-                    print("Error: Unknown option \(arg)")
+                    fputs("ERROR: Unknown option \(arg)\n", stderr)
                     showHelp()
                     exit(1)
                 }

@@ -177,11 +177,12 @@ When adding new tools:
 
 - **`hello`** - Bash greeting tool with options for uppercase, timestamps, and custom names
 - **`hello-perl`** - Perl greeting tool demonstrating POD documentation and core module usage
-- **`gmail-sync`** - Gmail-to-SQLite sync with OAuth2 auth, FTS5 search, incremental sync, watch mode, selective attachment download, and self-documenting database schema
+- **`gmail-sync`** - Gmail-to-SQLite sync with OAuth2 auth, FTS5 search, incremental sync, watch mode, selective attachment download, and self-documenting database schema *(exception: requires `uv` and Google API packages)*
 - **`setup-mac`** - Idempotent macOS setup script: installs Homebrew, CLI tools, casks, App Store apps, configures shell/PATH, and sets up Tailscale SSH
 - **`touchid`** - Swift Touch ID authentication gate with custom reason strings and clean exit codes
 - **`apple-ai-api`** - OpenAI-compatible HTTP API server for Apple's on-device Foundation Models, with streaming, chat web UI, and API key auth
 - **`llm-chat`** - Terminal LLM chat client for any OpenAI-compatible API, with streaming, image support (Kitty/iTerm/Ghostty), readline editing, $EDITOR integration, slash commands, and contextual tips
+- **`apple-ai-api-test`** - Integration test suite for apple-ai-api (endpoints, auth, CORS, error handling)
 
 ### macOS Tools
 
