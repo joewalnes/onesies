@@ -1,0 +1,42 @@
+#!/usr/bin/swift
+
+// touchid - Prompt for Touch ID authentication, exit 0 on success, 1 on failure
+//
+// Usage: touchid [message]
+//   message: Optional custom reason string (default: "authenticate")
+//
+// Exit codes:
+//   0 - Authentication successful
+//   1 - Authentication failed or denied
+//   2 - Touch ID not available
+
+import LocalAuthentication
+import Foundation
+
+// AIDEV-NOTE: LAContext provides Touch ID / password fallback on macOS
+let context = LAContext()
+var error: NSError?
+
+let reason = CommandLine.arguments.count > 1
+    ? CommandLine.arguments.dropFirst().joined(separator: " ")
+    : "authenticate"
+
+guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) else {
+    fputs("error: Touch ID not available: \(error?.localizedDescription ?? "unknown")\n", stderr)
+    exit(2)
+}
+
+let semaphore = DispatchSemaphore(value: 0)
+var exitCode: Int32 = 1
+
+context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { success, authError in
+    if success {
+        exitCode = 0
+    } else {
+        fputs("error: \(authError?.localizedDescription ?? "authentication failed")\n", stderr)
+    }
+    semaphore.signal()
+}
+
+semaphore.wait()
+exit(exitCode)

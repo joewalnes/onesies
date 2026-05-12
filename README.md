@@ -152,6 +152,7 @@ When adding new tools:
 - **`hello-perl`** - Perl greeting tool demonstrating POD documentation and core module usage
 - **`gmail-sync`** - Gmail-to-SQLite sync with OAuth2 auth, FTS5 search, incremental sync, watch mode, selective attachment download, and self-documenting database schema
 - **`setup-mac`** - Idempotent macOS setup script: installs Homebrew, CLI tools, casks, App Store apps, configures shell/PATH, and sets up Tailscale SSH
+- **`touchid`** - Swift Touch ID authentication gate with custom reason strings and clean exit codes
 
 ### macOS Tools
 
