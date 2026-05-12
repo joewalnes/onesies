@@ -9,7 +9,7 @@ Onesies is a collection of self-contained, single-file tools designed for portab
 ### Core Principles
 
 - **Single File Rule**: Every tool must be fully contained in one source file. Each tool may also have a single-file test suite (named `<toolname>-test`) alongside it.
-- **No Dependencies**: Tools should only rely on standard system programs and commonly available utilities
+- **No Dependencies**: Tools should only rely on standard system programs and commonly available utilities. Exception: `gmail-sync` uses PEP 723 inline metadata with `uv` for Google API packages — this is acceptable when the tool's core purpose requires an external service SDK.
 - **Cross-Platform**: Must work on typical Linux and macOS systems, Docker containers
 - **Easy Installation**: Copy one file to install anywhere
 
