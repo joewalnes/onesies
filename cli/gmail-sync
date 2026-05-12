@@ -1053,17 +1053,20 @@ def backfill(service, conn, args, output):
             upsert_messages(conn, parsed)
 
             # Download attachments (auto-download small + pattern-matched)
-            for msg in parsed:
-                att_rows = conn.execute(
-                    "SELECT attachment_id, filename, mime_type, size FROM attachments WHERE message_id=?",
-                    (msg["id"],)
-                ).fetchall()
-                att_records = [
+            msg_ids = [msg["id"] for msg in parsed]
+            placeholders = ",".join("?" * len(msg_ids))
+            att_rows = conn.execute(
+                f"SELECT attachment_id, filename, mime_type, size, message_id FROM attachments WHERE message_id IN ({placeholders})",
+                msg_ids
+            ).fetchall()
+            att_by_msg = {}
+            for r in att_rows:
+                att_by_msg.setdefault(r[4], []).append(
                     {"attachment_id": r[0], "filename": r[1], "mime_type": r[2], "size": r[3]}
-                    for r in att_rows
-                ]
+                )
+            for msg in parsed:
                 download_attachments_for_message(
-                    service, conn, msg["id"], att_records,
+                    service, conn, msg["id"], att_by_msg.get(msg["id"], []),
                     args.attachments, args.auto_download_size, output,
                 )
 
@@ -1163,16 +1166,19 @@ def incremental_sync(service, conn, args, output):
             upsert_messages(conn, parsed)
 
             if args.attachments:
-                for msg in parsed:
-                    att_rows = conn.execute(
-                        "SELECT attachment_id, filename, mime_type, size FROM attachments WHERE message_id=?",
-                        (msg["id"],)
-                    ).fetchall()
-                    att_records = [
+                watch_msg_ids = [msg["id"] for msg in parsed]
+                placeholders = ",".join("?" * len(watch_msg_ids))
+                att_rows = conn.execute(
+                    f"SELECT attachment_id, filename, mime_type, size, message_id FROM attachments WHERE message_id IN ({placeholders})",
+                    watch_msg_ids
+                ).fetchall()
+                att_by_msg = {}
+                for r in att_rows:
+                    att_by_msg.setdefault(r[4], []).append(
                         {"attachment_id": r[0], "filename": r[1], "mime_type": r[2], "size": r[3]}
-                        for r in att_rows
-                    ]
-                    download_matching_attachments(service, conn, msg["id"], att_records, args.attachments, output)
+                    )
+                for msg in parsed:
+                    download_matching_attachments(service, conn, msg["id"], att_by_msg.get(msg["id"], []), args.attachments, output)
 
             output.success(f"Incremental sync: {len(new_ids)} new messages")
 
