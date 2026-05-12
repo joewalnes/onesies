@@ -153,6 +153,7 @@ When adding new tools:
 - **`gmail-sync`** - Gmail-to-SQLite sync with OAuth2 auth, FTS5 search, incremental sync, watch mode, selective attachment download, and self-documenting database schema
 - **`setup-mac`** - Idempotent macOS setup script: installs Homebrew, CLI tools, casks, App Store apps, configures shell/PATH, and sets up Tailscale SSH
 - **`touchid`** - Swift Touch ID authentication gate with custom reason strings and clean exit codes
+- **`apple-ai-api`** - OpenAI-compatible HTTP API server for Apple's on-device Foundation Models, with streaming, chat web UI, and API key auth
 
 ### macOS Tools
 
@@ -162,7 +163,6 @@ When adding new tools:
 - **`timezones`** - Menu bar multi-timezone display with 2x2 grid layout and customizable timezone list
 - **`token-counter`** - Menu bar LLM token counter with activity timeline and token flow charts, built-in OTLP receiver for Claude Code and Codex CLI telemetry
 - **`claude-usage`** - Menu bar Anthropic API rate limit monitor with progress bars, color-coded warnings, and optional usage/cost tracking via Admin API
-- **`apple-ai-api`** - OpenAI-compatible HTTP API server for Apple's on-device Foundation Models, with streaming, chat web UI, and API key auth
 
 ### 🌐 Web Tools (`web/`)
 
