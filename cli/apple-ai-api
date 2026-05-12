@@ -48,6 +48,7 @@ func printHelp() {
       -p, --port PORT       Port to listen on (default: \(Config.port))
       -k, --api-key KEY     Require this API key for all requests
       -d, --debug           Enable debug logging of requests/responses
+      --skip-model-check    Start server without verifying Apple Intelligence availability
       -h, --help            Show this help message
 
     EXAMPLES:
