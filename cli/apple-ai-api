@@ -13,6 +13,8 @@
 //
 // Exposes Apple's on-device LLM via an OpenAI-compatible REST API.
 // Point any OpenAI client at http://localhost:8080 and it just works.
+//
+// Includes simple interactive web-app.
 
 import Foundation
 import Network
