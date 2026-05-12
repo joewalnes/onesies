@@ -530,6 +530,7 @@ class ChatSession:
         self.turn_count = 0
         self.last_response = ""
         self.attached_files = []  # Pending file attachments
+        self._pending_text_files = []  # Pending inline text file attachments
         self.tips_shown = set()
 
     def set_system(self, prompt):
@@ -773,7 +774,7 @@ def cmd_copy(session, args):
             proc = subprocess.Popen(["xclip", "-selection", "clipboard"], stdin=subprocess.PIPE)
         proc.communicate(session.last_response.encode())
         print(f"  {Icons.CLIP}Copied to clipboard ({len(session.last_response)} chars)")
-    except FileNotFoundError:
+    except (FileNotFoundError, OSError, BrokenPipeError):
         print(f"  {Icons.WARN}Clipboard tool not found (need pbcopy or xclip)")
 
 
@@ -803,9 +804,6 @@ def cmd_attach(session, args):
             with open(path) as f:
                 content = f.read()
             session.attached_files.append(None)  # Marker
-            # Store as pending text
-            if not hasattr(session, '_pending_text_files'):
-                session._pending_text_files = []
             session._pending_text_files.append((os.path.basename(path), content))
             print(f"  {Icons.FILE}File queued: {os.path.basename(path)} ({len(content)} chars, will include with next message)")
         except Exception as e:
@@ -1230,7 +1228,7 @@ def main():
             continue
 
         # Handle pending text file attachments
-        if hasattr(session, '_pending_text_files') and session._pending_text_files:
+        if session._pending_text_files:
             file_context = ""
             for fname, content in session._pending_text_files:
                 file_context += f"\n\n--- File: {fname} ---\n{content}\n---\n"
