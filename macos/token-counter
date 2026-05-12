@@ -122,6 +122,9 @@ class TokenStore {
     private(set) var records: [TokenRecord] = []
     private(set) var lastResetDate: Date?   // When counters were last reset (nil = never)
     var onUpdate: (() -> Void)?     // Called when records change
+    // AIDEV-NOTE: Debounce saves to avoid serializing the full JSON file on every token
+    private var saveTimer: Timer?
+    private let saveInterval: TimeInterval = 2.0
 
     var totalInput: Int { records.reduce(0) { $0 + $1.inputTokens } }
     var totalOutput: Int { records.reduce(0) { $0 + $1.outputTokens } }
@@ -150,7 +153,7 @@ class TokenStore {
 
     func add(_ record: TokenRecord) {
         records.append(record)
-        saveToDisk()
+        scheduleSave()
         onUpdate?()
     }
 
@@ -159,6 +162,13 @@ class TokenStore {
         lastResetDate = Date()
         saveToDisk()
         onUpdate?()
+    }
+
+    private func scheduleSave() {
+        saveTimer?.invalidate()
+        saveTimer = Timer.scheduledTimer(withTimeInterval: saveInterval, repeats: false) { [weak self] _ in
+            self?.saveToDisk()
+        }
     }
 
     // --- Persistence ---
