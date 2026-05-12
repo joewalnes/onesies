@@ -64,6 +64,33 @@ A menu bar app that tracks LLM token usage from Claude Code and Codex CLI, with 
 # export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
 ```
 
+### 🤖 Apple AI API
+
+An OpenAI-compatible HTTP API server that exposes Apple's on-device Foundation Models (~3B parameter LLM). Point any OpenAI client at localhost and use Apple Intelligence programmatically.
+
+<img src="screenshots/apple-ai-api.png" alt="Apple AI API web chat interface" width="500">
+
+**Features:**
+- Full OpenAI-compatible `/v1/chat/completions` and `/v1/models` endpoints
+- Streaming support (SSE) for real-time token output
+- Built-in interactive web chat UI
+- Optional API key authentication
+- Zero dependencies — single Swift file using Apple's `FoundationModels` framework
+
+**Usage:**
+```bash
+# Start on default port 8080
+./cli/apple-ai-api
+
+# Custom port with API key
+./cli/apple-ai-api -p 9090 -k sk-my-secret
+
+# Use with any OpenAI client
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"apple","messages":[{"role":"user","content":"Hello!"}]}'
+```
+
 ## Tool Categories
 
 ### 📟 CLI Tools (`cli/`)
@@ -154,6 +181,7 @@ When adding new tools:
 - **`setup-mac`** - Idempotent macOS setup script: installs Homebrew, CLI tools, casks, App Store apps, configures shell/PATH, and sets up Tailscale SSH
 - **`touchid`** - Swift Touch ID authentication gate with custom reason strings and clean exit codes
 - **`apple-ai-api`** - OpenAI-compatible HTTP API server for Apple's on-device Foundation Models, with streaming, chat web UI, and API key auth
+- **`llm-chat`** - Terminal LLM chat client for any OpenAI-compatible API, with streaming, image support (Kitty/iTerm/Ghostty), readline editing, $EDITOR integration, slash commands, and contextual tips
 
 ### macOS Tools
 

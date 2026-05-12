@@ -1,0 +1,1247 @@
+#!/usr/bin/env python3
+"""Single-file LLM chat client using /v1/chat/completions API."""
+# AIDEV-NOTE: This is a self-contained REPL chat client. No external dependencies.
+# Uses only Python stdlib: readline, urllib, json, os, sys, subprocess, shutil, tempfile, base64, select, signal, threading
+
+import sys
+import os
+import json
+import readline
+import shutil
+import tempfile
+import subprocess
+import signal
+import base64
+import threading
+import time
+import re
+import textwrap
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+from urllib.parse import urljoin
+
+# ─── Configuration ──────────────────────────────────────────────────────────
+# AIDEV-NOTE: All user-configurable values at the top for easy modification
+
+VERSION = "1.0.0"
+CONFIG_DIR = os.path.expanduser("~/.config/llm-chat")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+HISTORY_FILE = os.path.join(CONFIG_DIR, "history")
+MAX_HISTORY = 1000
+DEFAULT_BASE_URL = "http://localhost:11434/v1"  # Ollama default
+CONNECT_TIMEOUT = 10
+READ_TIMEOUT = 120
+MAX_CONTEXT_MESSAGES = 50  # Auto-truncate after this many exchanges
+
+# AIDEV-NOTE: Provider presets. Each has a base URL, env vars to search for API keys,
+# and file paths where keys might be stored (e.g. CLI tool config files).
+PROVIDERS = {
+    "ollama": {
+        "base_url": "http://localhost:11434/v1",
+        "key_env": [],  # Ollama doesn't need a key
+        "key_files": [],
+        "needs_key": False,
+        "aliases": ["--ollama", "-ol"],
+        "description": "Local Ollama instance",
+    },
+    "openai": {
+        "base_url": "https://api.openai.com/v1",
+        "key_env": ["OPENAI_API_KEY", "OPENAI_KEY"],
+        "key_files": ["~/.config/openai/key", "~/.openai-api-key"],
+        "needs_key": True,
+        "aliases": ["--openai", "-oai"],
+        "description": "OpenAI API",
+    },
+    "anthropic": {
+        "base_url": "https://api.anthropic.com/v1",
+        "key_env": ["ANTHROPIC_API_KEY", "ANTHROPIC_KEY"],
+        "key_files": ["~/.config/anthropic/key", "~/.anthropic-api-key"],
+        "needs_key": True,
+        "aliases": ["--anthropic", "-ant"],
+        "description": "Anthropic API",
+    },
+    "openrouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "key_env": ["OPENROUTER_API_KEY", "OPENROUTER_KEY"],
+        "key_files": ["~/.config/openrouter/key"],
+        "needs_key": True,
+        "aliases": ["--openrouter", "-or"],
+        "description": "OpenRouter (multi-provider)",
+    },
+    "gemini": {
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "key_env": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        "key_files": ["~/.config/gemini/key"],
+        "needs_key": True,
+        "aliases": ["--gemini", "-gem"],
+        "description": "Google Gemini",
+    },
+    "deepseek": {
+        "base_url": "https://api.deepseek.com/v1",
+        "key_env": ["DEEPSEEK_API_KEY", "DEEPSEEK_KEY"],
+        "key_files": ["~/.config/deepseek/key"],
+        "needs_key": True,
+        "aliases": ["--deepseek", "-ds"],
+        "description": "DeepSeek",
+    },
+    "mistral": {
+        "base_url": "https://api.mistral.ai/v1",
+        "key_env": ["MISTRAL_API_KEY", "MISTRAL_KEY"],
+        "key_files": ["~/.config/mistral/key"],
+        "needs_key": True,
+        "aliases": ["--mistral", "-mis"],
+        "description": "Mistral AI",
+    },
+    "opencode": {
+        "base_url": "https://opencode.ai/zen/v1",
+        "key_env": ["OPENCODE_API_KEY"],
+        "key_files": ["~/.config/opencode/key"],
+        "needs_key": False,
+        "default_key": "public",
+        "aliases": ["--opencode", "-oc"],
+        "description": "OpenCode (free, no key needed)",
+    },
+    "teenytiny": {
+        "base_url": "https://teenytiny.ai/v1",
+        "key_env": ["TEENYTINY_API_KEY"],
+        "key_files": ["~/.config/teenytiny/key"],
+        "needs_key": True,
+        "aliases": ["--teenytiny", "-tt"],
+        "description": "TeenyTiny AI (free, classic models)",
+    },
+    "local": {
+        "base_url": "http://localhost:8080/v1",
+        "key_env": [],
+        "key_files": [],
+        "needs_key": False,
+        "aliases": ["--local"],
+        "description": "Local server (localhost:8080)",
+    },
+}
+
+# Build alias lookup
+_PROVIDER_ALIAS_MAP = {}
+for _name, _prov in PROVIDERS.items():
+    for _alias in _prov["aliases"]:
+        _PROVIDER_ALIAS_MAP[_alias] = _name
+
+
+def resolve_provider_key(provider_name):
+    """Search for API key in provider-specific env vars, key files, or default."""
+    prov = PROVIDERS.get(provider_name)
+    if not prov:
+        return None
+    # Check env vars
+    for env_var in prov["key_env"]:
+        val = os.environ.get(env_var)
+        if val:
+            return val
+    # Check key files
+    for path in prov["key_files"]:
+        expanded = os.path.expanduser(path)
+        if os.path.exists(expanded):
+            try:
+                with open(expanded) as f:
+                    key = f.read().strip()
+                if key:
+                    return key
+            except IOError:
+                pass
+    # Fall back to provider default key (e.g. "public" for opencode)
+    if "default_key" in prov:
+        return prov["default_key"]
+    return None
+
+# ─── ANSI & Terminal ────────────────────────────────────────────────────────
+
+class C:
+    """ANSI color/style codes."""
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    ITALIC = "\033[3m"
+    UNDERLINE = "\033[4m"
+    # Colors
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+    WHITE = "\033[37m"
+    GRAY = "\033[90m"
+    # Bright
+    BRIGHT_GREEN = "\033[92m"
+    BRIGHT_CYAN = "\033[96m"
+    BRIGHT_YELLOW = "\033[93m"
+    BRIGHT_MAGENTA = "\033[95m"
+
+
+def supports_color():
+    """Check if terminal supports color output."""
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+
+def detect_terminal():
+    """Detect terminal capabilities."""
+    term = os.environ.get("TERM", "")
+    term_program = os.environ.get("TERM_PROGRAM", "")
+    caps = {
+        "color": supports_color(),
+        "kitty_images": "kitty" in term_program.lower() or "kitty" in term.lower(),
+        "iterm_images": term_program == "iTerm.app" or "iterm" in term_program.lower(),
+        "ghostty_images": "ghostty" in term_program.lower(),
+        "sixel": False,  # Would need to query terminal
+        "bracketed_paste": True,  # Most modern terminals
+        "unicode": True,  # Assume modern terminal
+        "nerd_fonts": True,  # Assume available, degrade gracefully
+    }
+    caps["images"] = caps["kitty_images"] or caps["iterm_images"] or caps["ghostty_images"]
+    return caps
+
+
+TERM_CAPS = detect_terminal()
+
+# ─── Icons (Nerd Font with fallback) ────────────────────────────────────────
+
+class Icons:
+    ROBOT = "󰚩 " if TERM_CAPS["nerd_fonts"] else "🤖 "
+    USER = " " if TERM_CAPS["nerd_fonts"] else "> "
+    ARROW = "" if TERM_CAPS["nerd_fonts"] else ">"
+    GEAR = " " if TERM_CAPS["nerd_fonts"] else "⚙ "
+    WARN = " " if TERM_CAPS["nerd_fonts"] else "⚠ "
+    INFO = " " if TERM_CAPS["nerd_fonts"] else "ℹ "
+    CHECK = " " if TERM_CAPS["nerd_fonts"] else "✓ "
+    SEND = "󰒊 " if TERM_CAPS["nerd_fonts"] else "➤ "
+    CLIP = "󰅍 " if TERM_CAPS["nerd_fonts"] else "📋 "
+    FILE = "󰈙 " if TERM_CAPS["nerd_fonts"] else "📄 "
+    IMAGE = "󰋩 " if TERM_CAPS["nerd_fonts"] else "🖼 "
+    SPARKLE = " " if TERM_CAPS["nerd_fonts"] else "✨ "
+    SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+
+# ─── Utilities ──────────────────────────────────────────────────────────────
+
+def styled(text, *styles):
+    """Apply ANSI styles to text."""
+    if not TERM_CAPS["color"]:
+        return text
+    prefix = "".join(styles)
+    return f"{prefix}{text}{C.RESET}"
+
+
+def dim(text):
+    return styled(text, C.DIM)
+
+
+def bold(text):
+    return styled(text, C.BOLD)
+
+
+def term_width():
+    return shutil.get_terminal_size((80, 24)).columns
+
+
+def hrule():
+    return dim("─" * min(term_width(), 72))
+
+
+def wrap_text(text, indent=0):
+    """Wrap text to terminal width with indent."""
+    width = min(term_width() - indent, 80)
+    lines = text.split("\n")
+    result = []
+    for line in lines:
+        if len(line) <= width:
+            result.append(line)
+        else:
+            wrapped = textwrap.wrap(line, width=width)
+            result.extend(wrapped if wrapped else [""])
+    return "\n".join((" " * indent + l) for l in result)
+
+
+# ─── Simple Markdown Rendering ──────────────────────────────────────────────
+
+def render_markdown(text):
+    """Render basic markdown with ANSI codes for terminal display."""
+    if not TERM_CAPS["color"]:
+        return text
+
+    lines = text.split("\n")
+    result = []
+    in_code_block = False
+    code_lang = ""
+
+    for line in lines:
+        # Code blocks
+        if line.startswith("```"):
+            in_code_block = not in_code_block
+            if in_code_block:
+                code_lang = line[3:].strip()
+                result.append(dim("┌─" + (f" {code_lang} " if code_lang else "") + "─" * 40))
+            else:
+                result.append(dim("└" + "─" * 44))
+                code_lang = ""
+            continue
+
+        if in_code_block:
+            result.append(f"  {styled(line, C.CYAN)}")
+            continue
+
+        # Headers
+        if line.startswith("### "):
+            result.append(styled(line[4:], C.BOLD, C.MAGENTA))
+            continue
+        if line.startswith("## "):
+            result.append(styled(line[3:], C.BOLD, C.YELLOW))
+            continue
+        if line.startswith("# "):
+            result.append(styled(line[2:], C.BOLD, C.GREEN))
+            continue
+
+        # Inline code
+        line = re.sub(r'`([^`]+)`', lambda m: styled(m.group(1), C.CYAN), line)
+        # Bold
+        line = re.sub(r'\*\*([^*]+)\*\*', lambda m: styled(m.group(1), C.BOLD), line)
+        # Italic
+        line = re.sub(r'\*([^*]+)\*', lambda m: styled(m.group(1), C.ITALIC), line)
+        # Bullet points
+        if line.startswith("- ") or line.startswith("* "):
+            line = f"  {styled('•', C.CYAN)} {line[2:]}"
+
+        result.append(line)
+
+    return "\n".join(result)
+
+
+# ─── Spinner ────────────────────────────────────────────────────────────────
+
+class Spinner:
+    """Animated spinner for waiting states."""
+    def __init__(self, message="Thinking"):
+        self.message = message
+        self.running = False
+        self.thread = None
+        self.frame = 0
+
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self._animate, daemon=True)
+        self.thread.start()
+
+    def _animate(self):
+        while self.running:
+            frame = Icons.SPINNER_FRAMES[self.frame % len(Icons.SPINNER_FRAMES)]
+            sys.stdout.write(f"\r{styled(frame, C.CYAN)} {dim(self.message)}  ")
+            sys.stdout.flush()
+            self.frame += 1
+            time.sleep(0.08)
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join()
+        sys.stdout.write("\r" + " " * (len(self.message) + 10) + "\r")
+        sys.stdout.flush()
+
+
+# ─── Image Handling ─────────────────────────────────────────────────────────
+
+def display_image_iterm(data, filename="image"):
+    """Display image using iTerm2 inline image protocol."""
+    b64 = base64.b64encode(data).decode("ascii")
+    sys.stdout.write(f"\033]1337;File=name={base64.b64encode(filename.encode()).decode()};inline=1:{b64}\007\n")
+    sys.stdout.flush()
+
+
+def display_image_kitty(data, filename="image"):
+    """Display image using Kitty graphics protocol."""
+    b64 = base64.b64encode(data).decode("ascii")
+    # Send in chunks of 4096
+    chunks = [b64[i:i+4096] for i in range(0, len(b64), 4096)]
+    for i, chunk in enumerate(chunks):
+        m = 1 if i < len(chunks) - 1 else 0
+        if i == 0:
+            sys.stdout.write(f"\033_Ga=T,f=100,m={m};{chunk}\033\\")
+        else:
+            sys.stdout.write(f"\033_Gm={m};{chunk}\033\\")
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def display_image(data, filename="image"):
+    """Display image using best available terminal protocol."""
+    if TERM_CAPS["kitty_images"] or TERM_CAPS["ghostty_images"]:
+        display_image_kitty(data, filename)
+    elif TERM_CAPS["iterm_images"]:
+        display_image_iterm(data, filename)
+    else:
+        print(dim(f"  [{Icons.IMAGE}{filename} - image display not supported in this terminal]"))
+
+
+def encode_image_for_api(filepath):
+    """Read and encode an image file for the chat completions API."""
+    ext = os.path.splitext(filepath)[1].lower()
+    mime_types = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".gif": "image/gif", ".webp": "image/webp",
+    }
+    mime = mime_types.get(ext, "image/png")
+    with open(filepath, "rb") as f:
+        data = f.read()
+    b64 = base64.b64encode(data).decode("ascii")
+    return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
+
+
+# ─── Config ─────────────────────────────────────────────────────────────────
+
+def load_config():
+    """Load saved configuration."""
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass
+    return {}
+
+
+def save_config(config):
+    """Save configuration to disk."""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+# ─── API Client ─────────────────────────────────────────────────────────────
+
+class LLMClient:
+    """HTTP client for OpenAI-compatible chat completions API."""
+
+    def __init__(self, base_url, api_key=None):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.model = None
+        self.models_cache = None
+        self.total_tokens = {"prompt": 0, "completion": 0}
+
+    def _headers(self):
+        h = {"Content-Type": "application/json"}
+        if self.api_key:
+            h["Authorization"] = f"Bearer {self.api_key}"
+        return h
+
+    def _request(self, path, data=None, stream=False):
+        """Make HTTP request to API."""
+        url = f"{self.base_url}{path}"
+        body = json.dumps(data).encode() if data else None
+        req = Request(url, data=body, headers=self._headers(), method="POST" if data else "GET")
+        return urlopen(req, timeout=READ_TIMEOUT if stream else CONNECT_TIMEOUT)
+
+    def test_connection(self):
+        """Test if we can connect to the API. Returns (success, error_message)."""
+        try:
+            self._request("/models")
+            return True, None
+        except HTTPError as e:
+            if e.code == 401:
+                return False, "unauthorized"
+            return False, f"HTTP {e.code}: {e.reason}"
+        except URLError as e:
+            return False, f"Connection failed: {e.reason}"
+        except Exception as e:
+            return False, str(e)
+
+    def list_models(self):
+        """Fetch available models."""
+        if self.models_cache:
+            return self.models_cache
+        try:
+            resp = self._request("/models")
+            data = json.loads(resp.read().decode())
+            models = [m["id"] for m in data.get("data", [])]
+            models.sort()
+            self.models_cache = models
+            return models
+        except Exception:
+            return []
+
+    def chat_stream(self, messages):
+        """Send chat request and yield response chunks."""
+        data = {
+            "model": self.model,
+            "messages": messages,
+            "stream": True,
+        }
+        try:
+            resp = self._request("/chat/completions", data=data, stream=True)
+        except HTTPError as e:
+            body = e.read().decode()
+            try:
+                err = json.loads(body)
+                yield {"error": err.get("error", {}).get("message", body)}
+            except json.JSONDecodeError:
+                yield {"error": f"HTTP {e.code}: {body[:200]}"}
+            return
+        except Exception as e:
+            yield {"error": str(e)}
+            return
+
+        # Parse SSE stream
+        buffer = ""
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace")
+            buffer += line
+            while "\n" in buffer:
+                sse_line, buffer = buffer.split("\n", 1)
+                sse_line = sse_line.rstrip("\r")
+                if sse_line.startswith("data: "):
+                    payload = sse_line[6:]
+                    if payload.strip() == "[DONE]":
+                        return
+                    try:
+                        chunk = json.loads(payload)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        if "content" in delta:
+                            yield {"content": delta["content"]}
+                        # Capture usage if present (some APIs send on last chunk)
+                        usage = chunk.get("usage")
+                        if usage:
+                            yield {"usage": usage}
+                    except json.JSONDecodeError:
+                        continue
+
+
+# ─── Chat Session ───────────────────────────────────────────────────────────
+
+class ChatSession:
+    """Manages conversation state and interaction."""
+
+    def __init__(self, client):
+        self.client = client
+        self.messages = []
+        self.system_prompt = None
+        self.turn_count = 0
+        self.last_response = ""
+        self.attached_files = []  # Pending file attachments
+        self.tips_shown = set()
+
+    def set_system(self, prompt):
+        self.system_prompt = prompt
+
+    def build_messages(self):
+        """Build message list for API, including system prompt."""
+        msgs = []
+        if self.system_prompt:
+            msgs.append({"role": "system", "content": self.system_prompt})
+        # Truncate if too long
+        history = self.messages
+        if len(history) > MAX_CONTEXT_MESSAGES * 2:
+            history = history[-(MAX_CONTEXT_MESSAGES * 2):]
+            if not self._tip_shown("truncate"):
+                print(dim(f"  {Icons.INFO}Context trimmed to last {MAX_CONTEXT_MESSAGES} exchanges"))
+        msgs.extend(history)
+        return msgs
+
+    def _tip_shown(self, key):
+        if key in self.tips_shown:
+            return True
+        self.tips_shown.add(key)
+        return False
+
+    def add_user_message(self, text):
+        """Add user message, possibly with image attachments."""
+        if self.attached_files:
+            # Build multimodal content
+            content = [{"type": "text", "text": text}]
+            for f in self.attached_files:
+                content.append(encode_image_for_api(f))
+                print(dim(f"  {Icons.IMAGE}Attached: {os.path.basename(f)}"))
+            self.messages.append({"role": "user", "content": content})
+            self.attached_files = []
+        else:
+            self.messages.append({"role": "user", "content": text})
+
+    def stream_response(self):
+        """Stream assistant response to terminal."""
+        msgs = self.build_messages()
+        spinner = Spinner("Thinking")
+        spinner.start()
+
+        full_response = ""
+        first_token = True
+        error_msg = None
+
+        for chunk in self.client.chat_stream(msgs):
+            if "error" in chunk:
+                spinner.stop()
+                error_msg = chunk["error"]
+                break
+            if "content" in chunk:
+                if first_token:
+                    spinner.stop()
+                    # Print assistant header
+                    sys.stdout.write(f"{styled(Icons.ROBOT, C.BRIGHT_GREEN)}")
+                    first_token = False
+                sys.stdout.write(chunk["content"])
+                sys.stdout.flush()
+                full_response += chunk["content"]
+            if "usage" in chunk:
+                usage = chunk["usage"]
+                self.client.total_tokens["prompt"] += usage.get("prompt_tokens", 0)
+                self.client.total_tokens["completion"] += usage.get("completion_tokens", 0)
+
+        if error_msg:
+            print(f"\n{styled(Icons.WARN + 'Error: ', C.RED)}{error_msg}")
+            return
+
+        if first_token:
+            spinner.stop()
+            print(dim("  (empty response)"))
+            return
+
+        # Ensure newline after response
+        if full_response and not full_response.endswith("\n"):
+            sys.stdout.write("\n")
+
+        self.messages.append({"role": "assistant", "content": full_response})
+        self.last_response = full_response
+        self.turn_count += 1
+        self._show_contextual_tip()
+
+    def _show_contextual_tip(self):
+        """Show helpful tips based on usage patterns."""
+        tips = []
+        if self.turn_count == 1 and not self._tip_shown("first"):
+            tips.append(f"Tip: {styled('/help', C.CYAN)} lists all commands  {dim('│')}  {styled('Ctrl+X Ctrl+E', C.CYAN)} opens $EDITOR  {dim('│')}  {styled('Ctrl+C', C.CYAN)} to exit")
+        elif self.turn_count == 3 and not self._tip_shown("slash"):
+            tips.append(f"Tip: {styled('/retry', C.CYAN)} regenerates  {dim('│')}  {styled('/copy', C.CYAN)} copies last response  {dim('│')}  {styled('/clear', C.CYAN)} resets")
+        elif self.turn_count == 5 and not self._tip_shown("attach"):
+            if TERM_CAPS["images"]:
+                tips.append(f"Tip: {styled('/attach <path>', C.CYAN)} to include images  {dim('│')}  paste file paths to attach")
+            else:
+                tips.append(f"Tip: {styled('/attach <path>', C.CYAN)} to include files in your message")
+        elif self.turn_count == 8 and not self._tip_shown("system"):
+            tips.append(f"Tip: {styled('/system <prompt>', C.CYAN)} sets a system prompt  {dim('│')}  {styled('/save', C.CYAN)} exports the conversation")
+        if tips:
+            print(dim(tips[0]))
+
+
+# ─── Slash Commands ─────────────────────────────────────────────────────────
+
+def cmd_help(session, args):
+    """Show all available commands."""
+    print(f"""
+{bold("Commands")}
+  {styled("/help", C.CYAN)}             Show this help
+  {styled("/model", C.CYAN)} [name]     Switch model (interactive picker if no name)
+  {styled("/models", C.CYAN)}           List available models
+  {styled("/system", C.CYAN)} [prompt]  Set or show system prompt
+  {styled("/clear", C.CYAN)}            Reset conversation history
+  {styled("/retry", C.CYAN)}            Regenerate last response
+  {styled("/copy", C.CYAN)}             Copy last response to clipboard
+  {styled("/attach", C.CYAN)} <path>    Attach file/image to next message
+  {styled("/save", C.CYAN)} [file]      Save conversation to file
+  {styled("/info", C.CYAN)}             Show session info (model, tokens, config)
+  {styled("/quit", C.CYAN)}             Exit (also: Ctrl+C, Ctrl+D)
+
+{bold("Editing")}
+  {styled("Ctrl+X Ctrl+E", C.CYAN)}   Open current input in $EDITOR (multi-line)
+  {styled("↑ / ↓", C.CYAN)}           Navigate input history
+  {styled("Ctrl+R", C.CYAN)}          Reverse search history
+  {styled("Ctrl+A / Ctrl+E", C.CYAN)}  Jump to start/end of line
+  {styled("Ctrl+W", C.CYAN)}          Delete word backward
+
+{bold("Tips")}
+  • Paste or drag file paths to attach them (images sent as vision input)
+  • Multi-line: end a line with \\ or use :edit to open $EDITOR
+  • Response streams in real-time; Ctrl+C during stream stops generation
+""")
+
+
+def cmd_model(session, args):
+    """Switch model."""
+    if args:
+        session.client.model = args.strip()
+        print(f"  {Icons.CHECK}Model set to {styled(session.client.model, C.BOLD)}")
+        return
+
+    models = session.client.list_models()
+    if not models:
+        print(f"  {Icons.WARN}No models available")
+        return
+
+    print(f"\n  {bold('Available Models')}")
+    for i, m in enumerate(models, 1):
+        marker = styled(" ●", C.GREEN) if m == session.client.model else "  "
+        print(f"  {marker} {styled(str(i), C.DIM)}) {m}")
+    print()
+
+    try:
+        choice = input(dim("  Select model (number or name): ")).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+
+    if choice.isdigit():
+        idx = int(choice) - 1
+        if 0 <= idx < len(models):
+            session.client.model = models[idx]
+        else:
+            print(f"  {Icons.WARN}Invalid selection")
+            return
+    elif choice in models:
+        session.client.model = choice
+    else:
+        # Fuzzy match
+        matches = [m for m in models if choice.lower() in m.lower()]
+        if len(matches) == 1:
+            session.client.model = matches[0]
+        elif matches:
+            print(f"  {Icons.WARN}Ambiguous: {', '.join(matches[:5])}")
+            return
+        else:
+            print(f"  {Icons.WARN}Model not found: {choice}")
+            return
+
+    print(f"  {Icons.CHECK}Switched to {styled(session.client.model, C.BOLD)}")
+
+
+def cmd_models(session, args):
+    """List models."""
+    models = session.client.list_models()
+    if not models:
+        print(f"  {Icons.WARN}No models available")
+        return
+    print(f"\n  {bold('Models')} ({len(models)} available)")
+    for m in models:
+        marker = styled("● ", C.GREEN) if m == session.client.model else "  "
+        print(f"  {marker}{m}")
+    print()
+
+
+def cmd_system(session, args):
+    """Set or show system prompt."""
+    if args:
+        session.set_system(args.strip())
+        print(f"  {Icons.CHECK}System prompt set ({len(args.strip())} chars)")
+    elif session.system_prompt:
+        print(f"  {bold('System prompt:')}")
+        print(f"  {dim(session.system_prompt[:200])}")
+        if len(session.system_prompt) > 200:
+            print(dim(f"  ... ({len(session.system_prompt)} chars total)"))
+    else:
+        print(f"  {dim('No system prompt set. Usage: /system <your prompt>')}")
+
+
+def cmd_clear(session, args):
+    """Clear conversation history."""
+    session.messages.clear()
+    session.turn_count = 0
+    session.last_response = ""
+    session.attached_files.clear()
+    print(f"  {Icons.CHECK}Conversation cleared")
+
+
+def cmd_retry(session, args):
+    """Regenerate last response."""
+    if len(session.messages) < 2:
+        print(f"  {Icons.WARN}Nothing to retry")
+        return
+    # Remove last assistant message
+    if session.messages[-1]["role"] == "assistant":
+        session.messages.pop()
+    session.turn_count -= 1
+    session.stream_response()
+
+
+def cmd_copy(session, args):
+    """Copy last response to clipboard."""
+    if not session.last_response:
+        print(f"  {Icons.WARN}No response to copy")
+        return
+    try:
+        if sys.platform == "darwin":
+            proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+        else:
+            proc = subprocess.Popen(["xclip", "-selection", "clipboard"], stdin=subprocess.PIPE)
+        proc.communicate(session.last_response.encode())
+        print(f"  {Icons.CLIP}Copied to clipboard ({len(session.last_response)} chars)")
+    except FileNotFoundError:
+        print(f"  {Icons.WARN}Clipboard tool not found (need pbcopy or xclip)")
+
+
+def cmd_attach(session, args):
+    """Attach a file to the next message."""
+    if not args:
+        print(f"  {dim('Usage: /attach <filepath>')}")
+        if session.attached_files:
+            print(f"  {bold('Pending attachments:')}")
+            for f in session.attached_files:
+                print(f"    {Icons.FILE}{os.path.basename(f)}")
+        return
+
+    path = os.path.expanduser(args.strip().strip("'\""))
+    if not os.path.exists(path):
+        print(f"  {Icons.WARN}File not found: {path}")
+        return
+
+    image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+    ext = os.path.splitext(path)[1].lower()
+    if ext in image_exts:
+        session.attached_files.append(path)
+        print(f"  {Icons.IMAGE}Image queued: {os.path.basename(path)} (will send with next message)")
+    else:
+        # Read text file and include in message
+        try:
+            with open(path) as f:
+                content = f.read()
+            session.attached_files.append(None)  # Marker
+            # Store as pending text
+            if not hasattr(session, '_pending_text_files'):
+                session._pending_text_files = []
+            session._pending_text_files.append((os.path.basename(path), content))
+            print(f"  {Icons.FILE}File queued: {os.path.basename(path)} ({len(content)} chars, will include with next message)")
+        except Exception as e:
+            print(f"  {Icons.WARN}Error reading file: {e}")
+
+
+def cmd_save(session, args):
+    """Save conversation to file."""
+    filename = args.strip() if args else f"chat-{int(time.time())}.md"
+    try:
+        with open(filename, "w") as f:
+            f.write(f"# Chat Export\n")
+            f.write(f"Model: {session.client.model}\n")
+            f.write(f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n---\n\n")
+            for msg in session.messages:
+                role = "**You**" if msg["role"] == "user" else "**Assistant**"
+                content = msg["content"] if isinstance(msg["content"], str) else "[multimodal]"
+                f.write(f"{role}:\n{content}\n\n---\n\n")
+        print(f"  {Icons.CHECK}Saved to {styled(filename, C.UNDERLINE)}")
+    except Exception as e:
+        print(f"  {Icons.WARN}Error saving: {e}")
+
+
+def cmd_info(session, args):
+    """Show session info."""
+    tokens = session.client.total_tokens
+    total = tokens["prompt"] + tokens["completion"]
+    print(f"""
+  {bold("Session Info")}
+  {dim("Model:")}       {session.client.model or 'none'}
+  {dim("Base URL:")}    {session.client.base_url}
+  {dim("Turns:")}       {session.turn_count}
+  {dim("Messages:")}    {len(session.messages)}
+  {dim("Tokens:")}      {total:,} total ({tokens['prompt']:,} in / {tokens['completion']:,} out)
+  {dim("System:")}      {'set' if session.system_prompt else 'none'}
+  {dim("Terminal:")}     {'images' if TERM_CAPS['images'] else 'text only'}
+  {dim("Attachments:")} {len(session.attached_files)} pending
+""")
+
+
+def cmd_quit(session, args):
+    """Exit the chat."""
+    print(f"\n  {dim('Goodbye!')}")
+    sys.exit(0)
+
+
+COMMANDS = {
+    "help": cmd_help, "h": cmd_help, "?": cmd_help,
+    "model": cmd_model,
+    "models": cmd_models,
+    "system": cmd_system,
+    "clear": cmd_clear,
+    "retry": cmd_retry,
+    "copy": cmd_copy,
+    "attach": cmd_attach,
+    "save": cmd_save,
+    "info": cmd_info,
+    "quit": cmd_quit, "q": cmd_quit, "exit": cmd_quit,
+}
+
+# ─── Readline & Editor Integration ─────────────────────────────────────────
+
+def setup_readline():
+    """Configure readline with history and keybindings."""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    if os.path.exists(HISTORY_FILE):
+        readline.read_history_file(HISTORY_FILE)
+    readline.set_history_length(MAX_HISTORY)
+
+    # Enable Ctrl+X Ctrl+E to open $EDITOR (like bash)
+    # This is handled in the input loop since readline doesn't support it natively in Python
+    readline.parse_and_bind("set editing-mode emacs")
+    readline.parse_and_bind("set show-all-if-ambiguous on")
+
+
+def save_readline_history():
+    """Save readline history on exit."""
+    try:
+        readline.write_history_file(HISTORY_FILE)
+    except Exception:
+        pass
+
+
+def open_in_editor(initial_text=""):
+    """Open text in $EDITOR and return edited content."""
+    editor = os.environ.get("EDITOR", os.environ.get("VISUAL", "vi"))
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        f.write(initial_text)
+        tmpfile = f.name
+    try:
+        ret = subprocess.call([editor, tmpfile])
+        if ret == 0:
+            with open(tmpfile) as f:
+                return f.read()
+    except Exception as e:
+        print(f"  {Icons.WARN}Editor error: {e}")
+    finally:
+        os.unlink(tmpfile)
+    return None
+
+
+# ─── Startup / Connection ───────────────────────────────────────────────────
+
+def print_banner():
+    """Show welcome banner with key info."""
+    w = min(term_width(), 60)
+    print()
+    print(styled("  ╭" + "─" * (w - 4) + "╮", C.DIM))
+    title = "llm-chat"
+    pad = w - 4 - len(title) - 3
+    print(styled("  │", C.DIM) + f" {styled(Icons.SPARKLE, C.BRIGHT_MAGENTA)}{styled(title, C.BOLD)} " + " " * pad + styled("│", C.DIM))
+    print(styled("  ╰" + "─" * (w - 4) + "╯", C.DIM))
+    print()
+
+
+def setup_connection(args):
+    """Establish API connection, prompting as needed. Returns LLMClient."""
+    config = load_config()
+    provider_name = args.get("provider")
+    provider = PROVIDERS.get(provider_name) if provider_name else None
+
+    # Resolve base URL: args > provider > env > config > show help
+    if args.get("base_url"):
+        base_url = args["base_url"]
+    elif provider:
+        base_url = provider["base_url"]
+    else:
+        base_url = (
+            os.environ.get("LLM_BASE_URL")
+            or os.environ.get("OPENAI_BASE_URL")
+            or config.get("base_url")
+        )
+        if not base_url:
+            print_help()
+            sys.exit(0)
+
+    # Resolve API key: args > provider-specific env/files > generic env > config > prompt
+    api_key = args.get("api_key")
+    if not api_key and provider_name:
+        api_key = resolve_provider_key(provider_name)
+    if not api_key:
+        api_key = (
+            os.environ.get("LLM_API_KEY")
+            or os.environ.get("OPENAI_API_KEY")
+            or config.get("api_key")
+        )
+
+    client = LLMClient(base_url, api_key)
+    print(f"  {dim('Connecting to')} {styled(base_url, C.UNDERLINE)}")
+
+    # Test connection
+    ok, err = client.test_connection()
+    if not ok:
+        if err == "unauthorized":
+            print(f"  {Icons.WARN}API key required")
+            try:
+                api_key = input(f"  {dim('API Key: ')}").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n")
+                sys.exit(1)
+            client.api_key = api_key
+            ok, err = client.test_connection()
+            if not ok:
+                print(f"  {styled('Error:', C.RED)} {err}")
+                sys.exit(1)
+            # Save for next time
+            config["api_key"] = api_key
+            config["base_url"] = base_url
+            save_config(config)
+        else:
+            print(f"  {styled('Error:', C.RED)} {err}")
+            sys.exit(1)
+    else:
+        # Save working config
+        config["base_url"] = base_url
+        if api_key:
+            config["api_key"] = api_key
+        save_config(config)
+
+    print(f"  {Icons.CHECK}{styled('Connected', C.GREEN)}")
+
+    # Select model: args > env > config > interactive
+    model = (
+        args.get("model")
+        or os.environ.get("LLM_MODEL")
+        or config.get("model")
+    )
+
+    if not model:
+        models = client.list_models()
+        if not models:
+            print(f"  {Icons.WARN}No models found at /models endpoint")
+            try:
+                model = input(f"  {dim('Model name: ')}").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n")
+                sys.exit(1)
+        elif len(models) == 1:
+            model = models[0]
+            print(f"  {dim('Using only available model:')} {styled(model, C.BOLD)}")
+        else:
+            print(f"\n  {bold('Select a model:')}")
+            for i, m in enumerate(models[:20], 1):
+                print(f"    {styled(str(i), C.DIM)}) {m}")
+            if len(models) > 20:
+                print(dim(f"    ... and {len(models) - 20} more (/models to see all)"))
+            print()
+            try:
+                choice = input(dim("  Choice (number or name): ")).strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n")
+                sys.exit(1)
+            if choice.isdigit() and 1 <= int(choice) <= len(models):
+                model = models[int(choice) - 1]
+            elif choice in models:
+                model = choice
+            else:
+                matches = [m for m in models if choice.lower() in m.lower()]
+                model = matches[0] if matches else choice
+
+    client.model = model
+    config["model"] = model
+    save_config(config)
+    print(f"  {dim('Model:')} {styled(model, C.BOLD)}")
+    print()
+    return client
+
+
+def print_help():
+    """Print help message with provider info and env var names."""
+    provider_lines = []
+    for name, p in PROVIDERS.items():
+        aliases = ", ".join(p["aliases"])
+        env_hint = p["key_env"][0] if p["key_env"] else "no key needed"
+        provider_lines.append(f"  {aliases:<20s} {p['description']:<32s} {dim(env_hint)}")
+    provider_block = "\n".join(provider_lines)
+
+    print(f"""
+{bold("llm-chat")} - Terminal LLM chat client (OpenAI-compatible API)
+
+{bold("Usage:")}
+  llm-chat --openai -m gpt-4o
+  llm-chat --anthropic -m claude-sonnet-4-20250514
+  llm-chat --ollama -m llama3
+  llm-chat --opencode
+  llm-chat -u https://my-server.com/v1 -k my-key -m my-model
+
+{bold("Provider shortcuts:")}
+{provider_block}
+
+  Keys are auto-detected from the env var shown above,
+  or from ~/.config/<provider>/key files.
+
+{bold("Arbitrary provider:")}
+  llm-chat -u <base_url> [-k <key>] [-m <model>]
+
+  Any OpenAI-compatible /v1/chat/completions endpoint works.
+
+{bold("Options:")}
+  -u, --url <url>       API base URL
+  -k, --key <key>       API key (or set via env var)
+  -m, --model <model>   Model to use
+  -s, --system <prompt> System prompt
+  -h, --help            Show this help
+
+{bold("General env vars:")}
+  LLM_BASE_URL, OPENAI_BASE_URL   API base URL
+  LLM_API_KEY, OPENAI_API_KEY     API key (generic fallback)
+  LLM_MODEL                       Default model
+
+{bold("Config:")} ~/.config/llm-chat/config.json (remembers last provider/model)
+""")
+
+
+def parse_args():
+    """Parse command-line arguments."""
+    args = {}
+    argv = sys.argv[1:]
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-u", "--url", "--base-url"):
+            i += 1
+            args["base_url"] = argv[i] if i < len(argv) else None
+        elif a in ("-k", "--key", "--api-key"):
+            i += 1
+            args["api_key"] = argv[i] if i < len(argv) else None
+        elif a in ("-m", "--model"):
+            i += 1
+            args["model"] = argv[i] if i < len(argv) else None
+        elif a in ("-s", "--system"):
+            i += 1
+            args["system"] = argv[i] if i < len(argv) else None
+        elif a in _PROVIDER_ALIAS_MAP:
+            args["provider"] = _PROVIDER_ALIAS_MAP[a]
+        elif a in ("-h", "--help"):
+            print_help()
+            sys.exit(0)
+        elif a.startswith("http"):
+            args["base_url"] = a
+        else:
+            if not a.startswith("-"):
+                args["model"] = a
+        i += 1
+    return args
+
+
+# ─── Main Loop ──────────────────────────────────────────────────────────────
+
+def get_input(session):
+    """Get user input with support for multi-line (backslash continuation) and Ctrl+X Ctrl+E."""
+    prompt = f"{styled(Icons.USER, C.BRIGHT_CYAN)}"
+    lines = []
+
+    while True:
+        try:
+            if lines:
+                line = input(styled("  ... ", C.DIM))
+            else:
+                line = input(prompt)
+        except EOFError:
+            if lines:
+                return "\n".join(lines)
+            raise
+        except KeyboardInterrupt:
+            if lines:
+                print()
+                lines.clear()
+                continue
+            raise
+
+        # Check for editor trigger: if line is just `:e` or user pressed Ctrl+X Ctrl+E
+        if line.strip() == ":e" or line.strip() == ":edit":
+            initial = "\n".join(lines) if lines else ""
+            result = open_in_editor(initial)
+            if result is not None:
+                return result.rstrip("\n")
+            lines.clear()
+            continue
+
+        # Multi-line continuation
+        if line.endswith("\\"):
+            lines.append(line[:-1])
+            continue
+
+        lines.append(line)
+        return "\n".join(lines)
+
+
+def handle_file_path_input(session, text):
+    """Check if input looks like a file path and offer to attach it."""
+    # Detect pasted file paths (common pattern: starts with / or ~, has image extension)
+    stripped = text.strip().strip("'\"")
+    if (stripped.startswith("/") or stripped.startswith("~")) and os.path.exists(os.path.expanduser(stripped)):
+        ext = os.path.splitext(stripped)[1].lower()
+        image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+        if ext in image_exts:
+            session.attached_files.append(os.path.expanduser(stripped))
+            print(f"  {Icons.IMAGE}Image attached: {os.path.basename(stripped)}")
+            print(dim(f"  Type your message (image will be included) or paste another file"))
+            return True
+    return False
+
+
+def main():
+    signal.signal(signal.SIGINT, lambda s, f: (print(f"\n  {dim('Goodbye!')}"), save_readline_history(), sys.exit(0)))
+
+    args = parse_args()
+    print_banner()
+
+    # Setup
+    setup_readline()
+    import atexit
+    atexit.register(save_readline_history)
+
+    client = setup_connection(args)
+    session = ChatSession(client)
+
+    if args.get("system"):
+        session.set_system(args["system"])
+        print(f"  {dim('System prompt set from --system flag')}")
+
+    # Welcome hints
+    print(hrule())
+    features = [f"{styled('/help', C.CYAN)} commands"]
+    features.append(f"{styled(':edit', C.CYAN)} opens $EDITOR")
+    if TERM_CAPS["images"]:
+        features.append(f"{styled('/attach', C.CYAN)} images")
+    bslash = styled("\\\\", C.CYAN)
+    features.append(f"{bslash} for multi-line")
+    print(f"  {dim(' │ '.join(features))}")
+    print(hrule())
+    print()
+
+    # Main REPL
+    while True:
+        try:
+            text = get_input(session)
+        except EOFError:
+            print(f"\n  {dim('Goodbye!')}")
+            break
+        except KeyboardInterrupt:
+            print(f"\n  {dim('Goodbye!')}")
+            break
+
+        if not text.strip():
+            continue
+
+        # Handle slash commands
+        if text.startswith("/"):
+            parts = text[1:].split(None, 1)
+            cmd_name = parts[0].lower() if parts else ""
+            cmd_args = parts[1] if len(parts) > 1 else ""
+            if cmd_name in COMMANDS:
+                COMMANDS[cmd_name](session, cmd_args)
+            else:
+                print(f"  {Icons.WARN}Unknown command: /{cmd_name}  {dim('(try /help)')}")
+            continue
+
+        # Check for file path paste
+        if handle_file_path_input(session, text):
+            continue
+
+        # Handle pending text file attachments
+        if hasattr(session, '_pending_text_files') and session._pending_text_files:
+            file_context = ""
+            for fname, content in session._pending_text_files:
+                file_context += f"\n\n--- File: {fname} ---\n{content}\n---\n"
+            text = text + file_context
+            session._pending_text_files.clear()
+            # Remove None markers from attached_files
+            session.attached_files = [f for f in session.attached_files if f is not None]
+
+        # Send message
+        session.add_user_message(text)
+        session.stream_response()
+        print()
+
+
+if __name__ == "__main__":
+    main()
