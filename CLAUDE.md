@@ -31,6 +31,17 @@ Assume these are installed by default:
 
 ## Development Guidelines
 
+### License Header (Required)
+
+Every program file MUST include this header at the end of the opening comment block (after the description, before code begins):
+
+```
+Joe Walnes <joe@walnes.com>, <YEAR>, MIT License
+https://github.com/joewalnes/onesies
+```
+
+Use the current year. Use the appropriate comment syntax for the language (`#` for shell/perl/python, `//` for Swift/JS, `--` for AppleScript). The order is: shebang, then description, then author/license.
+
 ### CLI Tools
 - Use shell script or perl (no external deps beyond Git's perl)
 - If bash: always enable strict mode (`set -euo pipefail`)

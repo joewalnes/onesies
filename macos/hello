@@ -1,7 +1,8 @@
 #!/usr/bin/osascript
-
 -- AIDEV-NOTE: Example macOS tool demonstrating Onesies single-file principle
 -- Simple greeting dialog that can be run from terminal
+-- Joe Walnes <joe@walnes.com>, 2026, MIT License
+-- https://github.com/joewalnes/onesies
 
 on run argv
     -- Parse command line arguments

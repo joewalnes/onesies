@@ -1,5 +1,7 @@
 // AIDEV-NOTE: Example userscript demonstrating Onesies single-file principle
 // Simple browser greeting userscript - paste into dev console to run
+// Joe Walnes <joe@walnes.com>, 2026, MIT License
+// https://github.com/joewalnes/onesies
 
 /**
  * Hello Userscript

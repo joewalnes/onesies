@@ -1,7 +1,8 @@
 #!/usr/bin/swift
-
 // AIDEV-NOTE: Example Swift macOS tool demonstrating Onesies single-file principle
 // Creates a native Cocoa app window with greeting interface
+// Joe Walnes <joe@walnes.com>, 2026, MIT License
+// https://github.com/joewalnes/onesies
 
 import Cocoa
 import Foundation

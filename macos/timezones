@@ -10,6 +10,9 @@
 //   - Updates every second for accurate time
 //   - Customizable timezone list and display format
 //   - Clean monospace font for consistent spacing
+//
+// Joe Walnes <joe@walnes.com>, 2025, MIT License
+// https://github.com/joewalnes/onesies
 
 import Cocoa
 

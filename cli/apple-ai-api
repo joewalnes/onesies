@@ -15,6 +15,9 @@
 // Point any OpenAI client at http://localhost:8080 and it just works.
 //
 // Includes simple interactive web-app.
+//
+// Joe Walnes <joe@walnes.com>, 2026, MIT License
+// https://github.com/joewalnes/onesies
 
 import Foundation
 import Network

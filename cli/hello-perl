@@ -1,4 +1,7 @@
 #!/usr/bin/perl
+# hello-perl - A simple greeting tool written in Perl
+# Joe Walnes <joe@walnes.com>, 2026, MIT License
+# https://github.com/joewalnes/onesies
 use strict;
 use warnings;
 use Getopt::Long qw(GetOptions);

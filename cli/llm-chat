@@ -2,6 +2,8 @@
 """Single-file LLM chat client using /v1/chat/completions API."""
 # AIDEV-NOTE: This is a self-contained REPL chat client. No external dependencies.
 # Uses only Python stdlib: readline, urllib, json, os, sys, subprocess, shutil, tempfile, base64, select, signal, threading
+# Joe Walnes <joe@walnes.com>, 2026, MIT License
+# https://github.com/joewalnes/onesies
 
 import sys
 import os

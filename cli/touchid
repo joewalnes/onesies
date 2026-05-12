@@ -9,6 +9,9 @@
 //   0 - Authentication successful
 //   1 - Authentication failed or denied
 //   2 - Touch ID not available
+//
+// Joe Walnes <joe@walnes.com>, 2026, MIT License
+// https://github.com/joewalnes/onesies
 
 import LocalAuthentication
 import Foundation

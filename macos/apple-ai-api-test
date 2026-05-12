@@ -10,6 +10,9 @@ set -euo pipefail
 # Does NOT test actual model inference (requires Apple Intelligence enabled).
 # Tests are designed to work even when the model is unavailable — they test
 # the HTTP server layer, routing, auth, and request validation.
+#
+# Joe Walnes <joe@walnes.com>, 2026, MIT License
+# https://github.com/joewalnes/onesies
 
 # AIDEV-NOTE: User Configuration - Easy to modify settings
 PORT=18913  # High port to avoid conflicts

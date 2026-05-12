@@ -21,7 +21,8 @@
 //   - Built-in OTLP HTTP JSON receiver (no external collector needed)
 //   - Zero dependencies beyond macOS system frameworks
 //
-// - Joe Walnes
+// Joe Walnes <joe@walnes.com>, 2026, MIT License
+// https://github.com/joewalnes/onesies
 
 import Cocoa
 import Network

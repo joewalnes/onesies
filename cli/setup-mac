@@ -6,6 +6,9 @@
 # Usage:
 #   ./cli/setup-mac
 #
+# Joe Walnes <joe@walnes.com>, 2026, MIT License
+# https://github.com/joewalnes/onesies
+#
 # AIDEV-NOTE: All user-configurable lists are at the top. Helper functions below.
 
 set -euo pipefail

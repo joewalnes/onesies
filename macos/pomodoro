@@ -10,11 +10,12 @@
 //   - Small timer, always visible in macOS menu bar
 //   - Start/stop timer anytime with global shortcut
 //   - Customizable countdown duration with sounds at start/end
-// 
+//
 // Developed in 7 minutes using ChatGPT. The remaining 18 minutes spent
 // packaging up it up and publishing to GitHub.
 //
-// - Joe Walnes
+// Joe Walnes <joe@walnes.com>, 2025, MIT License
+// https://github.com/joewalnes/onesies
 
 import Cocoa
 import Foundation

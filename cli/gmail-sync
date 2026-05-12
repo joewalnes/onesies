@@ -16,6 +16,9 @@ offline querying, full-text search, and backup. One-way sync only.
 
 AIDEV-NOTE: This tool uses uv inline script metadata (PEP 723) for
 dependency management. Run with: ./gmail-sync or uv run gmail-sync
+
+Joe Walnes <joe@walnes.com>, 2026, MIT License
+https://github.com/joewalnes/onesies
 """
 
 import argparse
