@@ -194,6 +194,8 @@ class HTTPServer {
             var buffer = accumulated
             if let data = data { buffer.append(data) }
 
+            // AIDEV-NOTE: Cap buffer before header parsing completes to prevent
+            // unbounded memory accumulation from clients that never send \r\n\r\n
             if buffer.count > Config.maxRequestSize {
                 self.sendJSON(connection, status: 413, body: self.errorJSON("Request too large"))
                 return
@@ -276,7 +278,7 @@ class HTTPServer {
         // Auth check
         if let requiredKey = Config.apiKey {
             let authHeader = request.headers.first(where: { $0.0.lowercased() == "authorization" })?.1 ?? ""
-            let providedKey = authHeader.hasPrefix("Bearer ") ? String(authHeader.dropFirst(7)) : ""
+            let providedKey = authHeader.lowercased().hasPrefix("bearer ") ? String(authHeader.dropFirst(7)) : ""
             if providedKey != requiredKey {
                 sendJSON(connection, status: 401, body: errorJSON("Invalid API key"))
                 return
@@ -501,7 +503,11 @@ class HTTPServer {
                     "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" +
                     "Connection: keep-alive\r\n" +
                     "\r\n"
-                self.sendRaw(connection, data: header.data(using: .utf8)!)
+                guard let headerData = header.data(using: .utf8) else {
+                    connection.cancel()
+                    return
+                }
+                self.sendRaw(connection, data: headerData)
 
                 let stream = session.streamResponse(to: conversation[lastIdx].content, options: options)
                 var previousLength = 0
@@ -526,9 +532,10 @@ class HTTPServer {
                             ],
                         ]
                         if let jsonData = try? JSONSerialization.data(withJSONObject: chunk),
-                           let jsonStr = String(data: jsonData, encoding: .utf8) {
+                           let jsonStr = String(data: jsonData, encoding: .utf8),
+                           let sseData = "data: \(jsonStr)\n\n".data(using: .utf8) {
                             debugLog("Stream chunk: \(newContent)")
-                            self.sendRaw(connection, data: "data: \(jsonStr)\n\n".data(using: .utf8)!)
+                            self.sendRaw(connection, data: sseData)
                         }
                     }
                 }
@@ -548,18 +555,27 @@ class HTTPServer {
                     ],
                 ]
                 if let jsonData = try? JSONSerialization.data(withJSONObject: finalChunk),
-                   let jsonStr = String(data: jsonData, encoding: .utf8) {
-                    self.sendRaw(connection, data: "data: \(jsonStr)\n\n".data(using: .utf8)!)
+                   let jsonStr = String(data: jsonData, encoding: .utf8),
+                   let sseData = "data: \(jsonStr)\n\n".data(using: .utf8) {
+                    self.sendRaw(connection, data: sseData)
                 }
 
                 // Send done sentinel and close
-                self.sendRaw(connection, data: "data: [DONE]\n\n".data(using: .utf8)!) {
+                if let doneData = "data: [DONE]\n\n".data(using: .utf8) {
+                    self.sendRaw(connection, data: doneData) {
+                        connection.cancel()
+                    }
+                } else {
                     connection.cancel()
                 }
             } catch {
                 fputs("ERROR: Streaming generation failed: \(error)\n", stderr)
                 let errChunk = "data: {\"error\":{\"message\":\"\(error.localizedDescription)\"}}\n\n"
-                self.sendRaw(connection, data: errChunk.data(using: .utf8)!) {
+                if let errData = errChunk.data(using: .utf8) {
+                    self.sendRaw(connection, data: errData) {
+                        connection.cancel()
+                    }
+                } else {
                     connection.cancel()
                 }
             }
@@ -579,7 +595,11 @@ class HTTPServer {
     // No external dependencies — pure HTML/CSS/JS inlined in the Swift binary.
     private func handleIndex(_ connection: NWConnection) {
         let html = chatHTML()
-        sendHTTP(connection, status: 200, contentType: "text/html; charset=utf-8", body: html.data(using: .utf8)!)
+        guard let body = html.data(using: .utf8) else {
+            sendJSON(connection, status: 500, body: errorJSON("Failed to encode HTML"))
+            return
+        }
+        sendHTTP(connection, status: 200, contentType: "text/html; charset=utf-8", body: body)
     }
 
     private func chatHTML() -> String {
@@ -930,7 +950,10 @@ class HTTPServer {
         header += "Connection: close\r\n"
         header += "\r\n"
 
-        var responseData = header.data(using: .utf8)!
+        guard var responseData = header.data(using: .utf8) else {
+            connection.cancel()
+            return
+        }
         responseData.append(body)
 
         connection.send(content: responseData, completion: .contentProcessed { _ in
