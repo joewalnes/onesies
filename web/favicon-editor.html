@@ -1,0 +1,1213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Pixicon — Favicon Pixel Art Editor</title>
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Pixicon">
+  <style>
+    /* AIDEV-NOTE: Minimal reset + dark theme for pixel art aesthetic */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      min-height: 100dvh;
+      -webkit-font-smoothing: antialiased;
+      font-family: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono', monospace;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+      overflow-x: hidden;
+    }
+    html { overscroll-behavior: none; }
+    img, svg { display: block; max-width: 100%; }
+    input, button, textarea, select { font: inherit; }
+    .template { display: none !important; }
+
+    /* Layout */
+    .app {
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+
+    /* Header */
+    .header {
+      text-align: center;
+      padding: 0.75rem 0;
+    }
+    .header h1 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: #f0f0f0;
+      letter-spacing: 0.05em;
+    }
+    .header h1 span { color: #e74c3c; }
+    .header p {
+      font-size: 0.75rem;
+      color: #777;
+      margin-top: 0.25rem;
+    }
+
+    /* Toolbar */
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      align-items: center;
+      justify-content: center;
+      padding: 0.5rem;
+      background: #16213e;
+      border-radius: 8px;
+      border: 1px solid #2a2a4a;
+    }
+    .tool-group {
+      display: flex;
+      gap: 2px;
+    }
+    .tool-btn {
+      width: 40px;
+      height: 40px;
+      border: 2px solid transparent;
+      border-radius: 6px;
+      background: #1a1a2e;
+      color: #ccc;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.15s, border-color 0.15s;
+      position: relative;
+    }
+    .tool-btn:hover { background: #2a2a4a; }
+    .tool-btn.active { border-color: #e74c3c; background: #2a1525; }
+    .tool-btn svg { width: 20px; height: 20px; }
+    .tool-btn[title]::after {
+      content: attr(title);
+      position: absolute;
+      bottom: -24px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 0.6rem;
+      color: #888;
+      white-space: nowrap;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.15s;
+    }
+    .tool-btn:hover[title]::after { opacity: 1; }
+
+    .separator {
+      width: 1px;
+      height: 28px;
+      background: #2a2a4a;
+      margin: 0 0.25rem;
+    }
+
+    /* Color section */
+    .color-section {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      align-items: flex-start;
+      justify-content: center;
+    }
+
+    .color-current {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .color-preview {
+      width: 40px;
+      height: 40px;
+      border-radius: 6px;
+      border: 2px solid #444;
+      cursor: pointer;
+      position: relative;
+      overflow: hidden;
+    }
+    .color-preview .fg {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+    }
+    /* Checkerboard background for transparency indication */
+    .color-preview {
+      background-image:
+        linear-gradient(45deg, #555 25%, transparent 25%),
+        linear-gradient(-45deg, #555 25%, transparent 25%),
+        linear-gradient(45deg, transparent 75%, #555 75%),
+        linear-gradient(-45deg, transparent 75%, #555 75%);
+      background-size: 10px 10px;
+      background-position: 0 0, 0 5px, 5px -5px, -5px 0px;
+    }
+    .color-input { display: none; }
+
+    .palette {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 3px;
+      max-width: 320px;
+      justify-content: center;
+    }
+    .palette-color {
+      width: 24px;
+      height: 24px;
+      border-radius: 4px;
+      border: 2px solid transparent;
+      cursor: pointer;
+      transition: transform 0.1s, border-color 0.15s;
+    }
+    .palette-color:hover { transform: scale(1.2); }
+    .palette-color.active { border-color: #fff; transform: scale(1.15); }
+    .palette-color.transparent-color {
+      background-image:
+        linear-gradient(45deg, #666 25%, transparent 25%),
+        linear-gradient(-45deg, #666 25%, transparent 25%),
+        linear-gradient(45deg, transparent 75%, #666 75%),
+        linear-gradient(-45deg, transparent 75%, #666 75%);
+      background-size: 8px 8px;
+      background-position: 0 0, 0 4px, 4px -4px, -4px 0px;
+    }
+
+    /* Canvas area */
+    .canvas-area {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.75rem;
+    }
+    .canvas-container {
+      position: relative;
+      touch-action: none;
+      image-rendering: pixelated;
+    }
+    #grid-canvas {
+      image-rendering: pixelated;
+      border-radius: 4px;
+      cursor: crosshair;
+    }
+    /* Checkerboard behind canvas for transparency */
+    .canvas-container {
+      background-image:
+        linear-gradient(45deg, #252540 25%, transparent 25%),
+        linear-gradient(-45deg, #252540 25%, transparent 25%),
+        linear-gradient(45deg, transparent 75%, #252540 75%),
+        linear-gradient(-45deg, transparent 75%, #252540 75%);
+      background-size: 20px 20px;
+      background-position: 0 0, 0 10px, 10px -10px, -10px 0px;
+      background-color: #1e1e38;
+      border-radius: 4px;
+    }
+
+    /* Preview section */
+    .preview-section {
+      display: flex;
+      gap: 1rem;
+      align-items: center;
+      justify-content: center;
+      padding: 0.5rem 1rem;
+      background: #16213e;
+      border-radius: 8px;
+      border: 1px solid #2a2a4a;
+    }
+    .preview-item {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.25rem;
+    }
+    .preview-item label {
+      font-size: 0.6rem;
+      color: #777;
+      text-transform: uppercase;
+    }
+    .preview-canvas {
+      image-rendering: pixelated;
+      border-radius: 2px;
+      background: #fff;
+    }
+    .preview-canvas.dark-bg { background: #333; }
+    .preview-canvas.checker-bg {
+      background-image:
+        linear-gradient(45deg, #ccc 25%, transparent 25%),
+        linear-gradient(-45deg, #ccc 25%, transparent 25%),
+        linear-gradient(45deg, transparent 75%, #ccc 75%),
+        linear-gradient(-45deg, transparent 75%, #ccc 75%);
+      background-size: 6px 6px;
+      background-position: 0 0, 0 3px, 3px -3px, -3px 0px;
+      background-color: #fff;
+    }
+    .preview-tab-mock {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: #3a3a5a;
+      border-radius: 6px 6px 0 0;
+      padding: 6px 12px;
+      font-size: 0.7rem;
+      color: #bbb;
+    }
+    .preview-tab-mock canvas {
+      image-rendering: pixelated;
+      border-radius: 1px;
+    }
+
+    /* Actions */
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      justify-content: center;
+    }
+    .action-btn {
+      padding: 0.5rem 1rem;
+      border: 1px solid #2a2a4a;
+      border-radius: 6px;
+      background: #16213e;
+      color: #ccc;
+      cursor: pointer;
+      font-size: 0.8rem;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .action-btn:hover { background: #2a2a4a; border-color: #444; }
+    .action-btn.primary { background: #e74c3c; border-color: #e74c3c; color: #fff; }
+    .action-btn.primary:hover { background: #c0392b; }
+
+    /* Size selector */
+    .size-select {
+      background: #1a1a2e;
+      color: #ccc;
+      border: 1px solid #2a2a4a;
+      border-radius: 4px;
+      padding: 0.25rem 0.5rem;
+      font-size: 0.8rem;
+    }
+
+    /* Toast notifications */
+    .toast {
+      position: fixed;
+      bottom: 2rem;
+      left: 50%;
+      transform: translateX(-50%) translateY(100px);
+      background: #2ecc71;
+      color: #fff;
+      padding: 0.5rem 1.5rem;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      transition: transform 0.3s ease;
+      z-index: 100;
+      pointer-events: none;
+    }
+    .toast.show { transform: translateX(-50%) translateY(0); }
+
+    /* Keyboard shortcuts hint */
+    .shortcuts {
+      text-align: center;
+      font-size: 0.65rem;
+      color: #555;
+      padding: 0.25rem;
+    }
+    .shortcuts kbd {
+      background: #2a2a4a;
+      padding: 1px 4px;
+      border-radius: 3px;
+      border: 1px solid #3a3a5a;
+    }
+
+    /* Mobile adjustments */
+    @media (max-width: 480px) {
+      .app { padding: 0.5rem; gap: 0.75rem; }
+      .header h1 { font-size: 1.2rem; }
+      .toolbar { padding: 0.4rem; gap: 0.3rem; }
+      .tool-btn { width: 36px; height: 36px; }
+      .palette-color { width: 22px; height: 22px; }
+      .shortcuts { display: none; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="app">
+  <div class="header">
+    <h1>PIX<span>ICON</span></h1>
+    <p>pixel art favicon editor</p>
+  </div>
+
+  <div class="toolbar">
+    <div class="tool-group">
+      <button class="tool-btn active" data-tool="pencil" title="Pencil (P)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
+      </button>
+      <button class="tool-btn" data-tool="eraser" title="Eraser (E)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21"/><path d="M22 21H7"/><path d="m5 11 9 9"/></svg>
+      </button>
+      <button class="tool-btn" data-tool="fill" title="Fill (F)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m19 11-8-8-8.6 8.6a2 2 0 0 0 0 2.8l5.2 5.2c.8.8 2 .8 2.8 0L19 11Z"/><path d="m5 2 5 5"/><path d="M2 13h15"/><path d="M22 20a2 2 0 1 1-4 0c0-1.6 1.7-2.4 2-4 .3 1.6 2 2.4 2 4Z"/></svg>
+      </button>
+      <button class="tool-btn" data-tool="picker" title="Pick Color (I)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m2 22 1-1h3l9-9"/><path d="M3 21v-3l9-9"/><path d="m15 6 3.4-3.4a2.1 2.1 0 1 1 3 3L18 9"/></svg>
+      </button>
+    </div>
+
+    <div class="separator"></div>
+
+    <div class="tool-group">
+      <button class="tool-btn" data-action="undo" title="Undo (Ctrl+Z)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/></svg>
+      </button>
+      <button class="tool-btn" data-action="redo" title="Redo (Ctrl+Y)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 7v6h-6"/><path d="M3 17a9 9 0 0 1 9-9 9 9 0 0 1 6 2.3L21 13"/></svg>
+      </button>
+    </div>
+
+    <div class="separator"></div>
+
+    <div class="tool-group">
+      <button class="tool-btn" data-action="grid" title="Grid (G)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/><path d="M9 3v18"/><path d="M15 3v18"/></svg>
+      </button>
+      <button class="tool-btn" data-action="clear" title="Clear (Del)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
+      </button>
+    </div>
+
+    <div class="separator"></div>
+
+    <select class="size-select" id="size-select" title="Canvas Size">
+      <option value="16">16 × 16</option>
+      <option value="32">32 × 32</option>
+      <option value="64">64 × 64</option>
+    </select>
+  </div>
+
+  <div class="color-section">
+    <div class="color-current">
+      <div class="color-preview" id="color-preview" title="Click to pick custom color">
+        <div class="fg" id="color-fg"></div>
+      </div>
+      <input type="color" class="color-input" id="color-input" value="#e74c3c">
+    </div>
+    <div class="palette" id="palette"></div>
+  </div>
+
+  <div class="canvas-area">
+    <div class="canvas-container" id="canvas-container">
+      <canvas id="grid-canvas"></canvas>
+    </div>
+  </div>
+
+  <div class="preview-section">
+    <div class="preview-item">
+      <label>On White</label>
+      <canvas class="preview-canvas" id="preview-light" width="16" height="16" style="width:32px;height:32px;"></canvas>
+    </div>
+    <div class="preview-item">
+      <label>On Dark</label>
+      <canvas class="preview-canvas dark-bg" id="preview-dark" width="16" height="16" style="width:32px;height:32px;"></canvas>
+    </div>
+    <div class="preview-item">
+      <label>Actual</label>
+      <canvas class="preview-canvas checker-bg" id="preview-actual" width="16" height="16" style="width:16px;height:16px;"></canvas>
+    </div>
+    <div class="preview-item">
+      <label>Browser Tab</label>
+      <div class="preview-tab-mock">
+        <canvas id="preview-tab" width="16" height="16" style="width:16px;height:16px;image-rendering:pixelated;"></canvas>
+        <span>My Page</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="actions">
+    <button class="action-btn primary" data-action="download-png">Download PNG</button>
+    <button class="action-btn" data-action="download-ico">Download ICO</button>
+    <button class="action-btn" data-action="copy-dataurl">Copy Data URL</button>
+    <button class="action-btn" data-action="copy-link">Copy Link</button>
+    <button class="action-btn" data-action="import">Import Image</button>
+  </div>
+
+  <div class="shortcuts">
+    <kbd>P</kbd> Pencil &nbsp;
+    <kbd>E</kbd> Eraser &nbsp;
+    <kbd>F</kbd> Fill &nbsp;
+    <kbd>I</kbd> Pick &nbsp;
+    <kbd>G</kbd> Grid &nbsp;
+    <kbd>Ctrl+Z</kbd> Undo &nbsp;
+    <kbd>Ctrl+Y</kbd> Redo
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<input type="file" id="import-input" accept="image/*" style="display:none;">
+
+<script>
+/* AIDEV-NOTE: Configuration — edit these to customize defaults */
+const CONFIG = {
+  defaultSize: 16,
+  maxUndoSteps: 50,
+  gridColor: 'rgba(255,255,255,0.12)',
+  /* AIDEV-NOTE: Palette inspired by popular pixel art palettes (Pico-8 + extras) */
+  palette: [
+    null,       /* transparent */
+    '#000000', '#1d2b53', '#7e2553', '#008751',
+    '#ab5236', '#5f574f', '#c2c3c7', '#fff1e8',
+    '#ff004d', '#ffa300', '#ffec27', '#00e436',
+    '#29adff', '#83769c', '#ff77a8', '#ffccaa',
+    '#e74c3c', '#3498db', '#2ecc71', '#f39c12',
+    '#9b59b6', '#1abc9c', '#e67e22', '#ecf0f1',
+  ],
+  /* Maximum canvas display size in pixels */
+  maxCanvasDisplay: 480,
+};
+
+const $ = (sel, ctx = document) => ctx.querySelector(sel);
+const $$ = (sel, ctx = document) => [...ctx.querySelectorAll(sel)];
+
+/* ── State ── */
+let gridSize = CONFIG.defaultSize;
+let pixels = [];        /* 2D array: pixels[y][x] = '#rrggbb' or null (transparent) */
+let currentColor = CONFIG.palette[9]; /* start with red */
+let currentTool = 'pencil';
+let showGrid = true;
+let undoStack = [];
+let redoStack = [];
+let isDrawing = false;
+let lastCell = null;    /* for line-drawing continuity */
+
+/* ── DOM refs ── */
+const canvas = $('#grid-canvas');
+const ctx = canvas.getContext('2d');
+const colorPreview = $('#color-preview');
+const colorFg = $('#color-fg');
+const colorInput = $('#color-input');
+const paletteEl = $('#palette');
+const sizeSelect = $('#size-select');
+const toastEl = $('#toast');
+const importInput = $('#import-input');
+const canvasContainer = $('#canvas-container');
+
+/* ── Initialization ── */
+function init() {
+  buildPalette();
+  initCanvas();
+  updateColorPreview();
+  bindEvents();
+  render();
+}
+
+function initCanvas() {
+  pixels = Array.from({ length: gridSize }, () =>
+    Array.from({ length: gridSize }, () => null)
+  );
+  undoStack = [];
+  redoStack = [];
+  sizeCanvas();
+}
+
+function sizeCanvas() {
+  const maxDisplay = Math.min(CONFIG.maxCanvasDisplay, window.innerWidth - 32);
+  const cellSize = Math.floor(maxDisplay / gridSize);
+  const displaySize = cellSize * gridSize;
+  canvas.width = displaySize;
+  canvas.height = displaySize;
+  canvas.style.width = displaySize + 'px';
+  canvas.style.height = displaySize + 'px';
+
+  /* Update preview canvases */
+  $$('.preview-canvas, #preview-tab').forEach(c => {
+    c.width = gridSize;
+    c.height = gridSize;
+  });
+
+  render();
+}
+
+/* ── Palette ── */
+function buildPalette() {
+  paletteEl.innerHTML = '';
+  CONFIG.palette.forEach((color, i) => {
+    const swatch = document.createElement('div');
+    swatch.className = 'palette-color' + (color === null ? ' transparent-color' : '');
+    if (color !== null) swatch.style.background = color;
+    if (color === currentColor || (color === null && currentColor === null)) {
+      swatch.classList.add('active');
+    }
+    swatch.dataset.color = color === null ? 'null' : color;
+    swatch.addEventListener('click', () => {
+      currentColor = color;
+      updateColorPreview();
+      updatePaletteActive();
+      /* Switch to pencil when picking a color (except transparent → eraser) */
+      if (color === null && currentTool !== 'eraser') setTool('eraser');
+      else if (color !== null && currentTool === 'eraser') setTool('pencil');
+    });
+    paletteEl.appendChild(swatch);
+  });
+}
+
+function updatePaletteActive() {
+  $$('.palette-color', paletteEl).forEach(s => {
+    const c = s.dataset.color === 'null' ? null : s.dataset.color;
+    s.classList.toggle('active', c === currentColor);
+  });
+}
+
+function updateColorPreview() {
+  if (currentColor === null) {
+    colorFg.style.background = 'transparent';
+  } else {
+    colorFg.style.background = currentColor;
+  }
+  if (currentColor) colorInput.value = currentColor;
+}
+
+/* ── Tools ── */
+function setTool(tool) {
+  currentTool = tool;
+  $$('.tool-btn[data-tool]').forEach(b => {
+    b.classList.toggle('active', b.dataset.tool === tool);
+  });
+}
+
+/* ── Undo / Redo ── */
+function pushUndo() {
+  undoStack.push(pixels.map(row => [...row]));
+  if (undoStack.length > CONFIG.maxUndoSteps) undoStack.shift();
+  redoStack = [];
+}
+
+function undo() {
+  if (!undoStack.length) return;
+  redoStack.push(pixels.map(row => [...row]));
+  pixels = undoStack.pop();
+  render();
+}
+
+function redo() {
+  if (!redoStack.length) return;
+  undoStack.push(pixels.map(row => [...row]));
+  pixels = redoStack.pop();
+  render();
+}
+
+/* ── Drawing ── */
+function getCellFromEvent(e) {
+  const rect = canvas.getBoundingClientRect();
+  let clientX, clientY;
+  if (e.touches) {
+    clientX = e.touches[0].clientX;
+    clientY = e.touches[0].clientY;
+  } else {
+    clientX = e.clientX;
+    clientY = e.clientY;
+  }
+  const cellSize = canvas.width / gridSize;
+  const x = Math.floor((clientX - rect.left) / (rect.width / gridSize));
+  const y = Math.floor((clientY - rect.top) / (rect.height / gridSize));
+  if (x < 0 || x >= gridSize || y < 0 || y >= gridSize) return null;
+  return { x, y };
+}
+
+function setPixel(x, y, color) {
+  if (x < 0 || x >= gridSize || y < 0 || y >= gridSize) return;
+  pixels[y][x] = color;
+}
+
+function drawAt(cell) {
+  if (!cell) return;
+  const { x, y } = cell;
+  switch (currentTool) {
+    case 'pencil':
+      setPixel(x, y, currentColor);
+      break;
+    case 'eraser':
+      setPixel(x, y, null);
+      break;
+    case 'fill':
+      floodFill(x, y, currentColor);
+      break;
+    case 'picker':
+      const picked = pixels[y][x];
+      currentColor = picked;
+      updateColorPreview();
+      updatePaletteActive();
+      setTool('pencil');
+      break;
+  }
+  render();
+}
+
+/* AIDEV-NOTE: Flood fill uses iterative BFS to avoid stack overflow on large grids */
+function floodFill(startX, startY, fillColor) {
+  const targetColor = pixels[startY][startX];
+  if (targetColor === fillColor) return;
+  const queue = [[startX, startY]];
+  const visited = new Set();
+  while (queue.length) {
+    const [x, y] = queue.shift();
+    const key = `${x},${y}`;
+    if (visited.has(key)) continue;
+    if (x < 0 || x >= gridSize || y < 0 || y >= gridSize) continue;
+    if (pixels[y][x] !== targetColor) continue;
+    visited.add(key);
+    pixels[y][x] = fillColor;
+    queue.push([x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]);
+  }
+}
+
+/* Draw pixels between two cells for smooth lines */
+function drawLine(from, to) {
+  const dx = Math.abs(to.x - from.x);
+  const dy = Math.abs(to.y - from.y);
+  const sx = from.x < to.x ? 1 : -1;
+  const sy = from.y < to.y ? 1 : -1;
+  let err = dx - dy;
+  let x = from.x, y = from.y;
+  while (true) {
+    if (currentTool === 'pencil') setPixel(x, y, currentColor);
+    else if (currentTool === 'eraser') setPixel(x, y, null);
+    if (x === to.x && y === to.y) break;
+    const e2 = 2 * err;
+    if (e2 > -dy) { err -= dy; x += sx; }
+    if (e2 < dx) { err += dx; y += sy; }
+  }
+}
+
+/* ── Rendering ── */
+function render() {
+  const w = canvas.width;
+  const h = canvas.height;
+  const cellSize = w / gridSize;
+
+  ctx.clearRect(0, 0, w, h);
+
+  /* Draw pixels */
+  for (let y = 0; y < gridSize; y++) {
+    for (let x = 0; x < gridSize; x++) {
+      if (pixels[y][x] !== null) {
+        ctx.fillStyle = pixels[y][x];
+        ctx.fillRect(x * cellSize, y * cellSize, cellSize, cellSize);
+      }
+    }
+  }
+
+  /* Grid overlay */
+  if (showGrid) {
+    ctx.strokeStyle = CONFIG.gridColor;
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= gridSize; i++) {
+      const pos = Math.round(i * cellSize) + 0.5;
+      ctx.beginPath();
+      ctx.moveTo(pos, 0);
+      ctx.lineTo(pos, h);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(0, pos);
+      ctx.lineTo(w, pos);
+      ctx.stroke();
+    }
+  }
+
+  updatePreviews();
+  saveToHash();
+}
+
+function updatePreviews() {
+  ['preview-light', 'preview-dark', 'preview-actual', 'preview-tab'].forEach(id => {
+    const c = $('#' + id);
+    const pCtx = c.getContext('2d');
+    pCtx.clearRect(0, 0, c.width, c.height);
+    for (let y = 0; y < gridSize; y++) {
+      for (let x = 0; x < gridSize; x++) {
+        if (pixels[y][x] !== null) {
+          pCtx.fillStyle = pixels[y][x];
+          pCtx.fillRect(x, y, 1, 1);
+        }
+      }
+    }
+  });
+
+  /* Also set as the page favicon for fun */
+  const c = document.createElement('canvas');
+  c.width = gridSize;
+  c.height = gridSize;
+  const fCtx = c.getContext('2d');
+  for (let y = 0; y < gridSize; y++) {
+    for (let x = 0; x < gridSize; x++) {
+      if (pixels[y][x] !== null) {
+        fCtx.fillStyle = pixels[y][x];
+        fCtx.fillRect(x, y, 1, 1);
+      }
+    }
+  }
+  let link = $('link[rel="icon"]');
+  if (!link) {
+    link = document.createElement('link');
+    link.rel = 'icon';
+    document.head.appendChild(link);
+  }
+  link.href = c.toDataURL('image/png');
+}
+
+/* ── Export ── */
+function getExportCanvas() {
+  const c = document.createElement('canvas');
+  c.width = gridSize;
+  c.height = gridSize;
+  const eCtx = c.getContext('2d');
+  for (let y = 0; y < gridSize; y++) {
+    for (let x = 0; x < gridSize; x++) {
+      if (pixels[y][x] !== null) {
+        eCtx.fillStyle = pixels[y][x];
+        eCtx.fillRect(x, y, 1, 1);
+      }
+    }
+  }
+  return c;
+}
+
+function downloadPNG() {
+  const c = getExportCanvas();
+  const a = document.createElement('a');
+  a.download = `favicon-${gridSize}x${gridSize}.png`;
+  a.href = c.toDataURL('image/png');
+  a.click();
+  showToast('PNG downloaded!');
+}
+
+/* AIDEV-NOTE: ICO format — minimal implementation supporting single-image uncompressed ICO */
+function downloadICO() {
+  const c = getExportCanvas();
+  const icoCtx = c.getContext('2d');
+  const imageData = icoCtx.getImageData(0, 0, gridSize, gridSize);
+  const rgba = imageData.data;
+
+  /* ICO uses bottom-up row order with BGRA byte order */
+  const bmpSize = gridSize * gridSize * 4;
+  const maskSize = Math.ceil(gridSize / 32) * 4 * gridSize;
+  const dataSize = 40 + bmpSize + maskSize; /* BITMAPINFOHEADER + pixels + mask */
+
+  const buf = new ArrayBuffer(6 + 16 + dataSize);
+  const view = new DataView(buf);
+
+  /* ICONDIR header */
+  view.setUint16(0, 0, true);       /* reserved */
+  view.setUint16(2, 1, true);       /* type: 1 = ICO */
+  view.setUint16(4, 1, true);       /* count: 1 image */
+
+  /* ICONDIRENTRY */
+  const s = gridSize >= 256 ? 0 : gridSize;
+  view.setUint8(6, s);              /* width */
+  view.setUint8(7, s);              /* height */
+  view.setUint8(8, 0);              /* color palette */
+  view.setUint8(9, 0);              /* reserved */
+  view.setUint16(10, 1, true);      /* color planes */
+  view.setUint16(12, 32, true);     /* bits per pixel */
+  view.setUint32(14, dataSize, true); /* data size */
+  view.setUint32(18, 22, true);     /* data offset */
+
+  /* BITMAPINFOHEADER */
+  const bmpOffset = 22;
+  view.setUint32(bmpOffset, 40, true);           /* header size */
+  view.setInt32(bmpOffset + 4, gridSize, true);   /* width */
+  view.setInt32(bmpOffset + 8, gridSize * 2, true); /* height (doubled for ICO) */
+  view.setUint16(bmpOffset + 12, 1, true);        /* planes */
+  view.setUint16(bmpOffset + 14, 32, true);       /* bpp */
+  view.setUint32(bmpOffset + 16, 0, true);        /* compression */
+  view.setUint32(bmpOffset + 20, bmpSize + maskSize, true); /* image size */
+
+  /* Pixel data — BGRA, bottom-up */
+  const pixelOffset = bmpOffset + 40;
+  for (let y = gridSize - 1; y >= 0; y--) {
+    for (let x = 0; x < gridSize; x++) {
+      const srcIdx = (y * gridSize + x) * 4;
+      const dstIdx = pixelOffset + ((gridSize - 1 - y) * gridSize + x) * 4;
+      view.setUint8(dstIdx, rgba[srcIdx + 2]);     /* B */
+      view.setUint8(dstIdx + 1, rgba[srcIdx + 1]); /* G */
+      view.setUint8(dstIdx + 2, rgba[srcIdx]);     /* R */
+      view.setUint8(dstIdx + 3, rgba[srcIdx + 3]); /* A */
+    }
+  }
+
+  /* AND mask — all zeros (no masking, alpha channel handles transparency) */
+  /* Already zeroed by ArrayBuffer */
+
+  const blob = new Blob([buf], { type: 'image/x-icon' });
+  const a = document.createElement('a');
+  a.download = 'favicon.ico';
+  a.href = URL.createObjectURL(blob);
+  a.click();
+  URL.revokeObjectURL(a.href);
+  showToast('ICO downloaded!');
+}
+
+function copyDataURL() {
+  const c = getExportCanvas();
+  const url = c.toDataURL('image/png');
+  navigator.clipboard.writeText(url).then(() => {
+    showToast('Data URL copied!');
+  }).catch(() => {
+    /* Fallback: select text in a temporary input */
+    const input = document.createElement('input');
+    input.value = url;
+    document.body.appendChild(input);
+    input.select();
+    document.execCommand('copy');
+    input.remove();
+    showToast('Data URL copied!');
+  });
+}
+
+function copyLink() {
+  /* Force an immediate save so the hash is up to date */
+  clearTimeout(hashSaveTimer);
+  saveToHashNow();
+  navigator.clipboard.writeText(location.href).then(() => {
+    showToast('Link copied — bookmark it!');
+  }).catch(() => {
+    showToast('URL updated — copy from address bar');
+  });
+}
+
+function importImage() {
+  importInput.click();
+}
+
+function handleImport(file) {
+  const img = new Image();
+  img.onload = () => {
+    pushUndo();
+    const c = document.createElement('canvas');
+    c.width = gridSize;
+    c.height = gridSize;
+    const iCtx = c.getContext('2d');
+    iCtx.imageSmoothingEnabled = false;
+    iCtx.drawImage(img, 0, 0, gridSize, gridSize);
+    const data = iCtx.getImageData(0, 0, gridSize, gridSize).data;
+    for (let y = 0; y < gridSize; y++) {
+      for (let x = 0; x < gridSize; x++) {
+        const i = (y * gridSize + x) * 4;
+        if (data[i + 3] < 128) {
+          pixels[y][x] = null;
+        } else {
+          const r = data[i].toString(16).padStart(2, '0');
+          const g = data[i + 1].toString(16).padStart(2, '0');
+          const b = data[i + 2].toString(16).padStart(2, '0');
+          pixels[y][x] = `#${r}${g}${b}`;
+        }
+      }
+    }
+    render();
+    showToast('Image imported!');
+  };
+  img.src = URL.createObjectURL(file);
+}
+
+/* ── Toast ── */
+let toastTimer;
+function showToast(msg) {
+  toastEl.textContent = msg;
+  toastEl.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove('show'), 1500);
+}
+
+/* ── Events ── */
+function bindEvents() {
+  /* Tool buttons */
+  $$('.tool-btn[data-tool]').forEach(btn => {
+    btn.addEventListener('click', () => setTool(btn.dataset.tool));
+  });
+
+  /* Action buttons */
+  $$('.tool-btn[data-action], .action-btn[data-action]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      switch (btn.dataset.action) {
+        case 'undo': undo(); break;
+        case 'redo': redo(); break;
+        case 'grid':
+          showGrid = !showGrid;
+          btn.classList.toggle('active', showGrid);
+          render();
+          break;
+        case 'clear':
+          pushUndo();
+          pixels = Array.from({ length: gridSize }, () =>
+            Array.from({ length: gridSize }, () => null)
+          );
+          render();
+          showToast('Canvas cleared');
+          break;
+        case 'download-png': downloadPNG(); break;
+        case 'download-ico': downloadICO(); break;
+        case 'copy-dataurl': copyDataURL(); break;
+        case 'copy-link': copyLink(); break;
+        case 'import': importImage(); break;
+      }
+    });
+  });
+
+  /* Canvas drawing — mouse */
+  canvas.addEventListener('mousedown', e => {
+    e.preventDefault();
+    isDrawing = true;
+    const cell = getCellFromEvent(e);
+    if (cell) {
+      pushUndo();
+      drawAt(cell);
+      lastCell = cell;
+    }
+  });
+  canvas.addEventListener('mousemove', e => {
+    if (!isDrawing) return;
+    const cell = getCellFromEvent(e);
+    if (cell) {
+      if (lastCell && (currentTool === 'pencil' || currentTool === 'eraser')) {
+        drawLine(lastCell, cell);
+        render();
+      } else {
+        drawAt(cell);
+      }
+      lastCell = cell;
+    }
+  });
+  window.addEventListener('mouseup', () => {
+    isDrawing = false;
+    lastCell = null;
+  });
+
+  /* Canvas drawing — touch */
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    isDrawing = true;
+    const cell = getCellFromEvent(e);
+    if (cell) {
+      pushUndo();
+      drawAt(cell);
+      lastCell = cell;
+    }
+  }, { passive: false });
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    if (!isDrawing) return;
+    const cell = getCellFromEvent(e);
+    if (cell) {
+      if (lastCell && (currentTool === 'pencil' || currentTool === 'eraser')) {
+        drawLine(lastCell, cell);
+        render();
+      } else {
+        drawAt(cell);
+      }
+      lastCell = cell;
+    }
+  }, { passive: false });
+  canvas.addEventListener('touchend', () => {
+    isDrawing = false;
+    lastCell = null;
+  });
+
+  /* Color picker */
+  colorPreview.addEventListener('click', () => colorInput.click());
+  colorInput.addEventListener('input', () => {
+    currentColor = colorInput.value;
+    updateColorPreview();
+    updatePaletteActive();
+    if (currentTool === 'eraser') setTool('pencil');
+  });
+
+  /* Size selector */
+  sizeSelect.addEventListener('change', () => {
+    const newSize = parseInt(sizeSelect.value);
+    if (newSize !== gridSize) {
+      gridSize = newSize;
+      initCanvas();
+      sizeCanvas();
+      showToast(`Canvas: ${gridSize}×${gridSize}`);
+    }
+  });
+
+  /* Import */
+  importInput.addEventListener('change', () => {
+    if (importInput.files.length) {
+      handleImport(importInput.files[0]);
+      importInput.value = '';
+    }
+  });
+
+  /* Drag and drop */
+  document.addEventListener('dragover', e => e.preventDefault());
+  document.addEventListener('drop', e => {
+    e.preventDefault();
+    if (e.dataTransfer.files.length) {
+      handleImport(e.dataTransfer.files[0]);
+    }
+  });
+
+  /* Keyboard shortcuts */
+  document.addEventListener('keydown', e => {
+    /* Don't capture if an input is focused */
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+
+    const ctrl = e.ctrlKey || e.metaKey;
+    switch (e.key.toLowerCase()) {
+      case 'p': if (!ctrl) setTool('pencil'); break;
+      case 'e': if (!ctrl) setTool('eraser'); break;
+      case 'f': if (!ctrl) setTool('fill'); break;
+      case 'i': if (!ctrl) setTool('picker'); break;
+      case 'g':
+        if (!ctrl) {
+          showGrid = !showGrid;
+          $('[data-action="grid"]').classList.toggle('active', showGrid);
+          render();
+        }
+        break;
+      case 'z': if (ctrl) { e.preventDefault(); undo(); } break;
+      case 'y': if (ctrl) { e.preventDefault(); redo(); } break;
+      case 'delete':
+      case 'backspace':
+        if (!ctrl) {
+          pushUndo();
+          pixels = Array.from({ length: gridSize }, () =>
+            Array.from({ length: gridSize }, () => null)
+          );
+          render();
+          showToast('Canvas cleared');
+        }
+        break;
+    }
+  });
+
+  /* Resize handling */
+  window.addEventListener('resize', () => sizeCanvas());
+
+  /* Hash navigation (back/forward, pasting a URL) */
+  window.addEventListener('hashchange', () => {
+    if (loadFromHash()) {
+      sizeCanvas(); /* re-sizes canvas and calls render() */
+    }
+  });
+}
+
+/* ── Hash state ── */
+/*
+ * AIDEV-NOTE: Hash encoding for bookmarkable pixel art
+ *
+ * Format: #s=SIZE&p=PALETTE&d=PIXEL_DATA
+ *   - s: grid size (16, 32, 64)
+ *   - p: dash-separated hex colors without '#' (e.g. "ff0000-00ff00-0000ff")
+ *   - d: URL-safe base64 of Uint8Array where each byte is a palette index
+ *        (0 = transparent, 1+ = index into palette)
+ *
+ * URL-safe base64 uses '-' for '+' and '_' for '/', no '=' padding.
+ * This keeps URLs clean and avoids encoding issues in the hash.
+ *
+ * Size for a 16x16 with 10 colors: ~400 chars total — very bookmarkable.
+ * Size for a 32x32: ~1400 chars. 64x64: ~5500 chars (browsers handle up to ~2MB).
+ */
+
+function toBase64Url(uint8) {
+  let bin = '';
+  for (let i = 0; i < uint8.length; i++) bin += String.fromCharCode(uint8[i]);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function fromBase64Url(str) {
+  const padded = str.replace(/-/g, '+').replace(/_/g, '/');
+  const bin = atob(padded);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return arr;
+}
+
+let hashSaveTimer = null;
+
+function saveToHash() {
+  /* Debounce: wait until drawing settles to avoid thrashing the URL */
+  clearTimeout(hashSaveTimer);
+  hashSaveTimer = setTimeout(saveToHashNow, 300);
+}
+
+function saveToHashNow() {
+  /* Build palette from used colors */
+  const colorSet = new Set();
+  for (let y = 0; y < gridSize; y++) {
+    for (let x = 0; x < gridSize; x++) {
+      if (pixels[y][x] !== null) colorSet.add(pixels[y][x]);
+    }
+  }
+
+  /* Empty canvas → clear hash */
+  if (colorSet.size === 0) {
+    history.replaceState(null, '', location.pathname);
+    return;
+  }
+
+  const palette = [...colorSet];
+  const colorIndex = {};
+  palette.forEach((c, i) => { colorIndex[c] = i + 1; }); /* 0 reserved for transparent */
+
+  /* Encode pixel data as byte array */
+  const data = new Uint8Array(gridSize * gridSize);
+  for (let y = 0; y < gridSize; y++) {
+    for (let x = 0; x < gridSize; x++) {
+      const c = pixels[y][x];
+      data[y * gridSize + x] = c === null ? 0 : colorIndex[c];
+    }
+  }
+
+  const params = new URLSearchParams();
+  params.set('s', String(gridSize));
+  params.set('p', palette.map(c => c.slice(1)).join('-'));
+  params.set('d', toBase64Url(data));
+  history.replaceState(null, '', '#' + params.toString());
+}
+
+function loadFromHash() {
+  const raw = location.hash.slice(1);
+  if (!raw) return false;
+
+  const state = Object.fromEntries(new URLSearchParams(raw));
+
+  if (state.s && ['16', '32', '64'].includes(state.s)) {
+    gridSize = parseInt(state.s);
+    sizeSelect.value = state.s;
+  }
+
+  if (state.p && state.d) {
+    try {
+      const palette = state.p.split('-').map(h => '#' + h);
+      const data = fromBase64Url(state.d);
+      const expected = gridSize * gridSize;
+
+      if (data.length >= expected) {
+        /* Re-init the pixel grid at the right size before filling */
+        pixels = Array.from({ length: gridSize }, () =>
+          Array.from({ length: gridSize }, () => null)
+        );
+        for (let y = 0; y < gridSize; y++) {
+          for (let x = 0; x < gridSize; x++) {
+            const idx = data[y * gridSize + x];
+            pixels[y][x] = idx === 0 ? null : (palette[idx - 1] || null);
+          }
+        }
+        return true;
+      }
+    } catch (e) { /* ignore bad hash data */ }
+  }
+  return false;
+}
+
+/* Start */
+init();
+const loaded = loadFromHash();
+if (loaded) sizeCanvas();
+render();
+</script>
+</body>
+</html>

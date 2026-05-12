@@ -163,6 +163,10 @@ When adding new tools:
 - **`claude-usage`** - Menu bar Anthropic API rate limit monitor with progress bars, color-coded warnings, and optional usage/cost tracking via Admin API
 - **`apple-ai-api`** - OpenAI-compatible HTTP API server for Apple's on-device Foundation Models, with streaming, chat web UI, and API key auth
 
+### 🌐 Web Tools (`web/`)
+
+- **`favicon-editor`** - Pixel art favicon editor with pencil/eraser/fill tools, ICO & PNG export, live browser-tab preview, drag-and-drop import, and full keyboard shortcuts
+
 ### Userscripts
 
 - **`hello.js`** - Animated browser greeting with floating dialog, customizable options, and auto-dismiss
