@@ -27,7 +27,8 @@ Assume these are installed by default:
 
 1. **cli/**: Command-line tools (shell script or perl preferred)
 2. **macos/**: macOS desktop apps (AppleScript or Swift with shebang)
-3. **userscripts/**: Browser console JavaScript snippets
+3. **web/**: Single-file web applications (HTML with embedded CSS/JS)
+4. **userscripts/**: Browser console JavaScript snippets
 
 ## Development Guidelines
 
@@ -53,6 +54,11 @@ Use the current year. Use the appropriate comment syntax for the language (`#` f
 - Must be executable from terminal
 - Ensure Ctrl+C terminates cleanly
 - No compile step or IDE required
+
+### Web Tools
+- Single HTML file with embedded CSS and JavaScript
+- No external dependencies (no CDN links, no build step)
+- Open directly in any modern browser
 
 ### Userscripts
 - Pure JavaScript for browser dev console

@@ -111,7 +111,15 @@ Desktop applications for macOS written in AppleScript or Swift.
 - Handle Ctrl+C gracefully
 - No compilation or IDE required
 
-### 🌐 Userscripts (`userscripts/`)
+### 🌐 Web Tools (`web/`)
+Single-file web applications that run in a browser.
+
+**Requirements:**
+- Single HTML file with embedded CSS and JavaScript
+- No external dependencies (no CDN links, no build step)
+- Open directly in any modern browser
+
+### 📜 Userscripts (`userscripts/`)
 JavaScript snippets for enhancing web pages via browser developer console.
 
 **Requirements:**
@@ -183,6 +191,10 @@ When adding new tools:
 - **`apple-ai-api`** - OpenAI-compatible HTTP API server for Apple's on-device Foundation Models, with streaming, chat web UI, and API key auth
 - **`llm-chat`** - Terminal LLM chat client for any OpenAI-compatible API, with streaming, image support (Kitty/iTerm/Ghostty), readline editing, $EDITOR integration, slash commands, and contextual tips
 - **`apple-ai-api-test`** - Integration test suite for apple-ai-api (endpoints, auth, CORS, error handling)
+
+### Web Tools
+
+- **`llm-chat`** - Single-file chat frontend for any OpenAI-compatible API with streaming, markdown rendering, multi-modal image support, 4 themes (Classic/Bubbles/Terminal/Minimal), conversation management, and export
 
 ### macOS Tools
 

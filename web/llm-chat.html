@@ -1,0 +1,1494 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>LLM Chat</title>
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="LLM Chat">
+  <script src="https://cdn.jsdelivr.net/npm/marked@15.0.7/marked.min.js"
+          integrity="sha384-H+hy9ULve6xfxRkWIh/YOtvDdpXgV2fmAGQkIDTxIgZwNoaoBal14Di2YTMR6MzR"
+          crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js"
+          integrity="sha384-eEu5CTj3qGvu9PdJuS+YlkNi7d2XxQROAFYOr59zgObtlcux1ae1Il3u7jvdCSWu"
+          crossorigin="anonymous"></script>
+  <style>
+    /* ===== RESET ===== */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { min-height: 100dvh; -webkit-font-smoothing: antialiased; }
+    img, svg { display: block; max-width: 100%; }
+    input, button, textarea, select { font: inherit; }
+
+    .template { display: none !important; }
+
+    /* ===== CSS VARIABLES — THEME ENGINE ===== */
+    :root {
+      /* AIDEV-NOTE: Theme colors are defined per-theme below. These are fallback defaults. */
+      --bg: #ffffff;
+      --bg-secondary: #f5f5f5;
+      --bg-tertiary: #e8e8e8;
+      --text-primary: #111111;
+      --text-secondary: #555555;
+      --text-tertiary: #999999;
+      --accent: #2563eb;
+      --accent-hover: #1d4ed8;
+      --accent-text: #ffffff;
+      --user-bg: #2563eb;
+      --user-text: #ffffff;
+      --assistant-bg: #f0f0f0;
+      --assistant-text: #111111;
+      --border: #e0e0e0;
+      --code-bg: #f5f5f5;
+      --code-text: #111111;
+      --input-bg: #ffffff;
+      --input-border: #d0d0d0;
+      --shadow: rgba(0,0,0,0.08);
+      --font-body: system-ui, sans-serif;
+      --font-heading: system-ui, sans-serif;
+      --font-code: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono', monospace;
+      --radius: 12px;
+      --radius-sm: 6px;
+      --msg-max-width: 80%;
+      --msg-radius: 18px;
+    }
+
+    /* ===== THEME: CLASSIC (default) ===== */
+    /* AIDEV-NOTE: Classic theme — clean ChatGPT/Claude-like centered layout */
+    [data-theme="classic"] {
+      --bg: #ffffff; --bg-secondary: #f7f7f8; --bg-tertiary: #ececee;
+      --text-primary: #111; --text-secondary: #555; --text-tertiary: #999;
+      --accent: #2563eb; --accent-hover: #1d4ed8; --accent-text: #fff;
+      --user-bg: transparent; --user-text: #111;
+      --assistant-bg: transparent; --assistant-text: #111;
+      --border: #e5e5e5; --code-bg: #f5f5f5; --code-text: #111;
+      --input-bg: #fff; --input-border: #d0d0d0;
+      --shadow: rgba(0,0,0,0.06);
+      --font-body: Inter, Roboto, 'Helvetica Neue', 'Arial Nova', 'Nimbus Sans', Arial, sans-serif;
+      --font-heading: Inter, Roboto, 'Helvetica Neue', 'Arial Nova', 'Nimbus Sans', Arial, sans-serif;
+      --radius: 12px; --radius-sm: 6px; --msg-max-width: 720px; --msg-radius: 8px;
+    }
+    [data-theme="classic"][data-mode="dark"] {
+      --bg: #1a1a1a; --bg-secondary: #222; --bg-tertiary: #333;
+      --text-primary: #e8e8e8; --text-secondary: #aaa; --text-tertiary: #777;
+      --accent: #5b9bf5; --accent-hover: #4a8ae6; --accent-text: #fff;
+      --user-bg: transparent; --user-text: #e8e8e8;
+      --assistant-bg: transparent; --assistant-text: #e8e8e8;
+      --border: #333; --code-bg: #2a2a2a; --code-text: #e8e8e8;
+      --input-bg: #222; --input-border: #444;
+      --shadow: rgba(0,0,0,0.3);
+    }
+
+    /* ===== THEME: BUBBLES ===== */
+    /* AIDEV-NOTE: Bubbles — iOS Messages style speech bubbles */
+    [data-theme="bubbles"] {
+      --bg: #ffffff; --bg-secondary: #f5f5f5; --bg-tertiary: #e8e8e8;
+      --text-primary: #111; --text-secondary: #555; --text-tertiary: #999;
+      --accent: #007aff; --accent-hover: #0063d1; --accent-text: #fff;
+      --user-bg: #007aff; --user-text: #fff;
+      --assistant-bg: #e9e9eb; --assistant-text: #111;
+      --border: #e0e0e0; --code-bg: rgba(0,0,0,0.06); --code-text: #111;
+      --input-bg: #fff; --input-border: #ccc;
+      --shadow: rgba(0,0,0,0.08);
+      --font-body: -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
+      --font-heading: -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
+      --radius: 20px; --radius-sm: 10px; --msg-max-width: 75%; --msg-radius: 18px;
+    }
+    [data-theme="bubbles"][data-mode="dark"] {
+      --bg: #000; --bg-secondary: #1c1c1e; --bg-tertiary: #2c2c2e;
+      --text-primary: #f0f0f0; --text-secondary: #aaa; --text-tertiary: #666;
+      --accent: #0a84ff; --accent-hover: #0070e0; --accent-text: #fff;
+      --user-bg: #0a84ff; --user-text: #fff;
+      --assistant-bg: #2c2c2e; --assistant-text: #f0f0f0;
+      --border: #333; --code-bg: rgba(255,255,255,0.08); --code-text: #f0f0f0;
+      --input-bg: #1c1c1e; --input-border: #444;
+      --shadow: rgba(0,0,0,0.4);
+    }
+
+    /* ===== THEME: TERMINAL ===== */
+    /* AIDEV-NOTE: Terminal — retro green-on-black CRT look */
+    [data-theme="terminal"] {
+      --bg: #0a0a0a; --bg-secondary: #111; --bg-tertiary: #1a1a1a;
+      --text-primary: #33ff33; --text-secondary: #22aa22; --text-tertiary: #117711;
+      --accent: #33ff33; --accent-hover: #44ff44; --accent-text: #000;
+      --user-bg: transparent; --user-text: #33ff33;
+      --assistant-bg: transparent; --assistant-text: #33ff33;
+      --border: #1a3a1a; --code-bg: #0d1a0d; --code-text: #33ff33;
+      --input-bg: #0a0a0a; --input-border: #1a3a1a;
+      --shadow: rgba(0,255,0,0.05);
+      --font-body: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono', monospace;
+      --font-heading: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono', monospace;
+      --radius: 0px; --radius-sm: 0px; --msg-max-width: 100%; --msg-radius: 0px;
+    }
+    [data-theme="terminal"][data-mode="light"] {
+      --bg: #f0f5f0; --bg-secondary: #e0e8e0; --bg-tertiary: #d0d8d0;
+      --text-primary: #0a4a0a; --text-secondary: #1a6a1a; --text-tertiary: #3a8a3a;
+      --accent: #0a6a0a; --accent-hover: #085a08; --accent-text: #fff;
+      --user-bg: transparent; --user-text: #0a4a0a;
+      --assistant-bg: transparent; --assistant-text: #0a4a0a;
+      --border: #b0c8b0; --code-bg: #dfe8df; --code-text: #0a4a0a;
+      --input-bg: #f0f5f0; --input-border: #b0c8b0;
+      --shadow: rgba(0,80,0,0.08);
+    }
+
+    /* ===== THEME: MINIMAL ===== */
+    /* AIDEV-NOTE: Minimal — ultra-clean, lots of whitespace, almost no decoration */
+    [data-theme="minimal"] {
+      --bg: #fafafa; --bg-secondary: #f5f5f5; --bg-tertiary: #eee;
+      --text-primary: #222; --text-secondary: #666; --text-tertiary: #aaa;
+      --accent: #222; --accent-hover: #000; --accent-text: #fff;
+      --user-bg: transparent; --user-text: #222;
+      --assistant-bg: transparent; --assistant-text: #222;
+      --border: #eee; --code-bg: #f0f0f0; --code-text: #222;
+      --input-bg: #fafafa; --input-border: #ddd;
+      --shadow: none;
+      --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, serif;
+      --font-heading: Optima, Candara, 'Noto Sans', source-sans-pro, sans-serif;
+      --radius: 4px; --radius-sm: 2px; --msg-max-width: 640px; --msg-radius: 4px;
+    }
+    [data-theme="minimal"][data-mode="dark"] {
+      --bg: #111; --bg-secondary: #191919; --bg-tertiary: #222;
+      --text-primary: #d4d4d4; --text-secondary: #888; --text-tertiary: #555;
+      --accent: #d4d4d4; --accent-hover: #fff; --accent-text: #111;
+      --user-bg: transparent; --user-text: #d4d4d4;
+      --assistant-bg: transparent; --assistant-text: #d4d4d4;
+      --border: #222; --code-bg: #1a1a1a; --code-text: #d4d4d4;
+      --input-bg: #111; --input-border: #333;
+      --shadow: none;
+    }
+
+    /* ===== LAYOUT ===== */
+    html { overscroll-behavior: none; }
+    body {
+      font-family: var(--font-body);
+      font-size: 15px;
+      line-height: 1.6;
+      color: var(--text-primary);
+      background: var(--bg);
+      display: flex;
+      flex-direction: column;
+      height: 100dvh;
+      padding-top: env(safe-area-inset-top);
+      padding-left: env(safe-area-inset-left);
+      padding-right: env(safe-area-inset-right);
+      -webkit-user-select: none; user-select: none;
+    }
+
+    /* ===== HEADER ===== */
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg);
+      flex-shrink: 0;
+      z-index: 10;
+      min-height: 48px;
+      flex-wrap: nowrap;
+      overflow-x: auto;
+    }
+    .header-title {
+      font-family: var(--font-heading);
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--text-primary);
+      white-space: nowrap;
+    }
+    .header-spacer { flex: 1; }
+    .header-btn {
+      background: none; border: none; cursor: pointer;
+      color: var(--text-secondary);
+      padding: 6px;
+      border-radius: var(--radius-sm);
+      display: flex; align-items: center; justify-content: center;
+      transition: color 0.15s, background 0.15s;
+      min-width: 36px; min-height: 36px;
+    }
+    .header-btn:hover { color: var(--text-primary); background: var(--bg-secondary); }
+    .header-btn.active { color: var(--accent); background: var(--bg-tertiary); }
+    .header-btn svg { width: 18px; height: 18px; }
+
+    /* ===== CONVERSATIONS DROPDOWN ===== */
+    .conversations-bar {
+      display: none;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg-secondary);
+      padding: 8px 12px;
+      gap: 8px;
+      align-items: center;
+      flex-shrink: 0;
+      overflow-x: auto;
+    }
+    .conversations-bar.open { display: flex; }
+    .conv-chip {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 4px 10px;
+      font-size: 13px;
+      cursor: pointer;
+      white-space: nowrap;
+      color: var(--text-secondary);
+      transition: all 0.15s;
+      display: flex; align-items: center; gap: 6px;
+    }
+    .conv-chip:hover { border-color: var(--accent); color: var(--text-primary); }
+    .conv-chip.active { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+    .conv-chip .conv-delete {
+      display: none;
+      background: none; border: none; cursor: pointer;
+      color: inherit; opacity: 0.6; font-size: 14px;
+      padding: 0 2px; line-height: 1;
+    }
+    .conv-chip:hover .conv-delete { display: inline; }
+    .conv-chip.active .conv-delete { display: inline; }
+    .conv-chip .conv-delete:hover { opacity: 1; }
+
+    /* ===== MODEL SELECTOR ===== */
+    .model-select {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 4px 8px;
+      font-size: 13px;
+      color: var(--text-primary);
+      max-width: 180px;
+      cursor: pointer;
+    }
+
+    /* ===== SETTINGS PANEL ===== */
+    .settings-overlay {
+      display: none;
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.4);
+      z-index: 100;
+      justify-content: center; align-items: center;
+    }
+    .settings-overlay.open { display: flex; }
+    .settings-panel {
+      background: var(--bg);
+      border-radius: var(--radius);
+      padding: 24px;
+      width: 90%; max-width: 440px;
+      box-shadow: 0 8px 32px var(--shadow);
+      border: 1px solid var(--border);
+    }
+    .settings-panel h2 {
+      font-family: var(--font-heading);
+      font-size: 18px; font-weight: 600;
+      margin-bottom: 16px; color: var(--text-primary);
+    }
+    .settings-field { margin-bottom: 14px; }
+    .settings-field label {
+      display: block; font-size: 13px; font-weight: 500;
+      color: var(--text-secondary); margin-bottom: 4px;
+    }
+    .settings-field input, .settings-field select {
+      width: 100%; padding: 8px 10px;
+      background: var(--input-bg);
+      border: 1px solid var(--input-border);
+      border-radius: var(--radius-sm);
+      color: var(--text-primary);
+      font-size: 14px;
+    }
+    .settings-field input:focus, .settings-field select:focus {
+      outline: none; border-color: var(--accent);
+    }
+    .settings-actions {
+      display: flex; gap: 8px; justify-content: flex-end; margin-top: 18px;
+    }
+    .btn {
+      padding: 8px 16px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border);
+      background: var(--bg-secondary);
+      color: var(--text-primary);
+      font-size: 14px; cursor: pointer;
+      transition: all 0.15s;
+    }
+    .btn:hover { background: var(--bg-tertiary); }
+    .btn-primary {
+      background: var(--accent); color: var(--accent-text);
+      border-color: var(--accent);
+    }
+    .btn-primary:hover { background: var(--accent-hover); }
+
+    /* ===== MESSAGES AREA ===== */
+    .messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding-bottom: env(safe-area-inset-bottom, 8px);
+    }
+    .messages::-webkit-scrollbar { width: 6px; }
+    .messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    .selectable { -webkit-user-select: text; user-select: text; }
+
+    /* ===== MESSAGE STYLES ===== */
+    .msg {
+      max-width: var(--msg-max-width);
+      padding: 10px 14px;
+      border-radius: var(--msg-radius);
+      font-size: 15px;
+      line-height: 1.6;
+      word-wrap: break-word;
+      position: relative;
+    }
+    .msg-user {
+      background: var(--user-bg);
+      color: var(--user-text);
+      white-space: pre-wrap;
+    }
+    .msg-assistant {
+      background: var(--assistant-bg);
+      color: var(--assistant-text);
+    }
+    .msg-error {
+      background: #fee; color: #c00;
+      border: 1px solid #fcc;
+      font-size: 13px;
+      align-self: center;
+      max-width: 90%;
+    }
+
+    /* Bubbles theme: speech bubble alignment */
+    [data-theme="bubbles"] .msg-user { align-self: flex-end; border-bottom-right-radius: 6px; }
+    [data-theme="bubbles"] .msg-assistant { align-self: flex-start; border-bottom-left-radius: 6px; }
+
+    /* Classic/Minimal theme: centered, full-width, subtle separator */
+    [data-theme="classic"] .msg,
+    [data-theme="minimal"] .msg {
+      align-self: center; width: 100%; max-width: var(--msg-max-width);
+    }
+    [data-theme="classic"] .msg-user,
+    [data-theme="minimal"] .msg-user {
+      border-left: 3px solid var(--accent); padding-left: 14px;
+    }
+
+    /* Terminal theme: prompt-style */
+    [data-theme="terminal"] .msg {
+      width: 100%; max-width: 100%;
+      padding: 6px 0;
+    }
+    [data-theme="terminal"] .msg-user::before {
+      content: '> '; color: var(--text-tertiary);
+    }
+    [data-theme="terminal"] .msg-assistant { opacity: 0.9; }
+
+    /* ===== MESSAGE IMAGES ===== */
+    .msg-images {
+      display: flex; flex-wrap: wrap; gap: 6px;
+      margin-bottom: 6px;
+    }
+    .msg-images img {
+      max-width: 200px; max-height: 200px;
+      border-radius: var(--radius-sm);
+      object-fit: cover;
+    }
+
+    /* ===== MESSAGE FOOTER ===== */
+    .msg-footer {
+      font-size: 11px;
+      color: var(--text-tertiary);
+      margin-top: 4px;
+      display: flex; gap: 12px; align-items: center;
+    }
+    .msg-copy-btn {
+      background: none; border: none; cursor: pointer;
+      color: var(--text-tertiary); font-size: 11px;
+      padding: 0; transition: color 0.15s;
+    }
+    .msg-copy-btn:hover { color: var(--text-primary); }
+
+    /* ===== MARKDOWN RENDERED CONTENT ===== */
+    .msg-assistant p { margin-bottom: 0.6em; }
+    .msg-assistant p:last-child { margin-bottom: 0; }
+    .msg-assistant ul, .msg-assistant ol { margin: 0.4em 0 0.6em 1.5em; }
+    .msg-assistant li { margin-bottom: 0.2em; }
+    .msg-assistant h1, .msg-assistant h2, .msg-assistant h3,
+    .msg-assistant h4, .msg-assistant h5, .msg-assistant h6 {
+      font-family: var(--font-heading);
+      margin: 0.8em 0 0.3em;
+    }
+    .msg-assistant h1 { font-size: 1.4em; font-weight: 500; }
+    .msg-assistant h2 { font-size: 1.2em; font-weight: 500; }
+    .msg-assistant h3 { font-size: 1.05em; font-weight: 600; }
+    .msg-assistant a { color: var(--accent); text-decoration: underline; }
+    .msg-assistant blockquote {
+      border-left: 3px solid var(--border);
+      padding-left: 12px;
+      color: var(--text-secondary);
+      margin: 0.4em 0;
+    }
+    .msg-assistant table {
+      border-collapse: collapse; margin: 0.6em 0; font-size: 14px;
+    }
+    .msg-assistant th, .msg-assistant td {
+      border: 1px solid var(--border);
+      padding: 4px 10px; text-align: left;
+    }
+    .msg-assistant th { background: var(--bg-secondary); font-weight: 600; }
+
+    /* Inline code */
+    .msg-assistant code {
+      font-family: var(--font-code);
+      font-size: 0.88em;
+      background: var(--code-bg);
+      padding: 2px 5px;
+      border-radius: 3px;
+      color: var(--code-text);
+    }
+    /* Code blocks */
+    .msg-assistant pre {
+      background: var(--code-bg);
+      border-radius: var(--radius-sm);
+      padding: 12px 14px;
+      margin: 0.5em 0;
+      overflow-x: auto;
+      position: relative;
+    }
+    .msg-assistant pre code {
+      background: none; padding: 0;
+      font-size: 13px; line-height: 1.5;
+    }
+    .code-copy-btn {
+      position: absolute; top: 6px; right: 6px;
+      background: var(--bg-secondary); border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 3px 8px; font-size: 11px;
+      cursor: pointer; color: var(--text-secondary);
+      opacity: 0; transition: opacity 0.15s;
+    }
+    .msg-assistant pre:hover .code-copy-btn { opacity: 1; }
+    .code-copy-btn:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+
+    /* ===== SYSTEM PROMPT BAR ===== */
+    .system-bar {
+      display: none;
+      padding: 8px 12px;
+      border-top: 1px solid var(--border);
+      background: var(--bg-secondary);
+      flex-shrink: 0;
+    }
+    .system-bar.open { display: block; }
+    .system-bar input {
+      width: 100%; padding: 8px 10px;
+      background: var(--input-bg);
+      border: 1px solid var(--input-border);
+      border-radius: var(--radius-sm);
+      color: var(--text-primary);
+      font-size: 13px;
+    }
+    .system-bar input:focus { outline: none; border-color: var(--accent); }
+
+    /* ===== ATTACHMENTS PREVIEW ===== */
+    .attachments-preview {
+      display: none;
+      padding: 6px 12px;
+      background: var(--bg-secondary);
+      border-top: 1px solid var(--border);
+      gap: 6px;
+      flex-wrap: wrap;
+      flex-shrink: 0;
+    }
+    .attachments-preview.has-items { display: flex; }
+    .attachment-thumb {
+      position: relative;
+      width: 60px; height: 60px;
+      border-radius: var(--radius-sm);
+      overflow: hidden;
+      border: 1px solid var(--border);
+    }
+    .attachment-thumb img {
+      width: 100%; height: 100%; object-fit: cover;
+    }
+    .attachment-remove {
+      position: absolute; top: 2px; right: 2px;
+      background: rgba(0,0,0,0.6); color: #fff;
+      border: none; border-radius: 50%;
+      width: 18px; height: 18px;
+      font-size: 12px; line-height: 1;
+      cursor: pointer; display: flex;
+      align-items: center; justify-content: center;
+    }
+
+    /* ===== INPUT BAR ===== */
+    .input-bar {
+      display: flex; align-items: flex-end;
+      gap: 8px;
+      padding: 8px 12px;
+      border-top: 1px solid var(--border);
+      background: var(--bg);
+      flex-shrink: 0;
+      padding-bottom: max(8px, env(safe-area-inset-bottom));
+    }
+    .input-bar textarea {
+      flex: 1;
+      padding: 10px 12px;
+      background: var(--input-bg);
+      border: 1px solid var(--input-border);
+      border-radius: var(--radius);
+      color: var(--text-primary);
+      font-size: 15px;
+      line-height: 1.4;
+      resize: none;
+      min-height: 22px;
+      max-height: 150px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .input-bar textarea:focus { border-color: var(--accent); }
+    .input-bar textarea::placeholder { color: var(--text-tertiary); }
+
+    .input-actions { display: flex; gap: 4px; align-items: flex-end; }
+    .input-btn {
+      background: none; border: none; cursor: pointer;
+      color: var(--text-tertiary);
+      padding: 8px;
+      border-radius: var(--radius-sm);
+      display: flex; align-items: center; justify-content: center;
+      transition: color 0.15s, background 0.15s;
+      min-width: 40px; min-height: 40px;
+    }
+    .input-btn:hover { color: var(--text-primary); background: var(--bg-secondary); }
+    .input-btn svg { width: 20px; height: 20px; }
+    .send-btn {
+      background: var(--accent); color: var(--accent-text);
+      border: none; cursor: pointer;
+      padding: 8px 14px;
+      border-radius: var(--radius);
+      display: flex; align-items: center; justify-content: center;
+      min-width: 40px; min-height: 40px;
+      transition: background 0.15s, opacity 0.15s;
+    }
+    .send-btn:hover { background: var(--accent-hover); }
+    .send-btn:disabled { opacity: 0.4; cursor: default; }
+    .send-btn svg { width: 20px; height: 20px; }
+
+    /* ===== WELCOME SCREEN ===== */
+    .welcome {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 24px;
+      color: var(--text-secondary);
+    }
+    .welcome h2 {
+      font-family: var(--font-heading);
+      font-size: 1.5rem; font-weight: 300;
+      color: var(--text-primary);
+      margin-bottom: 8px;
+    }
+    .welcome p { font-size: 14px; max-width: 400px; }
+
+    /* ===== EXPORT MENU ===== */
+    .export-menu {
+      display: none;
+      position: absolute;
+      right: 12px; top: 44px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      box-shadow: 0 4px 16px var(--shadow);
+      z-index: 20;
+      min-width: 140px;
+      overflow: hidden;
+    }
+    .export-menu.open { display: block; }
+    .export-menu button {
+      display: block; width: 100%;
+      background: none; border: none;
+      padding: 8px 14px;
+      text-align: left; font-size: 13px;
+      color: var(--text-primary);
+      cursor: pointer;
+    }
+    .export-menu button:hover { background: var(--bg-secondary); }
+
+    /* ===== RESPONSIVE ===== */
+    @media (max-width: 640px) {
+      .msg { max-width: 90%; }
+      .header-title { font-size: 14px; }
+      .model-select { max-width: 120px; font-size: 12px; }
+    }
+
+    /* ===== THEME SELECTOR IN SETTINGS ===== */
+    .theme-options { display: flex; gap: 6px; flex-wrap: wrap; }
+    .theme-opt {
+      padding: 6px 12px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      background: var(--bg);
+      color: var(--text-primary);
+      font-size: 13px; cursor: pointer;
+      transition: all 0.15s;
+    }
+    .theme-opt:hover { border-color: var(--accent); }
+    .theme-opt.active { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+
+    .mode-toggle {
+      display: flex; gap: 4px;
+    }
+    .mode-opt {
+      padding: 4px 10px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      background: var(--bg);
+      color: var(--text-primary);
+      font-size: 12px; cursor: pointer;
+      transition: all 0.15s;
+    }
+    .mode-opt:hover { border-color: var(--accent); }
+    .mode-opt.active { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+
+    /* ===== LOADING DOTS ===== */
+    .typing-indicator span {
+      display: inline-block;
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--text-tertiary);
+      margin-right: 3px;
+      animation: blink 1.4s infinite both;
+    }
+    .typing-indicator span:nth-child(2) { animation-delay: 0.2s; }
+    .typing-indicator span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes blink {
+      0%, 80%, 100% { opacity: 0.3; }
+      40% { opacity: 1; }
+    }
+  </style>
+</head>
+<body data-theme="classic" data-mode="light">
+
+  <!-- ===== HEADER ===== -->
+  <div class="header">
+    <span class="header-title">LLM Chat</span>
+    <select class="model-select" id="modelSelect" title="Model">
+      <option value="">default</option>
+    </select>
+    <div class="header-spacer"></div>
+    <button class="header-btn" id="btnConvs" title="Conversations">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+    </button>
+    <button class="header-btn" id="btnSystem" title="System prompt">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+    </button>
+    <div class="header-btn" id="btnExport" title="Export" style="position:relative;cursor:pointer" role="button" tabindex="0">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      <div class="export-menu" id="exportMenu">
+        <button id="exportJson">Export JSON</button>
+        <button id="exportMd">Export Markdown</button>
+      </div>
+    </div>
+    <button class="header-btn" id="btnClear" title="Clear conversation">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14H7L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4h6v2"/></svg>
+    </button>
+    <button class="header-btn" id="btnSettings" title="Settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+    </button>
+    <button class="header-btn" id="btnNew" title="New conversation">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+    </button>
+  </div>
+
+  <!-- ===== CONVERSATIONS BAR ===== -->
+  <div class="conversations-bar" id="convsBar"></div>
+
+  <!-- ===== SYSTEM PROMPT BAR ===== -->
+  <div class="system-bar" id="systemBar">
+    <input type="text" id="systemInput" placeholder="System prompt (e.g. You are a helpful assistant...)">
+  </div>
+
+  <!-- ===== MESSAGES ===== -->
+  <div class="messages selectable" id="messages">
+    <div class="welcome" id="welcome">
+      <h2>LLM Chat</h2>
+      <p>Connect to any OpenAI-compatible API. Click the gear icon to configure your endpoint.</p>
+    </div>
+  </div>
+
+  <!-- ===== ATTACHMENTS PREVIEW ===== -->
+  <div class="attachments-preview" id="attachments"></div>
+
+  <!-- ===== INPUT BAR ===== -->
+  <div class="input-bar">
+    <button class="input-btn" id="btnAttach" title="Attach image">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+    </button>
+    <textarea id="input" rows="1" placeholder="Type a message..." autofocus></textarea>
+    <button class="send-btn" id="btnSend" title="Send">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+    </button>
+  </div>
+  <input type="file" id="fileInput" accept="image/*" multiple style="display:none">
+
+  <!-- ===== SETTINGS OVERLAY ===== -->
+  <div class="settings-overlay" id="settingsOverlay">
+    <div class="settings-panel">
+      <h2>Settings</h2>
+      <div class="settings-field">
+        <label>API Base URL</label>
+        <input type="url" id="settingUrl" placeholder="http://localhost:8080/v1">
+      </div>
+      <div class="settings-field">
+        <label>API Key (optional)</label>
+        <input type="password" id="settingKey" placeholder="sk-...">
+      </div>
+      <div class="settings-field">
+        <label>Model (leave blank for server default)</label>
+        <input type="text" id="settingModel" placeholder="gpt-4o">
+      </div>
+      <div class="settings-field">
+        <label>Theme</label>
+        <div class="theme-options" id="themeOptions">
+          <button class="theme-opt active" data-theme="classic">Classic</button>
+          <button class="theme-opt" data-theme="bubbles">Bubbles</button>
+          <button class="theme-opt" data-theme="terminal">Terminal</button>
+          <button class="theme-opt" data-theme="minimal">Minimal</button>
+        </div>
+      </div>
+      <div class="settings-field">
+        <label>Color mode</label>
+        <div class="mode-toggle" id="modeToggle">
+          <button class="mode-opt" data-mode="light">Light</button>
+          <button class="mode-opt" data-mode="dark">Dark</button>
+          <button class="mode-opt active" data-mode="auto">Auto</button>
+        </div>
+      </div>
+      <div class="settings-actions">
+        <button class="btn" id="settingsCancel">Cancel</button>
+        <button class="btn btn-primary" id="settingsSave">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // AIDEV-NOTE: Configuration — user-tunable defaults
+    const CONFIG = {
+      defaultBaseUrl: 'http://localhost:8080/v1',
+      defaultModel: '',
+      defaultApiKey: '',
+      defaultTheme: 'classic',       // classic, bubbles, terminal, minimal
+      defaultMode: 'auto',           // light, dark, auto
+      storagePrefix: 'llm-chat-',
+      maxAttachmentSize: 10 * 1024 * 1024,  // 10MB
+    };
+
+    /* ===== HELPERS ===== */
+    const $ = (sel, ctx = document) => ctx.querySelector(sel);
+    const $$ = (sel, ctx = document) => [...ctx.querySelectorAll(sel)];
+
+    /* ===== STATE ===== */
+    let settings = loadSettings();
+    let conversations = loadConversations();
+    let currentConvId = null;
+    let busy = false;
+    let pendingAttachments = []; // [{dataUrl, mimeType}]
+    let abortController = null;
+
+    /* ===== STORAGE ===== */
+    function loadSettings() {
+      try {
+        const s = JSON.parse(localStorage.getItem(CONFIG.storagePrefix + 'settings'));
+        return {
+          baseUrl: s?.baseUrl || CONFIG.defaultBaseUrl,
+          apiKey: s?.apiKey || CONFIG.defaultApiKey,
+          model: s?.model || CONFIG.defaultModel,
+          theme: s?.theme || CONFIG.defaultTheme,
+          mode: s?.mode || CONFIG.defaultMode,
+        };
+      } catch { return { baseUrl: CONFIG.defaultBaseUrl, apiKey: CONFIG.defaultApiKey, model: CONFIG.defaultModel, theme: CONFIG.defaultTheme, mode: CONFIG.defaultMode }; }
+    }
+    function saveSettings() {
+      localStorage.setItem(CONFIG.storagePrefix + 'settings', JSON.stringify(settings));
+    }
+    function loadConversations() {
+      try {
+        return JSON.parse(localStorage.getItem(CONFIG.storagePrefix + 'conversations')) || [];
+      } catch { return []; }
+    }
+    function saveConversations() {
+      localStorage.setItem(CONFIG.storagePrefix + 'conversations', JSON.stringify(conversations));
+    }
+
+    /* ===== THEME ===== */
+    function applyTheme() {
+      document.body.dataset.theme = settings.theme;
+      let mode = settings.mode;
+      if (mode === 'auto') {
+        mode = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      }
+      document.body.dataset.mode = mode;
+    }
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+      if (settings.mode === 'auto') applyTheme();
+    });
+
+    /* ===== MARKDOWN ===== */
+    // AIDEV-NOTE: marked is configured to produce GFM with breaks for streaming friendliness
+    marked.setOptions({ gfm: true, breaks: false });
+
+    function renderMarkdown(text) {
+      const raw = marked.parse(text);
+      const clean = DOMPurify.sanitize(raw, {
+        ADD_ATTR: ['target'],
+        ALLOW_DATA_ATTR: false,
+      });
+      return clean;
+    }
+
+    /* ===== MODEL FETCHING ===== */
+    async function fetchModels() {
+      const sel = $('#modelSelect');
+      try {
+        const headers = {};
+        if (settings.apiKey) headers['Authorization'] = 'Bearer ' + settings.apiKey;
+        const resp = await fetch(settings.baseUrl + '/models', { headers });
+        if (!resp.ok) return;
+        const json = await resp.json();
+        const models = (json.data || []).map(m => m.id).sort();
+        // Clear existing options except default
+        while (sel.options.length > 1) sel.remove(1);
+        for (const m of models) {
+          const opt = document.createElement('option');
+          opt.value = m; opt.textContent = m;
+          sel.appendChild(opt);
+        }
+        // Restore saved model selection
+        if (settings.model && models.includes(settings.model)) {
+          sel.value = settings.model;
+        }
+      } catch {
+        // Endpoint may not support /models — that's fine
+      }
+    }
+
+    /* ===== CONVERSATIONS ===== */
+    function newConversation() {
+      const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+      const conv = { id, title: 'New chat', messages: [], systemPrompt: '', created: Date.now() };
+      conversations.unshift(conv);
+      saveConversations();
+      switchConversation(id);
+      renderConvChips();
+    }
+
+    function switchConversation(id) {
+      currentConvId = id;
+      const conv = conversations.find(c => c.id === id);
+      if (!conv) return;
+      // Update hash
+      location.hash = 'chat=' + id;
+      // Restore system prompt
+      $('#systemInput').value = conv.systemPrompt || '';
+      // Render messages
+      renderMessages(conv);
+      renderConvChips();
+    }
+
+    function deleteConversation(id) {
+      conversations = conversations.filter(c => c.id !== id);
+      saveConversations();
+      if (currentConvId === id) {
+        if (conversations.length) switchConversation(conversations[0].id);
+        else newConversation();
+      }
+      renderConvChips();
+    }
+
+    function getCurrentConv() {
+      return conversations.find(c => c.id === currentConvId);
+    }
+
+    function titleFromMessage(text) {
+      const clean = text.replace(/\n/g, ' ').trim();
+      return clean.length > 40 ? clean.slice(0, 40) + '...' : clean;
+    }
+
+    function renderConvChips() {
+      const bar = $('#convsBar');
+      bar.innerHTML = '';
+      for (const conv of conversations) {
+        const chip = document.createElement('div');
+        chip.className = 'conv-chip' + (conv.id === currentConvId ? ' active' : '');
+        chip.dataset.id = conv.id;
+
+        const label = document.createElement('span');
+        label.textContent = conv.title;
+        chip.appendChild(label);
+
+        const del = document.createElement('button');
+        del.className = 'conv-delete';
+        del.textContent = '\u00d7';
+        del.onclick = (e) => { e.stopPropagation(); deleteConversation(conv.id); };
+        chip.appendChild(del);
+
+        chip.onclick = () => switchConversation(conv.id);
+        bar.appendChild(chip);
+      }
+    }
+
+    /* ===== RENDER MESSAGES ===== */
+    function renderMessages(conv) {
+      const container = $('#messages');
+      container.innerHTML = '';
+      if (!conv.messages.length) {
+        container.innerHTML = '<div class="welcome" id="welcome"><h2>LLM Chat</h2><p>Connect to any OpenAI-compatible API. Click the gear icon to configure your endpoint.</p></div>';
+        return;
+      }
+      for (const msg of conv.messages) {
+        appendMessageEl(msg);
+      }
+      scrollToBottom();
+    }
+
+    function appendMessageEl(msg) {
+      const container = $('#messages');
+      // Remove welcome if present
+      const welcome = $('#welcome');
+      if (welcome) welcome.remove();
+
+      const div = document.createElement('div');
+      div.className = 'msg msg-' + msg.role;
+
+      // Images
+      if (msg.images && msg.images.length) {
+        const imgWrap = document.createElement('div');
+        imgWrap.className = 'msg-images';
+        for (const src of msg.images) {
+          const img = document.createElement('img');
+          img.src = src;
+          imgWrap.appendChild(img);
+        }
+        div.appendChild(imgWrap);
+      }
+
+      // Content
+      const content = document.createElement('div');
+      content.className = 'msg-content';
+      if (msg.role === 'assistant') {
+        content.innerHTML = renderMarkdown(msg.content || '');
+        addCodeCopyButtons(content);
+      } else if (msg.role === 'error') {
+        content.textContent = msg.content;
+      } else {
+        content.textContent = msg.content;
+      }
+      div.appendChild(content);
+
+      // Footer
+      if (msg.role === 'user' || msg.role === 'assistant') {
+        const footer = document.createElement('div');
+        footer.className = 'msg-footer';
+
+        if (msg.usage) {
+          const usage = document.createElement('span');
+          const parts = [];
+          if (msg.usage.prompt_tokens != null) parts.push('in: ' + msg.usage.prompt_tokens);
+          if (msg.usage.completion_tokens != null) parts.push('out: ' + msg.usage.completion_tokens);
+          if (msg.usage.total_tokens != null) parts.push('total: ' + msg.usage.total_tokens);
+          usage.textContent = parts.join(' · ');
+          footer.appendChild(usage);
+        }
+
+        const copyBtn = document.createElement('button');
+        copyBtn.className = 'msg-copy-btn';
+        copyBtn.textContent = 'copy';
+        copyBtn.onclick = () => {
+          navigator.clipboard.writeText(msg.content).then(() => {
+            copyBtn.textContent = 'copied!';
+            setTimeout(() => copyBtn.textContent = 'copy', 1500);
+          });
+        };
+        footer.appendChild(copyBtn);
+        div.appendChild(footer);
+      }
+
+      container.appendChild(div);
+      return div;
+    }
+
+    function addCodeCopyButtons(container) {
+      for (const pre of $$('pre', container)) {
+        const btn = document.createElement('button');
+        btn.className = 'code-copy-btn';
+        btn.textContent = 'Copy';
+        btn.onclick = () => {
+          const code = $('code', pre);
+          navigator.clipboard.writeText(code ? code.textContent : pre.textContent).then(() => {
+            btn.textContent = 'Copied!';
+            setTimeout(() => btn.textContent = 'Copy', 1500);
+          });
+        };
+        pre.style.position = 'relative';
+        pre.appendChild(btn);
+      }
+    }
+
+    function scrollToBottom() {
+      const container = $('#messages');
+      container.scrollTop = container.scrollHeight;
+    }
+
+    /* ===== SENDING ===== */
+    async function sendMessage() {
+      const input = $('#input');
+      const text = input.value.trim();
+      if (!text && !pendingAttachments.length) return;
+      if (busy) return;
+
+      const conv = getCurrentConv();
+      if (!conv) return;
+
+      // Build user message
+      const userMsg = { role: 'user', content: text, images: [] };
+      const imageDataUrls = [];
+      for (const att of pendingAttachments) {
+        userMsg.images.push(att.dataUrl);
+        imageDataUrls.push(att);
+      }
+
+      // Update title from first message
+      if (!conv.messages.length) {
+        conv.title = titleFromMessage(text || 'Image chat');
+        renderConvChips();
+      }
+
+      conv.messages.push(userMsg);
+      conv.systemPrompt = $('#systemInput').value;
+      saveConversations();
+
+      appendMessageEl(userMsg);
+      input.value = '';
+      autoResize(input);
+      clearAttachments();
+      scrollToBottom();
+
+      // Build API messages
+      const apiMessages = [];
+      if (conv.systemPrompt) {
+        apiMessages.push({ role: 'system', content: conv.systemPrompt });
+      }
+      for (const m of conv.messages) {
+        if (m.role === 'error') continue;
+        if (m.images && m.images.length) {
+          // Multi-modal: vision format
+          const contentParts = [];
+          for (const img of m.images) {
+            contentParts.push({ type: 'image_url', image_url: { url: img } });
+          }
+          if (m.content) {
+            contentParts.push({ type: 'text', text: m.content });
+          }
+          apiMessages.push({ role: m.role, content: contentParts });
+        } else {
+          apiMessages.push({ role: m.role, content: m.content });
+        }
+      }
+
+      // Create assistant message placeholder
+      const assistantMsg = { role: 'assistant', content: '', usage: null };
+      conv.messages.push(assistantMsg);
+      const assistantEl = appendMessageEl(assistantMsg);
+      const contentEl = $('.msg-content', assistantEl);
+
+      // Show typing indicator
+      contentEl.innerHTML = '<span class="typing-indicator"><span></span><span></span><span></span></span>';
+      scrollToBottom();
+
+      busy = true;
+      $('#btnSend').disabled = true;
+      abortController = new AbortController();
+
+      try {
+        const model = $('#modelSelect').value || settings.model || undefined;
+        const headers = { 'Content-Type': 'application/json' };
+        if (settings.apiKey) headers['Authorization'] = 'Bearer ' + settings.apiKey;
+
+        const body = {
+          messages: apiMessages,
+          stream: true,
+        };
+        if (model) body.model = model;
+
+        const resp = await fetch(settings.baseUrl + '/chat/completions', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+          signal: abortController.signal,
+        });
+
+        if (!resp.ok) {
+          const errText = await resp.text();
+          throw new Error(`HTTP ${resp.status}: ${errText.slice(0, 200)}`);
+        }
+
+        // Stream SSE
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let full = '';
+        let firstChunk = true;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop(); // Keep incomplete line
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed === 'data: [DONE]') continue;
+            if (!trimmed.startsWith('data: ')) continue;
+
+            try {
+              const json = JSON.parse(trimmed.slice(6));
+              const delta = json.choices?.[0]?.delta?.content;
+              if (delta) {
+                if (firstChunk) {
+                  contentEl.innerHTML = '';
+                  firstChunk = false;
+                }
+                full += delta;
+                contentEl.innerHTML = renderMarkdown(full);
+                addCodeCopyButtons(contentEl);
+                scrollToBottom();
+              }
+              // Capture usage if present (some providers send it in the last chunk)
+              if (json.usage) {
+                assistantMsg.usage = json.usage;
+              }
+            } catch {
+              // Ignore malformed SSE lines
+            }
+          }
+        }
+
+        if (firstChunk) {
+          // No streaming content received — try non-streaming parse of buffer
+          contentEl.innerHTML = '';
+        }
+
+        assistantMsg.content = full;
+
+        // Re-render with final markdown + code buttons
+        contentEl.innerHTML = renderMarkdown(full);
+        addCodeCopyButtons(contentEl);
+
+        // Update footer with usage
+        if (assistantMsg.usage) {
+          const footer = $('.msg-footer', assistantEl);
+          if (footer) {
+            const usageSpan = document.createElement('span');
+            const parts = [];
+            if (assistantMsg.usage.prompt_tokens != null) parts.push('in: ' + assistantMsg.usage.prompt_tokens);
+            if (assistantMsg.usage.completion_tokens != null) parts.push('out: ' + assistantMsg.usage.completion_tokens);
+            if (assistantMsg.usage.total_tokens != null) parts.push('total: ' + assistantMsg.usage.total_tokens);
+            usageSpan.textContent = parts.join(' · ');
+            footer.prepend(usageSpan);
+          }
+        }
+
+        saveConversations();
+
+      } catch (err) {
+        if (err.name === 'AbortError') {
+          assistantMsg.content = assistantMsg.content || '(cancelled)';
+        } else {
+          // Remove empty assistant message, show error
+          conv.messages.pop();
+          assistantEl.remove();
+          const errMsg = { role: 'error', content: err.message };
+          conv.messages.push(errMsg);
+          appendMessageEl(errMsg);
+        }
+        saveConversations();
+      } finally {
+        busy = false;
+        $('#btnSend').disabled = false;
+        abortController = null;
+        scrollToBottom();
+      }
+    }
+
+    /* ===== ATTACHMENTS ===== */
+    function addAttachment(file) {
+      if (file.size > CONFIG.maxAttachmentSize) return;
+      if (!file.type.startsWith('image/')) return;
+
+      const reader = new FileReader();
+      reader.onload = () => {
+        pendingAttachments.push({ dataUrl: reader.result, mimeType: file.type });
+        renderAttachments();
+      };
+      reader.readAsDataURL(file);
+    }
+
+    function renderAttachments() {
+      const container = $('#attachments');
+      container.innerHTML = '';
+      container.classList.toggle('has-items', pendingAttachments.length > 0);
+      pendingAttachments.forEach((att, i) => {
+        const thumb = document.createElement('div');
+        thumb.className = 'attachment-thumb';
+        const img = document.createElement('img');
+        img.src = att.dataUrl;
+        thumb.appendChild(img);
+        const rm = document.createElement('button');
+        rm.className = 'attachment-remove';
+        rm.textContent = '\u00d7';
+        rm.onclick = () => { pendingAttachments.splice(i, 1); renderAttachments(); };
+        thumb.appendChild(rm);
+        container.appendChild(thumb);
+      });
+    }
+
+    function clearAttachments() {
+      pendingAttachments = [];
+      renderAttachments();
+    }
+
+    /* ===== INPUT AUTO-RESIZE ===== */
+    function autoResize(textarea) {
+      textarea.style.height = 'auto';
+      textarea.style.height = Math.min(textarea.scrollHeight, 150) + 'px';
+    }
+
+    /* ===== EXPORT ===== */
+    function exportJson() {
+      const conv = getCurrentConv();
+      if (!conv) return;
+      const blob = new Blob([JSON.stringify(conv, null, 2)], { type: 'application/json' });
+      downloadBlob(blob, (conv.title || 'chat') + '.json');
+    }
+
+    function exportMarkdown() {
+      const conv = getCurrentConv();
+      if (!conv) return;
+      let md = '# ' + conv.title + '\n\n';
+      for (const msg of conv.messages) {
+        if (msg.role === 'user') md += '**User:** ' + msg.content + '\n\n';
+        else if (msg.role === 'assistant') md += '**Assistant:** ' + msg.content + '\n\n';
+        else if (msg.role === 'error') md += '> Error: ' + msg.content + '\n\n';
+      }
+      const blob = new Blob([md], { type: 'text/markdown' });
+      downloadBlob(blob, (conv.title || 'chat') + '.md');
+    }
+
+    function downloadBlob(blob, filename) {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    /* ===== SETTINGS UI ===== */
+    function openSettings() {
+      $('#settingUrl').value = settings.baseUrl;
+      $('#settingKey').value = settings.apiKey;
+      $('#settingModel').value = settings.model;
+      // Update theme buttons
+      for (const btn of $$('.theme-opt')) {
+        btn.classList.toggle('active', btn.dataset.theme === settings.theme);
+      }
+      // Update mode buttons
+      for (const btn of $$('.mode-opt')) {
+        btn.classList.toggle('active', btn.dataset.mode === settings.mode);
+      }
+      $('#settingsOverlay').classList.add('open');
+    }
+
+    function previewTheme(theme, mode) {
+      document.body.dataset.theme = theme;
+      let resolved = mode;
+      if (resolved === 'auto') {
+        resolved = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      }
+      document.body.dataset.mode = resolved;
+    }
+
+    function closeSettings() {
+      // Revert to saved settings on cancel
+      applyTheme();
+      $('#settingsOverlay').classList.remove('open');
+    }
+
+    function saveSettingsFromUI() {
+      settings.baseUrl = $('#settingUrl').value.trim().replace(/\/+$/, '') || CONFIG.defaultBaseUrl;
+      settings.apiKey = $('#settingKey').value.trim();
+      settings.model = $('#settingModel').value.trim();
+
+      const activeTheme = $('.theme-opt.active');
+      if (activeTheme) settings.theme = activeTheme.dataset.theme;
+      const activeMode = $('.mode-opt.active');
+      if (activeMode) settings.mode = activeMode.dataset.mode;
+
+      saveSettings();
+      applyTheme();
+      closeSettings();
+      fetchModels();
+    }
+
+    /* ===== EVENT WIRING ===== */
+    function init() {
+      applyTheme();
+
+      // Settings
+      $('#btnSettings').onclick = openSettings;
+      $('#settingsCancel').onclick = closeSettings;
+      $('#settingsSave').onclick = saveSettingsFromUI;
+      $('#settingsOverlay').onclick = (e) => { if (e.target === e.currentTarget) closeSettings(); };
+
+      // Theme/mode pickers in settings — live preview on click
+      for (const btn of $$('.theme-opt')) {
+        btn.onclick = () => {
+          $$('.theme-opt').forEach(b => b.classList.remove('active'));
+          btn.classList.add('active');
+          const activeMode = $('.mode-opt.active');
+          previewTheme(btn.dataset.theme, activeMode ? activeMode.dataset.mode : 'auto');
+        };
+      }
+      for (const btn of $$('.mode-opt')) {
+        btn.onclick = () => {
+          $$('.mode-opt').forEach(b => b.classList.remove('active'));
+          btn.classList.add('active');
+          const activeTheme = $('.theme-opt.active');
+          previewTheme(activeTheme ? activeTheme.dataset.theme : 'classic', btn.dataset.mode);
+        };
+      }
+
+      // System prompt toggle
+      $('#btnSystem').onclick = () => {
+        const bar = $('#systemBar');
+        bar.classList.toggle('open');
+        $('#btnSystem').classList.toggle('active', bar.classList.contains('open'));
+        if (bar.classList.contains('open')) $('#systemInput').focus();
+      };
+      $('#systemInput').onchange = () => {
+        const conv = getCurrentConv();
+        if (conv) { conv.systemPrompt = $('#systemInput').value; saveConversations(); }
+      };
+
+      // Conversations toggle
+      $('#btnConvs').onclick = () => {
+        const bar = $('#convsBar');
+        bar.classList.toggle('open');
+        $('#btnConvs').classList.toggle('active', bar.classList.contains('open'));
+      };
+
+      // New conversation
+      $('#btnNew').onclick = () => newConversation();
+
+      // Clear
+      $('#btnClear').onclick = () => {
+        const conv = getCurrentConv();
+        if (!conv) return;
+        if (busy && abortController) abortController.abort();
+        conv.messages = [];
+        conv.title = 'New chat';
+        saveConversations();
+        renderMessages(conv);
+        renderConvChips();
+      };
+
+      // Export
+      $('#btnExport').onclick = (e) => {
+        e.stopPropagation();
+        $('#exportMenu').classList.toggle('open');
+      };
+      document.addEventListener('click', () => $('#exportMenu').classList.remove('open'));
+      $('#exportJson').onclick = (e) => { e.stopPropagation(); exportJson(); $('#exportMenu').classList.remove('open'); };
+      $('#exportMd').onclick = (e) => { e.stopPropagation(); exportMarkdown(); $('#exportMenu').classList.remove('open'); };
+
+      // Send
+      $('#btnSend').onclick = sendMessage;
+      const input = $('#input');
+      input.addEventListener('input', () => autoResize(input));
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          sendMessage();
+        }
+      });
+
+      // Attachments
+      $('#btnAttach').onclick = () => $('#fileInput').click();
+      $('#fileInput').onchange = (e) => {
+        for (const f of e.target.files) addAttachment(f);
+        e.target.value = '';
+      };
+
+      // Paste image
+      document.addEventListener('paste', (e) => {
+        for (const item of (e.clipboardData?.items || [])) {
+          if (item.type.startsWith('image/')) {
+            e.preventDefault();
+            addAttachment(item.getAsFile());
+          }
+        }
+      });
+
+      // Drag and drop image
+      const messagesEl = $('#messages');
+      messagesEl.addEventListener('dragover', (e) => { e.preventDefault(); });
+      messagesEl.addEventListener('drop', (e) => {
+        e.preventDefault();
+        for (const f of e.dataTransfer.files) {
+          if (f.type.startsWith('image/')) addAttachment(f);
+        }
+      });
+
+      // Model selector change
+      $('#modelSelect').onchange = () => {
+        settings.model = $('#modelSelect').value;
+        saveSettings();
+      };
+
+      // Initialize conversations
+      if (!conversations.length) {
+        newConversation();
+      } else {
+        // Restore from hash or use first
+        const hash = getHash();
+        const target = hash.chat && conversations.find(c => c.id === hash.chat);
+        switchConversation(target ? target.id : conversations[0].id);
+      }
+
+      renderConvChips();
+      fetchModels();
+
+      // Show settings on first use if no base URL configured
+      if (!localStorage.getItem(CONFIG.storagePrefix + 'settings')) {
+        openSettings();
+      }
+    }
+
+    function getHash() {
+      return Object.fromEntries(new URLSearchParams(location.hash.slice(1)));
+    }
+
+    window.addEventListener('hashchange', () => {
+      const hash = getHash();
+      if (hash.chat && hash.chat !== currentConvId) {
+        const conv = conversations.find(c => c.id === hash.chat);
+        if (conv) switchConversation(conv.id);
+      }
+    });
+
+    window.addEventListener('DOMContentLoaded', init);
+  </script>
+</body>
+</html>
