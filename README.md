@@ -195,6 +195,7 @@ When adding new tools:
 ### Web Tools
 
 - **`llm-chat`** - Single-file chat frontend for any OpenAI-compatible API with streaming, markdown rendering, multi-modal image support, 4 themes (Classic/Bubbles/Terminal/Minimal), conversation management, and export
+- **`favicon-editor`** - Pixel art favicon editor with pencil/eraser/fill tools, ICO & PNG export, live browser-tab preview, drag-and-drop import, and full keyboard shortcuts
 
 ### macOS Tools
 
@@ -204,10 +205,6 @@ When adding new tools:
 - **`timezones`** - Menu bar multi-timezone display with 2x2 grid layout and customizable timezone list
 - **`token-counter`** - Menu bar LLM token counter with activity timeline and token flow charts, built-in OTLP receiver for Claude Code and Codex CLI telemetry
 - **`claude-usage`** - Menu bar Anthropic API rate limit monitor with progress bars, color-coded warnings, and optional usage/cost tracking via Admin API
-
-### 🌐 Web Tools (`web/`)
-
-- **`favicon-editor`** - Pixel art favicon editor with pencil/eraser/fill tools, ICO & PNG export, live browser-tab preview, drag-and-drop import, and full keyboard shortcuts
 
 ### Userscripts
 
