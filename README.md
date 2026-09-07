@@ -91,6 +91,38 @@ curl http://localhost:8080/v1/chat/completions \
   -d '{"model":"apple","messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
+### ⚡ bigcurl
+
+A parallel chunked downloader that wraps curl. It splits a file into blocks, pulls them with several concurrent range requests, tunes the connection count to whatever the network is actually doing, and resumes where it left off if you interrupt it.
+
+<img src="screenshots/bigcurl.png" alt="bigcurl downloading six model shards in parallel" width="600">
+
+**Features:**
+- Adaptive parallelism and request sizing — climbs while throughput improves, backs off on errors
+- Resumable: bytes land in `<name>.part`, a sidecar records which blocks are done
+- Retries with exponential backoff, stall detection, and automatic re-resolution of expired signed CDN URLs
+- Falls back to a single stream when a server does not support ranges
+- Three output modes: silent, JSON-lines for scripts and agents, or a full-screen dashboard
+- Auth, proxies and TLS options pass straight through to curl (`-u`, `-H`, `-k`, `--curl '...'`)
+- Meaningful exit codes, documented in `--help`
+
+**Usage:**
+```bash
+# Just download something
+./cli/bigcurl https://host/ubuntu.iso
+
+# Several files into a directory, sharing one connection budget
+./cli/bigcurl -d ./models https://host/shard-1.safetensors https://host/shard-2.safetensors
+
+# Machine-readable progress for scripts and agents
+./cli/bigcurl -l -n 16 https://host/big.tar > progress.jsonl
+
+# Behind auth
+./cli/bigcurl -H 'Authorization: Bearer $TOKEN' https://host/private.bin
+```
+
+**Measured:** ahead of aria2c and axel in 11 of 12 cells of a netem sweep (+2% to +37%, behind in one), 14.9x curl at 250 ms RTT with 0.5% loss, within 5% of the best in every clean cell, 13.2x curl against a server capping each connection at 4 MB/s, and sitting on the cap of one that also limits connections per IP, 8-29% ahead of aria2c on real Starlink — and 0.66x curl on a one-core VPS already at 90% CPU, where a process per connection is the wrong shape. Packet loss, not latency, is what parallel connections fix. Full report and the harness that produced it: [`bench/bigcurl/`](bench/bigcurl/REPRODUCE.md).
+
 ## Tool Categories
 
 ### 📟 CLI Tools (`cli/`)
@@ -155,6 +187,9 @@ chmod +x ~/bin/toolname
 # Run a greeting tool
 ./cli/hello Alice
 
+# Download a big file in parallel chunks
+./cli/bigcurl https://host/big.iso
+
 # Get help for any tool
 ./macos/pomodoro --help
 ```
@@ -183,13 +218,17 @@ When adding new tools:
 
 ### CLI Tools
 
+- **`bigcurl`** - Parallel chunked downloader wrapping curl: adaptive connection count and request size, resumable via a block bitmap, retries with backoff, and silent/JSON-lines/full-screen output modes
+- **`bigcurl-test`** - Test suite for bigcurl, with a throwaway HTTP server that serves ranges, refuses them, demands auth, stalls, or drops connections mid-response
 - **`hello`** - Bash greeting tool with options for uppercase, timestamps, and custom names
 - **`hello-perl`** - Perl greeting tool demonstrating POD documentation and core module usage
 - **`gmail-sync`** - Gmail-to-SQLite sync with OAuth2 auth, FTS5 search, incremental sync, watch mode, selective attachment download, and self-documenting database schema *(exception: requires `uv` and Google API packages)*
+- **`gmail-sync-test`** - Test suite for gmail-sync's pure logic (dedup/attachment-grouping SQL, size/pattern-based attachment selection, MIME message parsing, `--since` and query-string parsing) against an in-memory SQLite fixture, with no network, credentials, or real mailbox
 - **`setup-mac`** - Idempotent macOS setup script: installs Homebrew, CLI tools, casks, App Store apps, configures shell/PATH, and sets up Tailscale SSH
 - **`touchid`** - Swift Touch ID authentication gate with custom reason strings and clean exit codes
 - **`apple-ai-api`** - OpenAI-compatible HTTP API server for Apple's on-device Foundation Models, with streaming, chat web UI, and API key auth
 - **`llm-chat`** - Terminal LLM chat client for any OpenAI-compatible API, with streaming, image support (Kitty/iTerm/Ghostty), readline editing, $EDITOR integration, slash commands, and contextual tips
+- **`llm-chat-test`** - Test suite for llm-chat's pure logic (provider preset resolution, config persistence, message/history construction, SSE streaming-chunk parsing, terminal capability detection, and arg parsing), with no network, API key, or real config/history files
 - **`apple-ai-api-test`** - Integration test suite for apple-ai-api (endpoints, auth, CORS, error handling)
 
 ### Web Tools
@@ -205,6 +244,10 @@ When adding new tools:
 - **`timezones`** - Menu bar multi-timezone display with 2x2 grid layout and customizable timezone list
 - **`token-counter`** - Menu bar LLM token counter with activity timeline and token flow charts, built-in OTLP receiver for Claude Code and Codex CLI telemetry
 - **`claude-usage`** - Menu bar Anthropic API rate limit monitor with progress bars, color-coded warnings, and optional usage/cost tracking via Admin API
+
+### Benchmarks
+
+- **`bench/bigcurl/`** - Benchmark harness for bigcurl: an nginx origin modelling five server behaviours, a `netem` lab for exact RTT/loss, a verifying measurement runner, and the raw CSVs behind the published results *(exception: a multi-file harness, not a onesie)*
 
 ### Userscripts
 
