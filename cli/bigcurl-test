@@ -1,0 +1,991 @@
+#!/bin/bash
+#
+# bigcurl-test - test suite for bigcurl.
+#
+# Spins up a throwaway HTTP server (written out at runtime, so this stays one
+# file) that can serve byte ranges, refuse them, demand auth, 404, run slowly
+# or randomly drop connections mid-response, then drives bigcurl against it.
+#
+# Usage: ./bigcurl-test [-v]
+#
+# Joe Walnes <joe@walnes.com>, 2026, MIT License
+# https://github.com/joewalnes/onesies
+
+set -uo pipefail
+
+VERBOSE=0
+[ "${1:-}" = "-v" ] && VERBOSE=1
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+BIGCURL="$HERE/bigcurl"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/bigcurl-test.XXXXXX")"
+SRV_PID=""
+PASS=0
+FAIL=0
+
+cleanup() {
+  [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+say()  { printf '%s\n' "$*"; }
+ok()   { PASS=$((PASS+1)); printf '  \033[32mok\033[0m   %s\n' "$1"; }
+bad()  { FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; [ -n "${2:-}" ] && printf '       %s\n' "$2"; }
+group(){ printf '\n\033[1m%s\033[0m\n' "$1"; }
+
+sha() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+# filemode <path>: octal permission bits (0666-family), independent of OS
+# stat(1) flag differences (macOS bsd stat vs GNU coreutils stat).
+filemode() { perl -e 'my @s = stat($ARGV[0]) or exit 1; printf "%04o\n", $s[2] & 07777' "$1"; }
+
+# ---------------------------------------------------------------------------
+# Test HTTP server
+# ---------------------------------------------------------------------------
+
+cat > "$TMP/server.pl" <<'SERVER_END'
+use strict;
+use warnings;
+use IO::Socket::INET;
+use MIME::Base64 qw(encode_base64);
+use Fcntl qw(:flock O_RDWR O_CREAT);
+
+my ($portfile, $root, $logfile) = @ARGV;
+$SIG{CHLD} = 'IGNORE';
+$SIG{PIPE} = 'IGNORE';
+
+my $srv = IO::Socket::INET->new(
+    LocalAddr => '127.0.0.1', LocalPort => 0,
+    Listen => 128, ReuseAddr => 1, Proto => 'tcp',
+) or die "listen: $!";
+open(my $pf, '>', $portfile) or die $!;
+print $pf $srv->sockport, "\n";
+close $pf;
+
+while (my $c = $srv->accept) {
+    my $pid = fork();
+    if (!defined $pid) { close $c; next }
+    if ($pid) { close $c; next }
+    close $srv;
+    eval { handle($c) };
+    close $c;
+    exit 0;
+}
+
+sub logreq {
+    open(my $lf, '>>', $logfile) or return;
+    print $lf "$_[0]\n";
+    close $lf;
+}
+
+# AIDEV-NOTE (test-flake): every connection is a forked child, so any counter
+# two of them might touch at once (busy's request tally, flaky's per-offset
+# drop tally below) needs real synchronization, not read-then-write - that
+# raced: concurrent children could read the same value, both decide from it,
+# and both write back n+1, silently losing an increment. flock() around the
+# whole read-modify-write makes each bump atomic across processes. Returns
+# the counter's value *before* this call's increment.
+sub counter_next {
+    my ($path) = @_;
+    sysopen(my $fh, $path, O_RDWR | O_CREAT, 0644) or return 0;
+    flock($fh, LOCK_EX);
+    seek($fh, 0, 0);
+    my $n = <$fh>;
+    $n = 0 unless defined $n && $n =~ /^\d+$/;
+    seek($fh, 0, 0);
+    truncate($fh, 0);
+    print $fh $n + 1;
+    close($fh);                # releases the lock
+    return $n;
+}
+
+sub simple {
+    my ($c, $code, $msg) = @_;
+    print $c "HTTP/1.1 $code $msg\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+}
+
+sub handle {
+    my ($c) = @_;
+    $c->autoflush(1);
+    my $req = '';
+    while (my $l = <$c>) { last if $l =~ /^\r?\n$/; $req .= $l }
+    return unless length $req;
+
+    my ($method, $path) = $req =~ m{^(\w+)\s+(\S+)};
+    return unless defined $path;
+    my ($rf, $rt);
+    if ($req =~ /^Range:\s*bytes=(\d*)-(\d*)/mi) { ($rf, $rt) = ($1, $2) }
+    my ($auth) = $req =~ /^Authorization:\s*(.+?)\r?$/mi;
+
+    my ($mode, $name) = $path =~ m{^/([^/]+)/(.+)$};
+    $mode = 'ok' unless defined $mode;
+    $name = '' unless defined $name;
+    $name =~ s{[^A-Za-z0-9._-]}{}g;
+    logreq(sprintf('%s %s range=%s', $method, $path,
+                   defined $rf ? "$rf-" . (defined $rt ? $rt : '') : 'none'));
+
+    if ($mode eq 'missing') { simple($c, 404, 'Not Found'); return }
+    # 'busy' 503s roughly the first third of requests, the way a server with a
+    # per-IP connection cap answers the connections over its limit.
+    # 'slowbusy' is the same refusal pattern layered on the 'slow' pacing
+    # below, so a test can see a hedge duplicate collide with a connection
+    # cap instead of reasoning about it from the two modes separately.
+    if ($mode eq 'busy' || $mode eq 'slowbusy') {
+        my $n = counter_next("$logfile.busy");
+        if ($n % 3 == 0) { simple($c, 503, 'Service Unavailable'); return }
+    }
+    # 'stagger' answers the first few connections (probe included) at full
+    # loopback speed and every connection after that - including any hedge
+    # duplicate, since a duplicate is just one more connection past the
+    # threshold - paced like 'slow' (~1MB/s). A fixture of same-size blocks
+    # all requested at once and all paced identically can never produce a
+    # straggler, because they all finish within the same instant of each
+    # other: there is nothing left mid-flight once the tail is short enough
+    # to hedge (proven below: run this exact case against 'slow' and hedging
+    # never fires at all). A fast head followed by a slow, lingering tail
+    # instead guarantees several genuine stragglers are still seconds from
+    # done at the moment the fast head's completions shrink the file to its
+    # hedgeable count - and because duplicates land past the threshold too,
+    # a formed pair does not resolve early and free a slot for a further,
+    # unbounded one - which is what a test proving $HEDGE_MAX actually caps
+    # *concurrent* duplicates (not just a lifetime total) needs (see the
+    # "hedging" group in this file).
+    my $stagger_slow = 0;
+    if ($mode eq 'stagger') {
+        $stagger_slow = (counter_next("$logfile.stagger") >= 4);
+    }
+    if ($mode eq 'auth') {
+        my $want = 'Basic ' . encode_base64('alice:secret', '');
+        unless (defined $auth && $auth eq $want) {
+            print $c "HTTP/1.1 401 Unauthorized\r\n"
+                   . "WWW-Authenticate: Basic realm=\"test\"\r\n"
+                   . "Content-Length: 0\r\nConnection: close\r\n\r\n";
+            return;
+        }
+    }
+
+    my $file = "$root/$name";
+    unless (-f $file) { simple($c, 404, 'Not Found'); return }
+    my $size = -s $file;
+    my $etag = '"' . $size . '-' . $name . '"';
+    my $lm   = 'Mon, 01 Jan 2024 00:00:00 GMT';
+    my $noranges    = ($mode eq 'norange' || $mode eq 'nohead');
+    # 'ignorerange' claims Accept-Ranges: bytes (unlike 'norange') but still
+    # answers every request, ranged or not, with a full 200 body - a server
+    # that lies about support instead of one that plainly lacks it.
+    my $ignorerange = ($mode eq 'ignorerange');
+
+    if ($method eq 'HEAD') {
+        if ($mode eq 'nohead') { simple($c, 405, 'Method Not Allowed'); return }
+        my $h = "HTTP/1.1 200 OK\r\nContent-Length: $size\r\n"
+              . "ETag: $etag\r\nLast-Modified: $lm\r\n";
+        $h .= "Accept-Ranges: bytes\r\n" unless $noranges;
+        print $c $h . "Connection: close\r\n\r\n";
+        return;
+    }
+
+    my ($from, $to, $partial) = (0, $size - 1, 0);
+    if (defined $rf && !$noranges && !$ignorerange) {
+        $from = ($rf eq '') ? 0 : $rf + 0;
+        $to   = (!defined $rt || $rt eq '') ? $size - 1 : $rt + 0;
+        $to   = $size - 1 if $to > $size - 1;
+        if ($from > $to || $from >= $size) { simple($c, 416, 'Range Not Satisfiable'); return }
+        $partial = 1;
+    }
+    my $len = $to - $from + 1;
+    my $h = $partial
+          ? "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes $from-$to/$size\r\n"
+          : "HTTP/1.1 200 OK\r\n";
+    $h .= "Content-Length: $len\r\nETag: $etag\r\nLast-Modified: $lm\r\n";
+    # Sent only on the actual data response, never on HEAD - a real server
+    # commonly does the same, and a HEAD-only prober never sees it.
+    $h .= "Content-Disposition: attachment; filename=\"cd-name.dat\"\r\n" if $mode eq 'cd';
+    $h .= "Accept-Ranges: bytes\r\n" unless $noranges;
+    print $c $h . "Connection: close\r\n\r\n";
+
+    open(my $fh, '<', $file) or return;
+    binmode $fh;
+    seek($fh, $from, 0);
+    # AIDEV-NOTE (test-flake, was the ~2min hang): a retried block re-requests
+    # the exact same byte range every time (confirmed by replaying this
+    # against unmodified bigcurl and watching access.log repeat one "from" a
+    # dozen times), so a *memoryless* per-connection coin flip here had no
+    # bound on how many times in a row one unlucky block could be dropped.
+    # bigcurl's own backoff is exponential up to 30s (by design, not ours to
+    # touch - see BACKOFF_MAX in cli/bigcurl), so a streak of ~7-8 losses on
+    # one block chains close to two minutes of waiting before it finally gets
+    # through; a streak that long was measured live (access.log showed the
+    # same range "1835008-1966079" answered and dropped repeatedly while
+    # bigcurl's own progress log crept from ts=70s to ts=91s still stuck on
+    # it). It always eventually recovered - MAX_RETRIES bounds it in
+    # principle - but "recovers eventually, sometimes after minutes" is
+    # exactly the hang this suite must never produce.
+    # Fix: cap it per starting offset instead of leaving it memoryless. Each
+    # distinct $from may be dropped at most FLAKY_DROP_CAP times, tracked via
+    # the same locked counter as 'busy' above (one file per offset, cleaned
+    # up with the rest of $TMP). This bounds any one block to at most
+    # FLAKY_DROP_CAP backoffs (1.5s at the default base/doubling) instead of
+    # an unbounded tail, while still guaranteeing at least one drop - and
+    # therefore a retry - happens for every block that reaches here, which a
+    # 40%-per-attempt coin could (and, per the "logs retry events" failure
+    # this test used to throw about 1 run in 10, sometimes did) miss
+    # entirely.
+    my $FLAKY_DROP_CAP = 2;
+    my $drop = -1;
+    if ($mode eq 'flaky') {
+        my $n = counter_next("$logfile.flaky.$from");
+        $drop = int($len / 2) if $n < $FLAKY_DROP_CAP;
+    }
+    # 'slowvolatile' answers the FIRST request for a given exact byte range
+    # (identified by "$from-$to", which is exactly what a hedge duplicate
+    # re-requests) with the real bytes, and every request after that for the
+    # SAME range with those bytes bit-flipped - same length, same status,
+    # same ETag, different content. This is the origin-changed-mid-flight
+    # case a hedge uniquely creates: without hedging, a byte range is only
+    # ever requested once (a retry replaces a dead attempt, it does not run
+    # concurrently with it), so no two live responses for the same bytes
+    # ever need to agree. Paced like 'slow' so there is time for a hedge
+    # duplicate - which by construction always arrives after the original
+    # (hedge_work only duplicates a block that has been in flight a while) -
+    # to be the request that gets flipped.
+    my $flip = 0;
+    if ($mode eq 'slowvolatile' && $partial) {
+        $flip = (counter_next("$logfile.volatile.$from-$to") >= 1);
+    }
+    my ($sent, $left) = (0, $len);
+    while ($left > 0) {
+        my $want = $left > 32768 ? 32768 : $left;
+        my $buf;
+        read($fh, $buf, $want) or last;
+        if ($drop >= 0 && $sent + length($buf) > $drop) {
+            my $n = $drop - $sent;
+            print $c substr($buf, 0, $n) if $n > 0;
+            return;                      # hang up mid-body
+        }
+        $buf ^= ("\xff" x length($buf)) if $flip;
+        print $c $buf;
+        $sent += length($buf);
+        $left -= length($buf);
+        select(undef, undef, undef, 0.03)
+            if $mode eq 'slow' || $mode eq 'slowbusy' || $mode eq 'slowvolatile' || $stagger_slow;
+    }
+    close $fh;
+}
+SERVER_END
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+mkdir -p "$TMP/data" "$TMP/out"
+perl -e '
+  my ($path, $n) = @ARGV;
+  open(my $fh, ">", $path) or die $!;
+  binmode $fh;
+  my $seed = 12345;
+  for my $i (0 .. $n/1024 - 1) {
+      my $s = "";
+      for (1 .. 1024) { $seed = ($seed * 1103515245 + 12345) % 2147483648; $s .= chr($seed % 256) }
+      print $fh $s;
+  }
+' "$TMP/data/big.bin" 4194304
+perl -e 'open(my $f, ">", $ARGV[0]); binmode $f; print $f "x" x 1048576' "$TMP/data/small.bin"
+perl -e 'open(my $f, ">", $ARGV[0]); binmode $f; print $f "y" x 8388608' "$TMP/data/slow.bin"
+# 24MB, paced by the 'slow'/'slowbusy' server modes at ~1 MB/s per connection
+# (see server.pl's `select(...,0.03)` per 32KB) - big enough that a 6MB block
+# takes several seconds per connection, comfortably past $HEDGE_MIN_SECS, so
+# hedging tests below don't race the server's own pacing.
+perl -e 'open(my $f, ">", $ARGV[0]); binmode $f; print $f "z" x 25165824' "$TMP/data/hedge.bin"
+# A second 1MB file, so a *batch* of files that each fit inside the full
+# prefetch probe can be exercised with two distinct output names.
+perl -e 'open(my $f, ">", $ARGV[0]); binmode $f; print $f "z" x 1048576' "$TMP/data/small2.bin"
+# Smaller than the lone-URL probe window, so a solo download of it must still
+# finish in exactly one HTTP request.
+perl -e 'open(my $f, ">", $ARGV[0]); binmode $f; print $f "t" x 4096' "$TMP/data/tiny.bin"
+: > "$TMP/data/empty.bin"
+
+BIG_SHA="$(sha "$TMP/data/big.bin")"
+SMALL_SHA="$(sha "$TMP/data/small.bin")"
+SLOW_SHA="$(sha "$TMP/data/slow.bin")"
+HEDGE_SHA="$(sha "$TMP/data/hedge.bin")"
+SMALL2_SHA="$(sha "$TMP/data/small2.bin")"
+TINY_SHA="$(sha "$TMP/data/tiny.bin")"
+
+perl "$TMP/server.pl" "$TMP/port" "$TMP/data" "$TMP/access.log" &
+SRV_PID=$!
+disown "$SRV_PID" 2>/dev/null || true
+for _ in $(seq 1 50); do
+  [ -s "$TMP/port" ] && break
+  perl -e 'select(undef,undef,undef,0.1)'
+done
+PORT="$(cat "$TMP/port" 2>/dev/null)"
+if [ -z "$PORT" ]; then say "could not start test server"; exit 1; fi
+BASE="http://127.0.0.1:$PORT"
+say "test server on port $PORT, workspace $TMP"
+
+run() {  # run bigcurl, capture stdout/stderr/exit
+  ( cd "$TMP/out" && "$BIGCURL" "$@" >"$TMP/stdout" 2>"$TMP/stderr" )
+  RC=$?
+  if [ "$VERBOSE" = "1" ]; then
+    printf '  $ bigcurl %s -> %d\n' "$*" "$RC"
+    sed 's/^/      /' "$TMP/stdout"
+    sed 's/^/      ! /' "$TMP/stderr"
+  fi
+  return $RC
+}
+
+# assert_download <label> <file-under-out> <want-sha> [want-rc=0]
+# Most tests boil down to "did the last run() produce the right exit code
+# and the right bytes" -- this is that check, shared instead of retyped.
+assert_download() {
+  local label="$1" file="$2" want="$3" want_rc="${4:-0}"
+  if [ "$RC" -eq "$want_rc" ] && [ "$(sha "$TMP/out/$file")" = "$want" ]; then
+    ok "$label"
+  else
+    bad "$label" "rc=$RC"
+  fi
+}
+
+# interrupt_slow_download: start a -B 128K -n 2 download of slow.bin, let it
+# run 1.5s, then SIGINT it. Leaves .part/.part.state behind and sets $RC to
+# bigcurl's exit code. Run bigcurl directly (no subshell) so $! is its own
+# pid and the signal actually reaches it.
+interrupt_slow_download() {
+  rm -rf "$TMP/out"/*
+  "$BIGCURL" -d "$TMP/out" -B 128K -n 2 "$BASE/slow/slow.bin" >"$TMP/stdout" 2>"$TMP/stderr" &
+  DL_PID=$!
+  perl -e 'select(undef,undef,undef,1.5)'
+  kill -INT "$DL_PID" 2>/dev/null
+  wait "$DL_PID"; RC=$?
+}
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+group "command line"
+
+run --help
+if [ $RC -eq 0 ] && grep -q "EXIT CODES" "$TMP/stdout" && grep -q "LOG FORMAT" "$TMP/stdout"; then
+  ok "--help documents exit codes and log format"
+else bad "--help documents exit codes and log format" "rc=$RC"; fi
+
+run --version
+if [ $RC -eq 0 ] && grep -qi "^bigcurl [0-9]" "$TMP/stdout"; then
+  ok "--version prints a version"
+else bad "--version prints a version" "rc=$RC"; fi
+
+run
+[ $RC -eq 2 ] && ok "no URLs exits 2" || bad "no URLs exits 2" "rc=$RC"
+
+run --nonsense "$BASE/ok/big.bin"
+[ $RC -eq 2 ] && ok "unknown flag exits 2" || bad "unknown flag exits 2" "rc=$RC"
+
+run ftp://example.com/x
+[ $RC -eq 2 ] && ok "non-http URL exits 2" || bad "non-http URL exits 2" "rc=$RC"
+
+run -o out.bin "$BASE/ok/big.bin" "$BASE/ok/small.bin"
+[ $RC -eq 2 ] && ok "-o with several URLs exits 2" || bad "-o with several URLs exits 2" "rc=$RC"
+
+group "basic download"
+
+rm -f "$TMP/out"/*
+: > "$TMP/access.log"
+run "$BASE/ok/big.bin"
+assert_download "downloads a file intact" "big.bin" "$BIG_SHA"
+
+[ ! -f "$TMP/out/big.bin.part" ] && [ ! -f "$TMP/out/big.bin.part.state" ] \
+  && ok "removes .part and .part.state on success" \
+  || bad "removes .part and .part.state on success"
+
+if [ "$(grep -c 'range=' "$TMP/access.log")" -gt 2 ]; then
+  ok "uses several range requests"
+else bad "uses several range requests" "$(grep -c 'range=' "$TMP/access.log") requests"; fi
+
+group "file mode parity (ASK 5 residual)"
+
+# AIDEV-NOTE: prepare_job() can place bytes into .part two ways - open() a
+# fresh file and copy the probe's bytes in (respects the ambient umask like
+# any newly-created file), or rename() the already-written probe-piece file
+# into place instead (avoids re-copying bytes curl already wrote to disk;
+# see the AIDEV-NOTE above the $reuse_want/$renamed block in prepare_job()).
+# rename() carries the SOURCE file's mode, not a freshly-computed one, so if
+# curl's -o ever created its output file with some mode other than the
+# ambient umask, a download that happens to fit inside one probe would
+# silently come out with different permissions than everything else -
+# forever, since nothing else in this suite checks metadata, only bytes.
+# Measured, not assumed: both curl -o and Perl's open() are ordinary POSIX
+# create-with-0666-masked-by-umask, on macOS and on Linux/ext4 (the actual
+# benchmark hosts) alike - confirmed by running both binaries under both
+# umasks below and diffing `stat` before writing this test. This asserts
+# that stays true under two different umasks, not just whichever one
+# happens to be ambient when the suite runs, and it is a forward-looking
+# invariant, not a caught bug: it passes against the pre-rename build too
+# (see the ASK5-residual commit message for that run).
+for UMASK in 022 077; do
+  rm -rf "$TMP/out"/*
+  EXPECT="$(perl -e 'printf "%04o\n", 0666 & ~oct($ARGV[0])' "$UMASK")"
+
+  ( cd "$TMP/out" && umask "$UMASK" && "$BIGCURL" -s "$BASE/ok/small.bin" "$BASE/ok/big.bin" )
+
+  SMALL_MODE="$(filemode "$TMP/out/small.bin")"
+  BIG_MODE="$(filemode "$TMP/out/big.bin")"
+
+  if [ "$SMALL_MODE" = "$EXPECT" ]; then
+    ok "umask $UMASK: probe-fast-path file (small.bin, whole file reused via rename) gets mode $EXPECT"
+  else bad "umask $UMASK: probe-fast-path file (small.bin) gets mode $EXPECT" "got $SMALL_MODE"; fi
+
+  if [ "$BIG_MODE" = "$EXPECT" ]; then
+    ok "umask $UMASK: worker-continued file (big.bin, partial reuse + fresh blocks) gets mode $EXPECT"
+  else bad "umask $UMASK: worker-continued file (big.bin) gets mode $EXPECT" "got $BIG_MODE"; fi
+
+  if [ "$SMALL_MODE" = "$BIG_MODE" ]; then
+    ok "umask $UMASK: rename path and open path agree on mode"
+  else bad "umask $UMASK: rename path and open path agree on mode" "small=$SMALL_MODE big=$BIG_MODE"; fi
+done
+rm -rf "$TMP/out"/*
+
+rm -f "$TMP/out"/*
+: > "$TMP/access.log"
+run -B 128K -n 8 "$BASE/ok/big.bin"
+NREQ="$(grep -c 'GET .* range=[0-9]' "$TMP/access.log")"
+if [ $RC -eq 0 ] && [ "$(sha "$TMP/out/big.bin")" = "$BIG_SHA" ] && [ "$NREQ" -ge 8 ]; then
+  ok "small blocks produce many parallel range requests ($NREQ)"
+else bad "small blocks produce many parallel range requests" "rc=$RC nreq=$NREQ"; fi
+
+rm -f "$TMP/out"/*
+run -n 1 "$BASE/ok/big.bin"
+assert_download "-n 1 downloads intact" "big.bin" "$BIG_SHA"
+
+rm -f "$TMP/out"/*
+run -o renamed.dat "$BASE/ok/small.bin"
+assert_download "-o chooses the output name" "renamed.dat" "$SMALL_SHA"
+
+rm -rf "$TMP/out"/*
+run -d nested/dir "$BASE/ok/small.bin"
+assert_download "-d creates the directory and writes into it" "nested/dir/small.bin" "$SMALL_SHA"
+
+# AIDEV-NOTE (probe-free start, ASK 5): this test server sends
+# Content-Disposition only on the data response (mode 'cd'), never on HEAD -
+# see server.pl above. Pre-change bigcurl asked HEAD first and, since HEAD
+# reported a real size, never made a second request to see this header, so
+# it named the file from the URL instead ("small.bin", wrong). The probe is
+# now that data response, so it sees the header on the very first request.
+rm -rf "$TMP/out"/*
+run "$BASE/cd/small.bin"
+assert_download "Content-Disposition on the probe response names the file" "cd-name.dat" "$SMALL_SHA"
+
+# AIDEV-NOTE (probe-free start, ASK 5): a 416 to our own from-byte-0 probe
+# request means "zero bytes available", not a client error - apply_probe()
+# used to have no reason to special-case this (a HEAD already knew the size
+# and the probe was only a last resort), so a bare 416 with no Content-Range
+# (this server's shape) was fatal. Confirmed still fatal on pre-change
+# bigcurl at the time this was written (rc=4, "could not reach server").
+rm -rf "$TMP/out"/*
+run "$BASE/ok/empty.bin"
+if [ $RC -eq 0 ] && [ -f "$TMP/out/empty.bin" ] && [ ! -s "$TMP/out/empty.bin" ]; then
+  ok "an empty file downloads as a zero-length file instead of failing"
+else bad "an empty file downloads as a zero-length file instead of failing" "rc=$RC"; fi
+
+group "disk errors"
+
+# AIDEV-NOTE: regression for the open() check bug fixed in prepare_job()
+# (see the AIDEV-NOTE above the $open_ok block there). The old guard tested
+# $fh's truthiness instead of open()'s own return value; open($fh, ...)
+# defines $fh as a side effect of binding the argument whether or not the
+# open succeeds, so `unless ($fh)` never caught a real failure. Verified
+# against the unfixed code (not asserted here, described for the record):
+# this exact case produced rc=1 with "seek failed: Bad file descriptor" -
+# the open failure surfaced later, misclassified, instead of a clean
+# "cannot open ...part: Permission denied" / rc=5. A read-only output
+# directory is a portable way to force open() to fail without root on
+# either Linux or macOS; root bypasses directory permission checks
+# entirely, so this case cannot be constructed running as root - skip
+# loudly rather than pass vacuously.
+if [ "$(id -u)" = "0" ]; then
+  say "  (skipped: running as root - a read-only directory does not stop root from creating files there, so this case can't be constructed)"
+else
+  rm -rf "$TMP/roout"; mkdir -p "$TMP/roout"; chmod 555 "$TMP/roout"
+  ( cd "$TMP/roout" && "$BIGCURL" -n 1 "$BASE/ok/small.bin" >"$TMP/stdout" 2>"$TMP/stderr" )
+  RC=$?
+  chmod 755 "$TMP/roout"
+  if [ "$RC" -eq 5 ] && grep -q 'cannot open .*\.part' "$TMP/stderr"; then
+    ok "a read-only output directory is reported cleanly as EX_DISK, not misclassified"
+  else
+    bad "a read-only output directory is reported cleanly as EX_DISK, not misclassified" "rc=$RC stderr=$(cat "$TMP/stderr" 2>/dev/null)"
+  fi
+  rm -rf "$TMP/roout"
+fi
+
+# maybe_complete()'s final rename($j->{part}, $j->{out}) is unconditional -
+# every completed job goes through it, reuse fast path or not. A destination
+# that already exists as a directory blocks it with EISDIR: a real, portable
+# (no root, no fault injection in the server) way to make that rename fail.
+rm -rf "$TMP/dirout"; mkdir -p "$TMP/dirout/small.bin"
+( cd "$TMP/dirout" && "$BIGCURL" "$BASE/ok/small.bin" >"$TMP/stdout" 2>"$TMP/stderr" )
+RC=$?
+if [ "$RC" -eq 5 ] && grep -q 'cannot rename' "$TMP/stderr"; then
+  ok "a destination that already exists as a directory fails the final rename as EX_DISK"
+else
+  bad "a destination that already exists as a directory fails the final rename as EX_DISK" "rc=$RC stderr=$(cat "$TMP/stderr" 2>/dev/null)"
+fi
+rm -rf "$TMP/dirout"
+
+# AIDEV-NOTE: regression for the tmpdir-collision fix (see the AIDEV-NOTE
+# above the mkdir retry loop in main()). $tmpdir used to be plain
+# "$TMPDIR/bigcurl.$$", so a stale directory surviving a killed prior run -
+# or a same-PID collision between two unrelated invocations, plausible in
+# low-PID containers - made mkdir() fail with EEXIST and the whole run die
+# as EX_DISK. Force the exact collision without root or fault injection:
+# `exec` replaces a process's image without forking, so a plain `sh -c`
+# script that mkdirs "bigcurl.$$" and then execs bigcurl guarantees bigcurl
+# sees that exact PID as its own $$ - no PID-guessing race. Deliberately
+# POSIX `sh`, not `$BASHPID` (bash 4+ only; macOS ships bash 3.2).
+rm -rf "$TMP/collide" "$TMP/collideout"; mkdir -p "$TMP/collide" "$TMP/collideout"
+sh -c '
+  cd "$2" &&
+  mkdir -p "$1/bigcurl.$$" &&
+  TMPDIR="$1" exec "$3" -n 1 "$4"
+' sh "$TMP/collide" "$TMP/collideout" "$BIGCURL" "$BASE/ok/small.bin" \
+  >"$TMP/stdout" 2>"$TMP/stderr"
+RC=$?
+LEFTOVER=$(find "$TMP/collide" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
+if [ "$RC" -eq 0 ] && [ -f "$TMP/collideout/small.bin" ] && [ "$LEFTOVER" -eq 1 ]; then
+  ok "a colliding stale bigcurl.\$\$ scratch directory does not abort the run"
+else
+  bad "a colliding stale bigcurl.\$\$ scratch directory does not abort the run" \
+      "rc=$RC leftover_dirs=$LEFTOVER stderr=$(cat "$TMP/stderr" 2>/dev/null)"
+fi
+rm -rf "$TMP/collide" "$TMP/collideout"
+
+# The retry-on-collision must not swallow a genuine disk error: an
+# unwritable TMPDIR has nothing to do with EEXIST and must still fail on
+# the first attempt, immediately and loudly, as EX_DISK.
+if [ "$(id -u)" = "0" ]; then
+  say "  (skipped: running as root - an unwritable TMPDIR does not stop root from creating directories there, so this case can't be constructed)"
+else
+  rm -rf "$TMP/rotmp"; mkdir -p "$TMP/rotmp"; chmod 555 "$TMP/rotmp"
+  TMPDIR="$TMP/rotmp" "$BIGCURL" -n 1 "$BASE/ok/small.bin" >"$TMP/stdout" 2>"$TMP/stderr"
+  RC=$?
+  chmod 755 "$TMP/rotmp"
+  if [ "$RC" -eq 5 ] && grep -q 'cannot create' "$TMP/stderr"; then
+    ok "an unwritable TMPDIR still fails cleanly as EX_DISK, not a retry loop"
+  else
+    bad "an unwritable TMPDIR still fails cleanly as EX_DISK, not a retry loop" "rc=$RC stderr=$(cat "$TMP/stderr" 2>/dev/null)"
+  fi
+  rm -rf "$TMP/rotmp"
+fi
+
+group "multiple URLs"
+
+rm -rf "$TMP/out"/*
+run "$BASE/ok/big.bin" "$BASE/ok/small.bin"
+if [ $RC -eq 0 ] \
+   && [ "$(sha "$TMP/out/big.bin")" = "$BIG_SHA" ] \
+   && [ "$(sha "$TMP/out/small.bin")" = "$SMALL_SHA" ]; then
+  ok "downloads two URLs in one run"
+else bad "downloads two URLs in one run" "rc=$RC"; fi
+
+rm -rf "$TMP/out"/*
+printf '%s\n# a comment\n\n%s\n' "$BASE/ok/big.bin" "$BASE/ok/small.bin" > "$TMP/urls.txt"
+run -i "$TMP/urls.txt"
+if [ $RC -eq 0 ] && [ -f "$TMP/out/big.bin" ] && [ -f "$TMP/out/small.bin" ]; then
+  ok "-i reads a URL list, ignoring blanks and comments"
+else bad "-i reads a URL list, ignoring blanks and comments" "rc=$RC"; fi
+
+rm -rf "$TMP/out"/*
+( cd "$TMP/out" && printf '%s\n' "$BASE/ok/small.bin" | "$BIGCURL" -i - >"$TMP/stdout" 2>"$TMP/stderr" )
+RC=$?
+if [ $RC -eq 0 ] && [ -f "$TMP/out/small.bin" ]; then
+  ok "-i - reads URLs from stdin"
+else bad "-i - reads URLs from stdin" "rc=$RC"; fi
+
+group "skip and force"
+
+rm -rf "$TMP/out"/*
+run "$BASE/ok/small.bin"
+: > "$TMP/access.log"
+run "$BASE/ok/small.bin"
+if [ $RC -eq 0 ] && grep -q '"event":"skip"' "$TMP/stdout"; then
+  ok "skips a file that is already complete"
+else bad "skips a file that is already complete" "rc=$RC"; fi
+
+run -f "$BASE/ok/small.bin"
+if [ $RC -eq 0 ] && grep -q '"event":"done"' "$TMP/stdout" \
+   && [ "$(sha "$TMP/out/small.bin")" = "$SMALL_SHA" ]; then
+  ok "-f re-downloads a complete file"
+else bad "-f re-downloads a complete file" "rc=$RC"; fi
+
+group "servers that do not cooperate"
+
+rm -rf "$TMP/out"/*
+run "$BASE/norange/big.bin"
+assert_download "falls back to a single stream when Range is unsupported" "big.bin" "$BIG_SHA"
+
+if grep -q '"ranges":false' "$TMP/stdout"; then
+  ok "reports ranges:false in the log for a non-range server"
+else bad "reports ranges:false in the log for a non-range server"; fi
+
+# AIDEV-NOTE (probe-free start, ASK 5): the probe used to be a HEAD (or a
+# 0-1 byte range fallback); it is now a real ranged GET, so it is itself
+# the first real chunk of the download for a server that can't or won't
+# do better. These cases exercise that directly instead of only through
+# byte-for-byte correctness, which a HEAD-based probe would also pass.
+
+rm -rf "$TMP/out"/*
+: > "$TMP/access.log"
+run "$BASE/norange/small.bin"
+assert_download "a non-range server small enough to fit the probe needs no second request" "small.bin" "$SMALL_SHA"
+NREQ="$(grep -c 'range=' "$TMP/access.log")"
+if [ "$NREQ" -eq 1 ]; then
+  ok "...and made exactly one HTTP request ($NREQ)"
+else bad "...and made exactly one HTTP request" "made $NREQ (pre-change bigcurl makes 2: HEAD then GET)"; fi
+
+rm -rf "$TMP/out"/*
+run --retries 3 "$BASE/ignorerange/slow.bin"
+assert_download "a server that claims Accept-Ranges but ignores Range still downloads correctly" "slow.bin" "$SLOW_SHA"
+
+rm -rf "$TMP/out"/*
+run "$BASE/nohead/big.bin"
+assert_download "recovers when HEAD is rejected with 405" "big.bin" "$BIG_SHA"
+
+group "probe sizing"
+
+# AIDEV-NOTE (probe sizing): these read the *first* line of a freshly-truncated
+# access.log, which is the probe: probe_all() completes before any worker is
+# spawned, so nothing else can have logged yet. The server logs the literal
+# Range header it saw ("range=0-8191"), so these assert the bytes actually
+# asked for on the wire, not an internal variable. An empty log fails the
+# comparison rather than passing vacuously; first_range() says so explicitly.
+first_range() {  # first logged Range header, or the word "none-logged"
+  if [ ! -s "$TMP/access.log" ]; then printf 'none-logged\n'; return; fi
+  head -1 "$TMP/access.log" | sed -n 's/.* range=//p'
+}
+
+rm -rf "$TMP/out"/*
+: > "$TMP/access.log"
+run "$BASE/ok/big.bin"
+FR="$(first_range)"
+if [ "$FR" = "0-8191" ]; then
+  ok "a lone URL probes one congestion window ($FR)"
+else bad "a lone URL probes one congestion window" "got range=$FR (pre-change bigcurl asks 0-1048575, a whole \$PROBE_RANGE serialized ahead of the pool)"; fi
+assert_download "...and the lone URL still downloads intact" "big.bin" "$BIG_SHA"
+
+# The case that must NOT trigger the lone-URL rule. Two URLs is the
+# many-files regime the full prefetch exists for, so both probes stay at
+# $PROBE_RANGE. This one passes against the pre-change build too, on purpose:
+# it guards against the new predicate over-triggering, not against the old bug.
+rm -rf "$TMP/out"/*
+: > "$TMP/access.log"
+run "$BASE/ok/small.bin" "$BASE/ok/small2.bin"
+NFULL="$(head -2 "$TMP/access.log" | grep -c 'range=0-1048575')"
+if [ "$NFULL" -eq 2 ]; then
+  ok "a batch of URLs keeps the full prefetch probe ($NFULL of 2)"
+else bad "a batch of URLs keeps the full prefetch probe" "only $NFULL of the first 2 probes asked for a full range; log head: $(head -2 "$TMP/access.log" | tr '\n' '|')"; fi
+
+# ASK 5's win, stated as an invariant: two files that each fit inside the
+# probe cost two HTTP requests in total, not four. Shrinking the batch probe
+# would break this.
+NREQ="$(grep -c 'range=' "$TMP/access.log")"
+if [ $RC -eq 0 ] && [ "$(sha "$TMP/out/small.bin")" = "$SMALL_SHA" ] \
+   && [ "$(sha "$TMP/out/small2.bin")" = "$SMALL2_SHA" ] && [ "$NREQ" -eq 2 ]; then
+  ok "...and a batch that fits the probe needs one request per file ($NREQ)"
+else bad "...and a batch that fits the probe needs one request per file" "rc=$RC nreq=$NREQ (expected 2)"; fi
+
+# The lone-URL probe is still a real prefetch: a file small enough to fit
+# inside it needs no second request, exactly as before.
+rm -rf "$TMP/out"/*
+: > "$TMP/access.log"
+run "$BASE/ok/tiny.bin"
+NREQ="$(grep -c 'range=' "$TMP/access.log")"
+if [ $RC -eq 0 ] && [ "$(sha "$TMP/out/tiny.bin")" = "$TINY_SHA" ] && [ "$NREQ" -eq 1 ]; then
+  ok "a lone file inside the probe window still needs exactly one request ($NREQ)"
+else bad "a lone file inside the probe window still needs exactly one request" "rc=$RC nreq=$NREQ (expected 1)"; fi
+
+# -B fixes the block size before any network I/O, so it still governs the
+# probe for a lone URL: the response is block 0 outright and must not be
+# shrunk to the size-discovery window.
+rm -rf "$TMP/out"/*
+: > "$TMP/access.log"
+run -B 128K "$BASE/ok/big.bin"
+FR="$(first_range)"
+if [ "$FR" = "0-131071" ]; then
+  ok "-B still fixes the probe size for a lone URL ($FR)"
+else bad "-B still fixes the probe size for a lone URL" "got range=$FR"; fi
+assert_download "...and -B on a lone URL downloads intact" "big.bin" "$BIG_SHA"
+
+group "http errors"
+
+rm -rf "$TMP/out"/*
+run "$BASE/missing/big.bin"
+if [ $RC -eq 4 ]; then
+  ok "404 exits 4"
+else bad "404 exits 4" "rc=$RC"; fi
+[ ! -f "$TMP/out/big.bin" ] && ok "404 leaves no output file" || bad "404 leaves no output file"
+
+rm -rf "$TMP/out"/*
+: > "$TMP/access.log.busy"
+run --retries 20 -B 128K "$BASE/busy/big.bin"
+assert_download "503 is transient: retried, not treated as fatal" "big.bin" "$BIG_SHA"
+
+group "authentication"
+
+rm -rf "$TMP/out"/*
+run "$BASE/auth/small.bin"
+[ $RC -eq 4 ] && ok "401 without credentials exits 4" || bad "401 without credentials exits 4" "rc=$RC"
+
+rm -rf "$TMP/out"/*
+run -u alice:secret "$BASE/auth/small.bin"
+assert_download "-u authenticates and downloads" "small.bin" "$SMALL_SHA"
+
+rm -rf "$TMP/out"/*
+run -u alice:wrong "$BASE/auth/small.bin"
+[ $RC -eq 4 ] && ok "wrong credentials exit 4" || bad "wrong credentials exit 4" "rc=$RC"
+
+group "robustness"
+
+rm -rf "$TMP/out"/*
+run --retries 20 -B 128K "$BASE/flaky/big.bin"
+assert_download "recovers from connections dropped mid-response" "big.bin" "$BIG_SHA"
+if grep -q '"event":"retry"' "$TMP/stdout"; then
+  ok "logs retry events when connections drop"
+else bad "logs retry events when connections drop"; fi
+
+group "hedging"
+
+# hedge.bin is 24MB, served through the 'slow' mode (~1 MB/s per connection -
+# see server.pl). -B 6M makes it 4 blocks; the probe (which also requests
+# exactly one block's worth, since -B fixes $BLOCK_SIZE) consumes block 0, so
+# pick_work only ever has 3 single-block workers to hand out. -n 8 leaves 5
+# slots nothing else can use, which is exactly the idle capacity hedging is
+# meant to spend. At ~1 MB/s a 6MB block has ~5s left after the 0.5s minimum
+# age hedge_work requires, comfortably clear of $HEDGE_MIN_SECS (2s), so this
+# does not race the server's own pacing.
+
+rm -rf "$TMP/out"/*
+: > "$TMP/access.log"
+run -B 6M -n 8 --hedge 4 "$BASE/slow/hedge.bin"
+DUPS=$(awk -F'range=' '/hedge\.bin/{print $2}' "$TMP/access.log" | sort | uniq -d | wc -l | tr -d ' ')
+if [ $RC -eq 0 ] && [ "$(sha "$TMP/out/hedge.bin")" = "$HEDGE_SHA" ] \
+   && ! grep -q '"event":"retry"' "$TMP/stdout" && [ "$DUPS" -ge 1 ]; then
+  ok "hedge duplicates a tail block onto a spare connection ($DUPS block(s))"
+else
+  bad "hedge duplicates a tail block onto a spare connection" \
+      "rc=$RC dup=$DUPS $(grep -c 'hedge\.bin' "$TMP/access.log") reqs"
+fi
+
+# Same setup, hedging switched off: the guard that gates hedge_work() on
+# $HEDGE_TAIL_BLOCKS > 0 must be shown not firing here, or the test above
+# proves nothing about the flag actually controlling anything.
+rm -rf "$TMP/out"/*
+: > "$TMP/access.log"
+run -B 6M -n 8 --hedge 0 "$BASE/slow/hedge.bin"
+DUPS0=$(awk -F'range=' '/hedge\.bin/{print $2}' "$TMP/access.log" | sort | uniq -d | wc -l | tr -d ' ')
+if [ $RC -eq 0 ] && [ "$(sha "$TMP/out/hedge.bin")" = "$HEDGE_SHA" ] && [ "$DUPS0" -eq 0 ]; then
+  ok "--hedge 0 disables hedging"
+else
+  bad "--hedge 0 disables hedging" "rc=$RC dup=$DUPS0"
+fi
+
+# 'slowbusy' layers the per-IP connection-cap 503s of 'busy' onto the same
+# pacing, so a hedge duplicate can actually collide with a metered origin
+# instead of that interaction only being argued from the code. What matters
+# here is that release_blocks() does not treat a refused hedge duplicate as
+# the block failing outright while its peer is still racing for the same
+# bytes - if it did, this would either corrupt the download or spuriously
+# fail it well before 20 retries are exhausted.
+rm -rf "$TMP/out"/*
+: > "$TMP/access.log"
+: > "$TMP/access.log.busy"
+run --retries 20 -B 6M -n 8 --hedge 4 "$BASE/slowbusy/hedge.bin"
+REQS=$(grep -c 'hedge\.bin' "$TMP/access.log")
+DUPSB=$(awk -F'range=' '/hedge\.bin/{print $2}' "$TMP/access.log" | sort | uniq -d | wc -l | tr -d ' ')
+if [ $RC -eq 0 ] && [ "$(sha "$TMP/out/hedge.bin")" = "$HEDGE_SHA" ] \
+   && [ "$REQS" -gt 4 ] && [ "$DUPSB" -ge 1 ]; then
+  ok "hedging survives a server that refuses excess connections ($REQS reqs, $DUPSB dup)"
+else
+  bad "hedging survives a server that refuses excess connections" "rc=$RC reqs=$REQS dup=$DUPSB"
+fi
+
+# $HEDGE_MAX bounds hedging even when far more candidates and idle slots
+# exist than it allows. -B 3M makes 8 blocks (7 after the probe takes block
+# 0) and -n 16 leaves the pool wide open, so without a cap every one of those
+# 7 could get a duplicate. This needs the 'stagger' server, not 'slow': with
+# every block the same size and paced identically, all 7 finish within the
+# same instant of each other and undone never sits at a hedgeable count
+# while anyone still has $HEDGE_MIN_SECS left to hedge against (proven by
+# running this exact case against 'slow' first: reqs stayed at 8, meaning
+# hedge_work() never found a single eligible candidate). 'stagger' answers
+# every other connection at full loopback speed, so the fast half finishes
+# almost immediately and drops undone to the hedgeable range while several
+# of the slow half are still seconds from done - genuine stragglers, several
+# of them at once. 8 requests (1 probe/block0 + 7 blocks) means no hedge
+# fired at all; anything above 10 (7 blocks + $HEDGE_MAX 2 duplicates) means
+# the cap did not hold.
+rm -rf "$TMP/out"/*
+: > "$TMP/access.log"
+run -B 3M -n 16 --hedge 4 "$BASE/stagger/hedge.bin"
+REQS4=$(grep -c 'hedge\.bin' "$TMP/access.log")
+if [ $RC -eq 0 ] && [ "$(sha "$TMP/out/hedge.bin")" = "$HEDGE_SHA" ] \
+   && [ "$REQS4" -gt 8 ] && [ "$REQS4" -le 10 ]; then
+  ok "hedge cap bounds duplicates well under a wide-open pool (n=16, reqs=$REQS4)"
+else
+  bad "hedge cap bounds duplicates well under a wide-open pool" "rc=$RC reqs=$REQS4"
+fi
+
+# A hedge duplicate carries no If-Range/ETag conditioning (curl_cmd() never
+# sends one, for any block request - see the AIDEV-NOTE by curl_cmd) and
+# nothing compares the two peers' bytes, so if the origin answers the second
+# request for an already-in-flight range with different content - a
+# redeploy, a CDN edge out of sync with another, a non-deterministic origin
+# - both peers are racing to stream into the very same offsets. This checks
+# for the failure mode that is specific to hedging (not to bigcurl's wider,
+# pre-existing "the origin does not change mid-run" assumption, which
+# applies whether or not any block is ever hedged and is not this ask's to
+# fix): two LIVE streams writing into the same bytes at once can interleave
+# sub-block, landing content that was never any single response bigcurl
+# actually received - worse than "picked the stale or the revised whole
+# block" because it corresponds to nothing the origin ever served, and
+# still has the right length and a complete bitmap. (Measured before
+# worker_read() buffered a hedge duplicate instead of writing it directly:
+# this exact case produced a whole-file sha matching neither version at
+# all - proof of exactly that interleaving, not just "picked a different
+# block version".) So the check here is per-block purity, not a whole-file
+# hash: -B 6M with $HEDGE_TAIL_BLOCKS undone from the start means every
+# block gets hedged and may independently land either version depending on
+# which peer of ITS pair won, and that per-block choice is unavoidable
+# without If-Range revalidation on every block request - in or out of a
+# hedge - which is out of scope here. What must never happen is a block
+# whose bytes are neither purely the original nor purely the revised
+# content throughout.
+rm -rf "$TMP/out"/*
+: > "$TMP/access.log"
+: > "$TMP/access.log.volatile"
+run -B 6M -n 8 --hedge 4 "$BASE/slowvolatile/hedge.bin"
+TORN=$(perl -e '
+  my ($path, $bs) = @ARGV;
+  open(my $f, "<", $path) or exit 2;
+  binmode $f;
+  my $torn = 0;
+  while (read($f, my $chunk, $bs)) {
+    my $flipped = $chunk;
+    $flipped ^= ("\xff" x length($flipped));
+    my $is_orig = ($chunk   =~ tr/z//) == length($chunk);
+    my $is_flip = ($flipped =~ tr/z//) == length($flipped);
+    $torn++ unless $is_orig || $is_flip;
+  }
+  print $torn;
+' "$TMP/out/hedge.bin" 6291456 2>/dev/null)
+if [ -z "$TORN" ] && [ $RC -ne 0 ]; then
+  ok "hedge into a changing origin fails closed instead of writing a torn block (rc=$RC)"
+elif [ "$TORN" = "0" ]; then
+  ok "hedge into a changing origin never tears a block across two responses"
+else
+  bad "hedge into a changing origin tears a block across two different responses" \
+      "rc=$RC torn_blocks=${TORN:-N/A}"
+fi
+
+group "resume"
+
+interrupt_slow_download
+if [ $RC -eq 6 ]; then
+  ok "interrupt exits 6"
+else bad "interrupt exits 6" "rc=$RC"; fi
+
+if [ -f "$TMP/out/slow.bin.part" ] && [ -f "$TMP/out/slow.bin.part.state" ]; then
+  ok "interrupt leaves .part and .part.state behind"
+else bad "interrupt leaves .part and .part.state behind"; fi
+
+DONE_BLOCKS="$(perl -ne 'if (/"bits":"([01]+)"/) { my $b = $1; print scalar($b =~ tr/1//) }' "$TMP/out/slow.bin.part.state" 2>/dev/null)"
+if [ -n "$DONE_BLOCKS" ] && [ "$DONE_BLOCKS" -gt 0 ]; then
+  ok "resume state records completed blocks ($DONE_BLOCKS)"
+else bad "resume state records completed blocks" "state: $(head -c 200 "$TMP/out/slow.bin.part.state" 2>/dev/null)"; fi
+
+BLOCK0_BIT="$(perl -ne 'if (/"bits":"([01]+)"/) { print substr($1, 0, 1) }' "$TMP/out/slow.bin.part.state" 2>/dev/null)"
+if [ "$BLOCK0_BIT" = "1" ]; then
+  ok "block 0 specifically is already complete before resuming"
+else bad "block 0 specifically is already complete before resuming" "bit='$BLOCK0_BIT' (test needs block 0 done first; rerun if flaky)"; fi
+
+# AIDEV-NOTE (probe-free start, ASK 5): probe_all() always re-fetches
+# probe_request_size() bytes from offset 0 for every job, resuming or not -
+# prepare_job() only *reuses* that payload (writes it into the file, marks
+# bits) when !$j->{resume}, precisely so this case - block 0 already on disk
+# from a previous run - is left to the trusted state file instead of being
+# raced or double-written by the fresh probe body. Tried removing that
+# guard by hand: the final bytes still came out correct, because the probe
+# always re-fetches from the same ETag-matched resource, so there is no
+# input this harness can serve that makes the guard's *absence* corrupt a
+# byte - only waste a request's worth of bandwidth re-fetching what resume
+# already had. Documented rather than asserted for that reason; the
+# assertions below instead cover the thing that actually can regress:
+# resume still working correctly now that the probe carries a body.
+run -B 128K "$BASE/ok/slow.bin"
+assert_download "resumes an interrupted download to a correct file" "slow.bin" "$SLOW_SHA"
+if grep -q '"resume":true' "$TMP/stdout"; then
+  ok "reports resume:true when picking up state"
+else bad "reports resume:true when picking up state"; fi
+
+interrupt_slow_download
+run -R -B 128K "$BASE/ok/slow.bin"
+if [ $RC -eq 0 ] && [ "$(sha "$TMP/out/slow.bin")" = "$SLOW_SHA" ] \
+   && grep -q '"resume":false' "$TMP/stdout"; then
+  ok "-R discards saved state and starts over"
+else bad "-R discards saved state and starts over" "rc=$RC"; fi
+
+interrupt_slow_download
+perl -i -pe 's/"etag":"[^"]*(?:\\.[^"]*)*"/"etag":"\\"stale\\""/' "$TMP/out/slow.bin.part.state"
+run -B 128K "$BASE/ok/slow.bin"
+if [ $RC -eq 0 ] && [ "$(sha "$TMP/out/slow.bin")" = "$SLOW_SHA" ] \
+   && grep -q '"resume":false' "$TMP/stdout"; then
+  ok "a changed ETag discards the saved state instead of resuming"
+else bad "a changed ETag discards the saved state instead of resuming" "rc=$RC"; fi
+
+group "output modes"
+
+rm -rf "$TMP/out"/*
+run -l "$BASE/ok/small.bin"
+LAST="$(tail -1 "$TMP/stdout")"
+if [ $RC -eq 0 ] && printf '%s' "$LAST" | grep -q '"event":"summary"' \
+   && printf '%s' "$LAST" | grep -q '"exit":0'; then
+  ok "-l ends with a summary object carrying the exit code"
+else bad "-l ends with a summary object carrying the exit code" "$LAST"; fi
+
+if perl -ne 'exit 1 unless /^\{.*\}$/; END { exit 0 }' "$TMP/stdout"; then
+  ok "-l emits one JSON object per line"
+else bad "-l emits one JSON object per line"; fi
+
+for ev in start progress done summary; do
+  grep -q "\"event\":\"$ev\"" "$TMP/stdout" \
+    && ok "-l emits a $ev event" \
+    || bad "-l emits a $ev event"
+done
+
+rm -rf "$TMP/out"/*
+run -s "$BASE/ok/small.bin"
+if [ $RC -eq 0 ] && [ ! -s "$TMP/stdout" ] && [ ! -s "$TMP/stderr" ]; then
+  ok "-s prints nothing on success"
+else bad "-s prints nothing on success" "rc=$RC out=$(wc -c <"$TMP/stdout")"; fi
+
+rm -rf "$TMP/out"/*
+run -s "$BASE/missing/small.bin"
+if [ $RC -eq 4 ] && [ ! -s "$TMP/stdout" ]; then
+  ok "-s stays quiet on stdout even when failing"
+else bad "-s stays quiet on stdout even when failing" "rc=$RC"; fi
+
+group "mixed outcomes"
+
+rm -rf "$TMP/out"/*
+run "$BASE/ok/small.bin" "$BASE/missing/nope.bin"
+if [ $RC -ne 0 ] && [ "$(sha "$TMP/out/small.bin")" = "$SMALL_SHA" ]; then
+  ok "one bad URL does not stop the others (rc=$RC)"
+else bad "one bad URL does not stop the others" "rc=$RC"; fi
+
+# ---------------------------------------------------------------------------
+
+printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+[ "$FAIL" -eq 0 ] || exit 1
+exit 0

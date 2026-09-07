@@ -1,0 +1,2805 @@
+#!/usr/bin/env perl
+#
+# bigcurl - download big files fast, in parallel chunks, resumably.
+#
+# Wraps curl. Each chunk is a separate `curl --range` process writing to a pipe;
+# bigcurl multiplexes those pipes in a single-process event loop and writes the
+# bytes straight into a sparse output file at the correct offset. curl does all
+# the HTTP/TLS/auth/redirect/proxy work; bigcurl does scheduling, resume,
+# retries, adaptive tuning and the display.
+#
+#   bigcurl https://host/big.iso
+#   bigcurl -d models https://host/shard-1.bin https://host/shard-2.bin
+#   bigcurl -l -n 16 -u user:pass https://host/private.tar
+#
+# Interrupted downloads resume automatically: bytes land in <name>.part and a
+# sidecar <name>.part.state records which blocks are complete.
+#
+# Joe Walnes <joe@walnes.com>, 2026, MIT License
+# https://github.com/joewalnes/onesies
+
+use strict;
+use warnings;
+
+our $VERSION = '1.0.0';
+
+# ---------------------------------------------------------------------------
+# Configuration
+#
+# AIDEV-NOTE: Every tunable lives in this block. Most are also CLI flags; the
+# values here are the defaults used when the flag is absent.
+# ---------------------------------------------------------------------------
+
+# Parallelism. Starts at CONNS_START and climbs while throughput improves.
+#
+# AIDEV-NOTE: 32 is deliberate and measured. Under packet loss per-connection
+# throughput varies wildly, so many connections each doing small requests beat
+# fewer connections doing big ones by ~2x (it is how aria2 wins with dynamic
+# 1MB pieces); on a clean high-RTT link 32 parallel slow-starts still grow the
+# aggregate window faster than one stream does. In the netem lab -n 32 won or
+# tied every cell, lossy and clean. The tuner shrinks the pool on 429/503 or a
+# high error rate, so a server that caps connections per IP is still handled.
+my $CONNS_START      = 32;        # connections opened at the start
+my $CONNS_MAX        = 64;        # never exceed this many concurrent curls
+my $CONNS_MIN        = 4;         # never drop below this (1 if file is tiny)
+my $CONNS_STEP       = 4;         # add/remove this many per tuning decision
+my $TUNE_INTERVAL    = 2.0;       # seconds between tuning decisions
+my $CONNS_STEP_DOWN  = 2;         # shrink more slowly than we grow
+my $TUNE_GAIN        = 1.03;      # speed must beat best by this to grow
+my $TUNE_LOSS        = 0.90;      # speed below best*this shrinks
+my $TUNE_DECAY       = 0.98;      # decay remembered best so we re-explore
+my $TUNE_ERR_RATE    = 0.30;      # retry fraction that means "too many connections"
+
+# Block sizing. Block size is the resume granularity and is fixed per file
+# (changing it would invalidate a saved bitmap). Requests are made larger
+# dynamically by coalescing adjacent blocks instead - see $COALESCE_MAX.
+my $BLOCK_SIZE       = 0;         # 0 = auto from file size (see block_size())
+my $COALESCE_MIN     = 1;         # min adjacent blocks fetched per curl
+my $COALESCE_MAX     = 32;        # max adjacent blocks fetched per curl
+my $REQ_TARGET_SECS  = 8;         # aim for this much transfer per request
+my $STEAL_MIN_SECS   = 3;         # only steal from a worker with at least this long left
+my $MIN_REQ          = 1 << 20;   # never issue a range request smaller than this
+
+# Hedging. Once a file is down to its last few blocks, an idle connection
+# (one pick_work and steal_work both had nothing else to give) may duplicate
+# a block already in flight; whichever copy lands first wins and the other is
+# killed. See the AIDEV-NOTE above hedge_work() for why this is bounded the
+# way it is - in short, it never grows the pool and never competes with
+# ordinary work for a slot, only spends genuinely idle ones.
+#
+# AIDEV-NOTE: Off by default (0) even though the mechanism works, because
+# the two regimes it was measured in point opposite ways and there is no
+# runtime signal yet to tell them apart. Measured, -n32 matched, sha256
+# verified, median of the -l trace's 90%-to-done tail:
+#   - Simulated packet loss (netem): +32% at rtt250ms/0.5% loss, +23% at
+#     rtt100ms/0.5% loss, +43% on a connection-capped origin (limit_conn 4)
+#     with loss layered on top - complete rank separation in all three
+#     (every hedged rep beat every unhedged rep), n=3 reps/arm each.
+#   - Starlink (this project's actual noisy real-world link, and the one
+#     ASKS.md item 3 names as the measurement to use): -31% (0.95s slower
+#     at the median, 4.01s vs 3.06s), direction consistent across every
+#     rep though the n=6-7/arm spreads overlap. A hedge duplicate on a
+#     fresh connection routes around an isolated straggler under netem's
+#     per-connection loss model; on a real, shared, bandwidth-capped link
+#     it just competes with the original for the same limited pipe.
+# Turn it on (--hedge N) where the link is known to be loss-limited rather
+# than bandwidth-contended. Flipping the default back to nonzero needs a
+# way to tell the two regimes apart at runtime, or a measurement that the
+# Starlink number was noise, neither of which exists yet - not a smaller
+# number here.
+my $HEDGE_TAIL_BLOCKS = 0;        # hedge only once a file has this few (or fewer)
+                                   # undone blocks left; 0 disables hedging entirely (default)
+my $HEDGE_MIN_SECS    = 2;        # like $STEAL_MIN_SECS but for hedging: don't bother
+                                   # duplicating a request that will finish sooner than this
+my $HEDGE_MAX         = 2;        # cap on concurrent hedge duplicates, so a server that
+                                   # meters connections per IP sees at worst this many extra
+my $HEDGE_MAX_BUF     = 64 << 20; # a hedge duplicate's bytes are buffered in memory until
+                                   # it either wins (see hedge_flush()) or loses, rather than
+                                   # written as they arrive - so its memory cost is one whole
+                                   # span, span*block_size, times up to $HEDGE_MAX at once.
+                                   # Block size is user-controlled (-B), so without this a
+                                   # large -B would make hedging allocate proportionally -
+                                   # this refuses to hedge any span bigger than 64MiB instead
+                                   # (128MiB worst case at the default $HEDGE_MAX of 2), which
+                                   # covers every block size this file has ever been measured
+                                   # with by a wide margin.
+
+# Reliability.
+my $MAX_RETRIES      = 5;         # attempts per block before the file fails
+my $STALL_SECS       = 30;        # kill+retry a connection idle this long
+my $CONNECT_TIMEOUT  = 15;        # curl --connect-timeout
+my $BACKOFF_BASE     = 0.5;       # first retry delay, doubles each attempt
+my $BACKOFF_MAX      = 30;        # cap on retry delay
+my $PROBE_CONNS      = 16;        # concurrent probe/first-block requests while sizing files
+my $PROBE_RANGE      = 1 << 20;   # bytes requested by the probe when -B isn't given and more
+                                   # than one URL was asked for - a whole file this size or
+                                   # smaller needs no further request at all
+my $PROBE_RANGE_SOLO = 8 << 10;   # ...but for a single URL, only this much: one initial TCP
+                                   # congestion window (10 x 1448B on Linux and macOS), so the
+                                   # probe body costs no extra round trip over a bare HEAD
+my $PROBE_MAX        = 4 << 20;   # give up on the probe body past this many bytes - a server
+                                   # that ignores Range would otherwise hand us the whole file
+
+# Output.
+my $READ_CHUNK       = 1 << 20;   # bytes read from a curl pipe per wakeup
+my $PIPE_SIZE        = 1 << 20;   # Linux: grow each curl pipe to this (F_SETPIPE_SZ)
+my $SMALL_READ       = 256 << 10; # a read shorter than this means the pipe is trickling...
+my $HOLD_BIG         = 0.020;     # ...so leave it alone this long if the pipe is large
+my $HOLD_SMALL       = 0.004;     # ...or this long if it is a default 64KB pipe
+my $LOG_INTERVAL     = 1.0;       # seconds between progress lines in log mode
+my $FRAME_INTERVAL   = 0.1;       # pretty-mode redraw interval (10fps)
+my $SAMPLE_INTERVAL  = 0.5;       # seconds per speed-history sample
+my $HISTORY_MAX      = 400;       # speed samples kept for the sparkline
+my $SPEED_EMA        = 0.25;      # smoothing factor for displayed speed
+my $STATE_INTERVAL   = 2.0;       # seconds between resume-state saves
+
+# Exit codes. Also documented in --help so scripts and agents can rely on them.
+my $EX_OK            = 0;         # everything downloaded
+my $EX_FAIL          = 1;         # one or more downloads failed (mixed causes)
+my $EX_USAGE         = 2;         # bad command line
+my $EX_NETWORK       = 3;         # retries exhausted / transport failure
+my $EX_HTTP          = 4;         # HTTP 4xx: auth required, forbidden, missing
+my $EX_DISK          = 5;         # could not create or write the output file
+my $EX_INTERRUPT     = 6;         # SIGINT/SIGTERM; state saved, resumable
+my $EX_NOCURL        = 7;         # curl not found on PATH
+
+# AIDEV-NOTE: EINTR is 4 on Linux, macOS and the BSDs. Hardcoded so the script
+# needs no modules at all (Errno is absent from stripped perl installs such as
+# Debian's perl-base).
+my $EINTR = 4;
+
+# ---------------------------------------------------------------------------
+# Portability shims - no non-pragma modules are used anywhere in this file.
+# ---------------------------------------------------------------------------
+
+sub cpu_count {
+    my $n = 0;
+    if (open(my $fh, '<', '/proc/cpuinfo')) {
+        while (<$fh>) { $n++ if /^processor\s*:/ }
+        close $fh;
+    }
+    if (!$n) {
+        my $out = `sysctl -n hw.ncpu 2>/dev/null`;
+        $n = $1 if defined $out && $out =~ /^\s*(\d+)/;
+    }
+    return $n || 4;
+}
+
+my $HIRES = eval { require Time::HiRes; 1 } ? 1 : 0;
+sub now { return $HIRES ? Time::HiRes::time() : time(); }
+
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
+
+sub fmt_bytes {
+    my ($n) = @_;
+    return '?' unless defined $n && $n >= 0;
+    my @u = ('B', 'KB', 'MB', 'GB', 'TB', 'PB');
+    my $i = 0;
+    my $v = $n + 0;
+    while ($v >= 1024 && $i < $#u) { $v /= 1024; $i++ }
+    return sprintf('%d %s', $v, $u[$i]) if $i == 0;
+    return sprintf('%.1f %s', $v, $u[$i]);
+}
+
+sub fmt_rate {
+    my ($n) = @_;
+    return '--' unless defined $n && $n > 0;
+    return fmt_bytes($n) . '/s';
+}
+
+sub fmt_dur {
+    my ($s) = @_;
+    return '--:--' unless defined $s && $s >= 0 && $s < 360000;
+    $s = int($s);
+    my $h = int($s / 3600);
+    my $m = int(($s % 3600) / 60);
+    my $x = $s % 60;
+    return sprintf('%d:%02d:%02d', $h, $m, $x) if $h;
+    return sprintf('%02d:%02d', $m, $x);
+}
+
+sub parse_size {
+    my ($s) = @_;
+    return undef unless defined $s && $s =~ /^\s*([0-9]*\.?[0-9]+)\s*([kmgtKMGT]?)[bB]?\s*$/;
+    my ($n, $u) = ($1, lc($2 || ''));
+    my %mul = ('' => 1, k => 1024, m => 1024**2, g => 1024**3, t => 1024**4);
+    return int($n * $mul{$u});
+}
+
+# Split a string into argv the way a shell would, honouring quotes.
+sub shell_split {
+    my ($s) = @_;
+    my @out;
+    return @out unless defined $s;
+    while ($s =~ /\G\s*(?:'([^']*)'|"((?:[^"\\]|\\.)*)"|([^\s'"]+))/gc) {
+        my $tok = defined $1 ? $1 : defined $2 ? do { my $t = $2; $t =~ s/\\(.)/$1/g; $t } : $3;
+        push @out, $tok;
+    }
+    return @out;
+}
+
+# ---------------------------------------------------------------------------
+# Usage
+#
+# AIDEV-NOTE: --help is the machine-readable contract too. Agents and scripts
+# are expected to read the EXIT CODES and LOG FORMAT sections from here, so
+# keep them accurate whenever behaviour changes.
+# ---------------------------------------------------------------------------
+
+sub usage {
+    my ($fh) = @_;
+    print $fh <<"HELPTEXT";
+bigcurl $VERSION - download big files fast, in parallel chunks, resumably.
+
+USAGE
+  bigcurl [options] URL...
+  bigcurl [options] -i urls.txt
+  cat urls.txt | bigcurl [options] -i -
+
+Splits each file into blocks and fetches them with several concurrent curl
+processes using HTTP range requests, tuning the number of connections to
+whatever the network is actually doing. Interrupted downloads resume where
+they left off. Works with http and https.
+
+OPTIONS
+  -o FILE          write to FILE (only valid with a single URL)
+  -d DIR           write into DIR (default: current directory)
+  -i FILE          read URLs from FILE, one per line ('-' for stdin)
+  -n N             max parallel connections (default: adaptive, up to $CONNS_MAX)
+  -B SIZE          block size, e.g. 4M (default: chosen from the file size)
+  -f               re-download even if the output file is already complete
+  -R               restart: discard any saved resume state
+  -s               silent: no output at all, just the exit code
+  -l               log: one JSON object per line on stdout (default: no TTY)
+  -p               pretty: full-screen dashboard (default: on a TTY)
+  --retries N      attempts per block before giving up (default: $MAX_RETRIES)
+  --stall SECS     kill and retry a connection idle this long (default: $STALL_SECS)
+  --hedge N        duplicate an in-flight block onto a spare connection once this
+                    few (or fewer) remain, keeping whichever lands first (default:
+                    $HEDGE_TAIL_BLOCKS; 0 disables)
+  -h, --help       this help
+  -V, --version    print version
+
+AUTHENTICATION AND TRANSPORT (passed straight through to curl)
+  -u USER:PASS     HTTP auth; the scheme (basic, digest, ntlm, negotiate) is
+                   negotiated automatically via curl --anyauth
+  -H 'K: V'        add a header, repeatable (e.g. -H 'Authorization: Bearer ...')
+  -k               allow insecure TLS certificates
+  -A UA            user agent          -e URL      referer
+  -b COOKIE        cookie              --netrc     read credentials from ~/.netrc
+  --compressed     accept compressed transfer encodings
+  --proxy URL      proxy               --cacert FILE / --cert FILE / --key FILE
+  --curl 'ARGS'    any other curl arguments, verbatim, repeatable
+
+EXAMPLES
+  bigcurl https://host/ubuntu.iso
+  bigcurl -d ./models https://host/shard-1.bin https://host/shard-2.bin
+  bigcurl -H 'Authorization: Bearer \$TOKEN' https://host/private.bin
+  bigcurl -u alice:secret https://host/protected.tar
+  bigcurl -l -n 16 https://host/big.tar > progress.jsonl
+  bigcurl --curl '--proxy socks5://localhost:1080' https://host/big.bin
+
+EXIT CODES
+  $EX_OK  all files downloaded successfully
+  $EX_FAIL  one or more downloads failed (mixed or unclassified causes)
+  $EX_USAGE  usage error (bad flags or no URLs)
+  $EX_NETWORK  transport failure, retries exhausted
+  $EX_HTTP  HTTP 4xx - authentication required, forbidden or not found
+  $EX_DISK  could not create or write the output file
+  $EX_INTERRUPT  interrupted; partial data and resume state were saved
+  $EX_NOCURL  curl was not found on PATH
+
+LOG FORMAT (-l)
+  One JSON object per line on stdout, with "event" one of:
+    start    file url size blocks block_size resume         a file began
+    progress file done size pct speed conns eta             every ${LOG_INTERVAL}s
+    retry    file block attempt reason backoff              a block is retried
+    skip     file reason                                    already complete
+    done     file bytes seconds speed                       a file finished
+    error    file message http                              a file failed
+    summary  files ok failed skipped bytes seconds exit      last line, always
+  Fields are stable; new fields may be added. Errors also go to stderr.
+
+FILES
+  <output>.part          partial data, renamed into place when complete
+  <output>.part.state    resume state; removed on success
+HELPTEXT
+}
+
+# ---------------------------------------------------------------------------
+# Command line
+# ---------------------------------------------------------------------------
+
+my (@urls, $opt_out, $opt_dir, $opt_input, $opt_conns, $opt_block);
+my ($opt_force, $opt_restart, $opt_mode);
+my @curl_extra;
+
+sub die_usage {
+    my ($msg) = @_;
+    print STDERR "bigcurl: $msg\n";
+    print STDERR "Try 'bigcurl --help' for usage.\n";
+    exit $EX_USAGE;
+}
+
+sub parse_args {
+    my @argv = @_;
+    my $only_urls = 0;
+    while (@argv) {
+        my $a = shift @argv;
+        if ($only_urls || $a !~ /^-./) { push @urls, $a; next }
+        my $need = sub {
+            die_usage("option $a requires a value") unless @argv;
+            return shift @argv;
+        };
+        if    ($a eq '--')            { $only_urls = 1 }
+        elsif ($a eq '-h' || $a eq '--help')    { usage(\*STDOUT); exit $EX_OK }
+        elsif ($a eq '-V' || $a eq '--version') { print "bigcurl $VERSION\n"; exit $EX_OK }
+        elsif ($a eq '-o' || $a eq '--output')  { $opt_out   = $need->() }
+        elsif ($a eq '-d' || $a eq '--dir')     { $opt_dir   = $need->() }
+        elsif ($a eq '-i' || $a eq '--input')   { $opt_input = $need->() }
+        elsif ($a eq '-n')            { $opt_conns = $need->() }
+        elsif ($a eq '-B')            { $opt_block = $need->() }
+        elsif ($a eq '-f' || $a eq '--force')   { $opt_force = 1 }
+        elsif ($a eq '-R' || $a eq '--restart') { $opt_restart = 1 }
+        elsif ($a eq '-s' || $a eq '--silent')  { $opt_mode = 'silent' }
+        elsif ($a eq '-l' || $a eq '--log')     { $opt_mode = 'log' }
+        elsif ($a eq '-p' || $a eq '--pretty')  { $opt_mode = 'pretty' }
+        elsif ($a eq '--retries')     { $MAX_RETRIES = $need->() }
+        elsif ($a eq '--stall')       { $STALL_SECS  = $need->() }
+        elsif ($a eq '--hedge')       { $HEDGE_TAIL_BLOCKS = $need->() }
+        elsif ($a eq '--curl')        { push @curl_extra, shell_split($need->()) }
+        # curl passthrough: flags that take a value
+        elsif ($a eq '-u' || $a eq '--user')   { push @curl_extra, '--anyauth', '-u', $need->() }
+        elsif ($a eq '-H' || $a eq '--header') { push @curl_extra, '-H', $need->() }
+        elsif ($a eq '-A' || $a eq '--user-agent') { push @curl_extra, '-A', $need->() }
+        elsif ($a eq '-e' || $a eq '--referer')    { push @curl_extra, '-e', $need->() }
+        elsif ($a eq '-b' || $a eq '--cookie')     { push @curl_extra, '-b', $need->() }
+        elsif ($a eq '--proxy'  || $a eq '--cacert' ||
+               $a eq '--cert'   || $a eq '--key'   ||
+               $a eq '--capath' || $a eq '--interface') { push @curl_extra, $a, $need->() }
+        # curl passthrough: boolean flags
+        elsif ($a eq '-k' || $a eq '--insecure') { push @curl_extra, '-k' }
+        elsif ($a eq '--netrc' || $a eq '--compressed' || $a eq '--http2' ||
+               $a eq '--http1.1' || $a eq '--ipv4' || $a eq '--ipv6') { push @curl_extra, $a }
+        elsif ($a =~ /^--(retries|stall|hedge)=(.*)$/) {
+            if    ($1 eq 'retries') { $MAX_RETRIES = $2 }
+            elsif ($1 eq 'stall')   { $STALL_SECS  = $2 }
+            else                    { $HEDGE_TAIL_BLOCKS = $2 }
+        }
+        elsif ($a =~ /^-([a-zA-Z]{2,})$/ && $a !~ /^--/) {
+            # bundled short flags, e.g. -fkp
+            unshift @argv, map { "-$_" } split //, $1;
+        }
+        else { die_usage("unknown option '$a'") }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Global state
+# ---------------------------------------------------------------------------
+
+my @jobs;                  # one hash per file to download, in priority order
+my @workers;               # live curl subprocesses
+my @reaping;               # retired workers whose curl has not been waited for yet
+my $worker_seq = 0;
+my $tmpdir;
+my $mode        = 'pretty';
+my $interrupted = 0;
+my $conns_limit = $CONNS_START;
+my $t_start     = 0;
+my @history;               # speed samples for the sparkline
+my $peak_speed  = 0;
+my $speed_ema   = 0;
+my $retry_count = 0;
+my $tune_bytes  = 0;
+my $tune_time   = 0;
+my $tune_best   = 0;
+my $tune_errors = 0;
+my $tune_reqs   = 0;
+my $tune_throttled = 0;
+my $tune_down_streak = 0;
+my $tune_up_streak   = 0;
+my $throttle_ceiling = 0;  # pool size a 429/503 told us not to exceed (0 = none)
+my $hedge_pairs  = 0;       # hedge duplicates currently racing a peer, capped at $HEDGE_MAX
+my $req_rate    = 0;       # bytes/s of the most recent completed request
+my $pretty_on   = 0;       # alternate screen is currently active
+my $term_w      = 80;
+my $term_h      = 24;
+my $use_color   = 0;
+
+$SIG{PIPE} = 'IGNORE';
+$SIG{INT}  = sub { $interrupted = 1 };
+$SIG{TERM} = sub { $interrupted = 1 };
+$SIG{WINCH} = sub { term_size() } if exists $SIG{WINCH};
+
+sub term_size {
+    my $out = '';
+    if (-t STDOUT || -t STDERR) {
+        $out = `stty size 2>/dev/null </dev/tty` || '';
+    }
+    if ($out =~ /^\s*(\d+)\s+(\d+)/) { ($term_h, $term_w) = ($1, $2) }
+    else {
+        $term_h = $ENV{LINES}   || 24;
+        $term_w = $ENV{COLUMNS} || 80;
+    }
+    $term_w = 40  if $term_w < 40;
+    $term_h = 10  if $term_h < 10;
+}
+
+# ---------------------------------------------------------------------------
+# Colour
+# ---------------------------------------------------------------------------
+
+# 256-colour ramp used for the speed gauge and sparkline: deep blue through
+# cyan and green into amber. Index 0 is slowest, last is fastest.
+my @RAMP = (25, 26, 32, 38, 44, 50, 49, 48, 47, 46, 82, 118, 154, 190, 220, 214);
+
+sub c   { my ($n) = @_; return $use_color ? "\e[38;5;${n}m" : '' }
+sub bold{ return $use_color ? "\e[1m" : '' }
+sub rst { return $use_color ? "\e[0m" : '' }
+sub ramp {
+    my ($t) = @_;
+    $t = 0 if !defined $t || $t < 0;
+    $t = 1 if $t > 1;
+    return c($RAMP[int($t * $#RAMP + 0.5)]);
+}
+
+my $C_DIM   = 240;
+my $C_GRAY  = 244;
+my $C_TEXT  = 252;
+my $C_HEAD  = 45;
+my $C_OK    = 42;
+my $C_WARN  = 220;
+my $C_ERR   = 203;
+my $C_LIVE  = 51;
+
+# ---------------------------------------------------------------------------
+# curl command construction
+# ---------------------------------------------------------------------------
+
+my $CURL = 'curl';
+
+sub have_curl {
+    for my $dir (split /:/, ($ENV{PATH} || '')) {
+        return 1 if -x "$dir/curl";
+    }
+    return 0;
+}
+
+# AIDEV-NOTE: Block requests go to the URL the probe landed on after
+# redirects, not the original. Re-following a redirect on every block costs a
+# round trip and a TLS handshake each time, which on hosts like Hugging Face
+# (which bounce you to a signed CDN URL) made bigcurl slower than plain curl.
+# The signed URL can expire mid-download, so a 401/403 on a block triggers
+# refresh_url() and a retry rather than an immediate failure. -L stays on so a
+# host that keeps redirecting still works.
+sub curl_cmd {
+    my ($job, $start, $end, $hdrfile) = @_;
+    my @cmd = (
+        $CURL,
+        '-sS',                          # no progress meter, but do report errors
+        '-L',                           # follow redirects
+        '--fail',                       # no error-page bytes in our output file
+        '--retry', '0',                 # retries are our job, not curl's
+        '--connect-timeout', $CONNECT_TIMEOUT,
+        '-D', $hdrfile,
+    );
+    push @cmd, '--range', "$start-$end" if defined $start;
+    push @cmd, @curl_extra;
+    push @cmd, '--', ($job->{eurl} || $job->{url});
+    return @cmd;
+}
+
+# Re-resolve the redirect chain, e.g. after a signed CDN URL has expired.
+sub refresh_url {
+    my ($j) = @_;
+    my $hdr = "$tmpdir/refresh.$j->{idx}";
+    my @cmd = ($CURL, '-sS', '-L', '-I', '--connect-timeout', $CONNECT_TIMEOUT,
+               '-D', $hdr, '-o', '/dev/null', '-w', '%{url_effective}',
+               @curl_extra, '--', $j->{url});
+    my $fh;
+    my $pid = open($fh, '-|');
+    return unless defined $pid;
+    if ($pid == 0) {
+        open(STDERR, '>', '/dev/null');
+        open(STDIN, '<', '/dev/null');
+        exec { $cmd[0] } @cmd;
+        exit 127;
+    }
+    local $/;
+    my $out = <$fh>;
+    close $fh;
+    return unless defined $out;
+    $out =~ s/\s+//g;
+    $j->{eurl} = $out if $out =~ m{^https?://\S+$};
+}
+
+# ---------------------------------------------------------------------------
+# Header parsing
+# ---------------------------------------------------------------------------
+
+# Returns a hashref of the *last* response's headers (i.e. after redirects),
+# with lowercased keys, plus a 'status' key.
+sub parse_headers {
+    my ($path) = @_;
+    open(my $fh, '<', $path) or return {};
+    local $/;
+    my $raw = <$fh>;
+    close $fh;
+    return {} unless defined $raw && length $raw;
+    $raw =~ s/\r//g;
+    my @blocks = grep { /\S/ } split /\n\n/, $raw;
+    return {} unless @blocks;
+    my %h;
+    for my $line (split /\n/, $blocks[-1]) {
+        if ($line =~ m{^HTTP/[\d.]+\s+(\d+)}) { $h{status} = $1 + 0; next }
+        if ($line =~ /^([^:]+):\s*(.*)$/)     { $h{lc $1} = $2 }
+    }
+    return \%h;
+}
+
+sub slurp {
+    my ($path) = @_;
+    open(my $fh, '<', $path) or return '';
+    local $/;
+    my $s = <$fh>;
+    close $fh;
+    $s = '' unless defined $s;
+    $s =~ s/\s+$//;
+    return $s;
+}
+
+# ---------------------------------------------------------------------------
+# Output naming
+# ---------------------------------------------------------------------------
+
+sub url_basename {
+    my ($url) = @_;
+    my $p = $url;
+    $p =~ s/#.*$//;
+    $p =~ s/\?.*$//;
+    $p =~ s{^[a-zA-Z][a-zA-Z0-9+.-]*://}{};
+    $p =~ s{^[^/]*}{};                 # strip host
+    $p =~ s{/+$}{};
+    my ($name) = $p =~ m{([^/]+)$};
+    $name = '' unless defined $name;
+    $name =~ s/%([0-9a-fA-F]{2})/chr(hex($1))/ge;
+    $name =~ s{[/\\]}{_}g;
+    $name = 'download' if $name eq '' || $name eq '.' || $name eq '..';
+    return $name;
+}
+
+sub disposition_name {
+    my ($h) = @_;
+    my $cd = $h->{'content-disposition'} or return undef;
+    my $n;
+    if    ($cd =~ /filename\*\s*=\s*[^']*'[^']*'([^;]+)/i) { $n = $1 }
+    elsif ($cd =~ /filename\s*=\s*"([^"]+)"/i)             { $n = $1 }
+    elsif ($cd =~ /filename\s*=\s*([^;]+)/i)               { $n = $1 }
+    return undef unless defined $n;
+    $n =~ s/^\s+|\s+$//g;
+    $n =~ s/%([0-9a-fA-F]{2})/chr(hex($1))/ge;
+    $n =~ s{[/\\]}{_}g;
+    return $n eq '' ? undef : $n;
+}
+
+# ---------------------------------------------------------------------------
+# Block sizing
+#
+# AIDEV-NOTE: Block size is the resume granularity and is frozen for the life
+# of a .part file - changing it would invalidate the saved bitmap. Requests are
+# made *larger* at runtime by coalescing adjacent blocks (see pick_work), which
+# adapts to fast links without touching the bitmap.
+# ---------------------------------------------------------------------------
+
+sub block_size {
+    my ($size) = @_;
+    return $BLOCK_SIZE if $BLOCK_SIZE;
+    # AIDEV-NOTE: Smaller than you might expect, on purpose. The block is the
+    # unit the tail of a download is paid in: with 40 slow connections on
+    # Starlink a 1MB block took ~8s each, so the last 20% of a run was spent
+    # draining. Early requests are still large because pick_work coalesces
+    # adjacent blocks from the measured per-connection rate; only the tail
+    # shrinks to single blocks.
+    return 256 << 10 if $size < 100  * (1 << 20);  # <100MB  -> 256KB
+    return 1 << 20   if $size < (1 << 30);         # <1GB    -> 1MB
+    return 2 << 20   if $size < 10 * (1 << 30);    # <10GB   -> 2MB
+    return 4 << 20;                                # >=10GB  -> 4MB
+}
+
+# ---------------------------------------------------------------------------
+# Probing: find out how big each file is and whether ranges work.
+#
+# AIDEV-NOTE: There is no separate sizing pass any more. The probe *is* a
+# ranged GET for the first probe_request_size() bytes: size comes from
+# Content-Range (or Content-Length), ETag/Accept-Ranges from the same
+# response, and the body we already paid to transfer becomes block 0 in
+# prepare_job() instead of being thrown away. Old HEAD-then-fallback code
+# paid up to two round trips before the first payload byte moved; this pays
+# exactly one, always. A server that ignores Range answers 200 with the
+# whole file; --max-filesize bounds how much of that we swallow before
+# giving up and falling back to an ordinary single-stream download, which is
+# exactly what happens today for any server that doesn't support Range.
+# ---------------------------------------------------------------------------
+
+my $probe_seq = 0;
+my $PROBE_BATCH = 25;      # URLs per curl process when probing, reusing the connection
+
+# AIDEV-NOTE: -B fixes the block size before any network I/O happens, so the
+# probe can request exactly that many bytes and the response becomes block 0
+# outright. Without -B we don't know the eventual block size yet (block_size()
+# depends on the total size, which is what we're probing for), so the size of
+# the probe is chosen from the one other thing known before any request goes
+# out: how many URLs were asked for. probe_all() has the whole list and passes
+# its length down, so the decision is made once per run, not per batch.
+#
+# MANY URLS ($PROBE_RANGE, 1MB). This is the many-small-files case the prefetch
+# exists for: the probe response *is* the complete file and no second request
+# is needed. For a bigger file prepare_job() credits the probed bytes as
+# leading blocks; if the file's block size turns out bigger than $PROBE_RANGE -
+# true above 1GB, see block_size() - that probe body goes unreused and its
+# bytes are fetched again as part of block 0. That's genuine double-fetched
+# bandwidth, bounded at $PROBE_RANGE per file and negligible next to files
+# that size.
+#
+# ONE URL ($PROBE_RANGE_SOLO, 8KB). The bandwidth argument above is sound and
+# is not the whole cost. The probe runs *before* the connection pool, on one
+# connection, so its body is serialized latency on the critical path, and at
+# high RTT that is paid in TCP slow start, not in bandwidth: an idle
+# connection delivers ~14.5KB in the first round trip and doubles per RTT
+# after, so a 1MB body costs ~7 round trips where a bare HEAD cost 1. Measured
+# on the netem lab at 250ms RTT / 0% loss on a 32MB file, that showed up as
+# +1.5s wall clock and -23.6% throughput against the pre-probe-free build.
+# With one URL there is no batch of small files to amortize a prefetch over
+# and nothing else running to hide it behind, so the probe asks only for what
+# it needs to learn the size - and 8KB fits inside that first congestion
+# window, making the body free relative to a HEAD while still finishing a
+# genuinely small lone file in a single request.
+#
+# The threshold is exactly one URL because that is the shape where the probe
+# is the entire critical path, and it is the shape both regressed benchmark
+# arms use (bigcurl-auto and bigcurl-8 each fetch one file). A batch of large
+# files still pays the full prefetch; see the "did not do" note in the branch
+# commit for why that was left alone rather than guessed at.
+#
+# MEASURED, netem lab, 250ms RTT / 0% loss / 200mbit, three builds interleaved
+# rep-by-rep, 3 reps, every row sha256-verified (bench/bigcurl/probe-size-lab.
+# csv, harness alongside it). old=da87807 pre-probe-free, tip=ae9f6f3, new=this:
+#   32MB  bigcurl-auto  old 6.60  tip 5.03  new 6.60 MB/s   (tip -23.7% vs old)
+#   32MB  bigcurl-8     old 4.14  tip 3.46  new 4.13 MB/s   (tip -16.4% vs old)
+#   512KB bigcurl-auto  old 2.32  tip 1.80  new 2.32 s      (tip -22.7% vs new)
+# The regression is gone: new lands on old to within 0.1%, and tip's and new's
+# distributions do not overlap in either 32MB arm.
+#
+# THE COST, measured rather than argued: a LONE file bigger than
+# $PROBE_RANGE_SOLO but smaller than $PROBE_RANGE - roughly 8KB..1MB - no
+# longer arrives complete inside the probe and needs a second request, worth
+# +0.52s at 250ms RTT on a 512KB file. That is not a regression against the
+# original build (old and new are identical there, 2.32s both); it hands back
+# a win ASK 5 had added for that narrow band in exchange for removing the
+# regression ASK 5 had added for the single large file, which is what this
+# tool is for. Do not "fix" the 512KB case by raising $PROBE_RANGE_SOLO
+# without re-running both cells: the 32MB recovery is bought precisely by the
+# probe body fitting in the first congestion window.
+sub probe_request_size {
+    my ($nurls) = @_;
+    return $BLOCK_SIZE if $BLOCK_SIZE;
+    return $PROBE_RANGE_SOLO if defined $nurls && $nurls == 1;
+    return $PROBE_RANGE;
+}
+
+# Where a job's probe lands: header dump and body-so-far, named by index so a
+# batch and its one-by-one fallback never collide.
+sub probe_files {
+    my ($j) = @_;
+    $j->{probe_hdr}   = "$tmpdir/probe.$j->{idx}.head";
+    $j->{probe_piece} = "$tmpdir/probe.$j->{idx}.piece";
+    return $j;
+}
+
+# AIDEV-NOTE: URLs are still batched into one curl process via --next,
+# reusing the connection: a directory of 200 small files used to cost 200
+# processes before the first byte moved - slower than a shell loop - and
+# that is just as true of a process per ranged-GET probe. Each --next segment
+# gets its own -D header file and -o body file, which every curl version
+# supports (unlike -w's %header{}, which is why the old HEAD-batching code
+# needed a curl-too-old fallback and this one does not).
+sub run_probe_batch {
+    my ($jobs, $len) = @_;
+    $len = probe_request_size(scalar @$jobs) unless defined $len;
+    return run_probe_each($jobs, $len) if @$jobs < 2;
+    my $cap = $len > $PROBE_MAX ? $len : $PROBE_MAX;
+    my @queue = @$jobs;
+    my %live;
+    my @fallback;
+    while ((@queue || %live) && !$interrupted) {
+        while (@queue && scalar(keys %live) < $PROBE_CONNS) {
+            my @batch = splice(@queue, 0, $PROBE_BATCH);
+            my $outf  = "$tmpdir/pb." . $probe_seq++;
+            my @cmd   = ($CURL);
+            for my $i (0 .. $#batch) {
+                push @cmd, '--next' if $i;
+                my $j = probe_files($batch[$i]);
+                push @cmd, '-sS', '-L', '--connect-timeout', $CONNECT_TIMEOUT,
+                           '--range', "0-" . ($len - 1), '--max-filesize', $cap,
+                           '-D', $j->{probe_hdr}, '-o', $j->{probe_piece},
+                           '-w', "%{url_effective}\n", @curl_extra, $j->{url};
+            }
+            my $pid = fork();
+            if (!defined $pid) { push @fallback, @batch; next }
+            if ($pid == 0) {
+                open(STDOUT, '>', $outf);
+                open(STDERR, '>', "$outf.err");
+                open(STDIN, '<', '/dev/null');
+                exec { $cmd[0] } @cmd;
+                exit 127;
+            }
+            $live{$pid} = { jobs => \@batch, out => $outf };
+        }
+        last unless %live;
+        my $pid = waitpid(-1, 0);
+        last if $pid <= 0;
+        my $rec = delete $live{$pid} or next;
+        my @lines;
+        if (open(my $fh, '<', $rec->{out})) { @lines = <$fh>; close $fh }
+        my $i = 0;
+        for my $j (@{ $rec->{jobs} }) {
+            my $eurl = $lines[$i];
+            my $h    = parse_headers($j->{probe_hdr});
+            if (!defined $h->{status}) {
+                # No HTTP response at all (DNS/connect/timeout): retry this
+                # one alone, where a real curl exit code and stderr exist.
+                push @fallback, $j;
+            } else {
+                $eurl =~ s/\s+$// if defined $eurl;
+                $j->{probe_eurl} = $eurl;
+                $j->{probe_len}  = $len;
+                $j->{probe_got}  = -s $j->{probe_piece} || 0;
+            }
+        } continue { $i++ }
+    }
+    run_probe_each(\@fallback, $len) if @fallback && !$interrupted;
+}
+
+# One curl process per URL: used directly for a single job, and as the
+# fallback for anything a batch couldn't get a response for.
+sub run_probe_each {
+    my ($jobs, $len) = @_;
+    $len = probe_request_size(scalar @$jobs) unless defined $len;
+    my $cap = $len > $PROBE_MAX ? $len : $PROBE_MAX;
+    my @queue = @$jobs;
+    my %live;
+    while ((@queue || %live) && !$interrupted) {
+        while (@queue && scalar(keys %live) < $PROBE_CONNS) {
+            my $j   = shift @queue;
+            probe_files($j);
+            my $err = "$j->{probe_hdr}.err";
+            my @cmd = ($CURL, '-sS', '-L', '--connect-timeout', $CONNECT_TIMEOUT,
+                       '--range', "0-" . ($len - 1), '--max-filesize', $cap,
+                       '-D', $j->{probe_hdr}, '-o', $j->{probe_piece},
+                       '-w', '%{url_effective}', @curl_extra, '--', $j->{url});
+            my $pid = fork();
+            if (!defined $pid) { $j->{probe_msg} = 'fork failed'; next }
+            if ($pid == 0) {
+                open(STDOUT, '>', "$j->{probe_hdr}.url");
+                open(STDERR, '>', $err);
+                open(STDIN, '<', '/dev/null');
+                exec { $cmd[0] } @cmd;
+                exit 127;
+            }
+            $live{$pid} = { job => $j, err => $err };
+        }
+        last unless %live;
+        my $pid = waitpid(-1, 0);
+        last if $pid <= 0;
+        my $rec = delete $live{$pid} or next;
+        my $j = $rec->{job};
+        my $code = $? >> 8;
+        $j->{probe_msg} = slurp($rec->{err}) || "curl exit $code" if $code;
+        $j->{probe_eurl} = slurp("$j->{probe_hdr}.url");
+        $j->{probe_len}  = $len;
+        $j->{probe_got}  = -s $j->{probe_piece} || 0;
+    }
+}
+
+sub apply_probe {
+    my ($j) = @_;
+    my $h = parse_headers($j->{probe_hdr} || '');
+
+    unless (defined $h->{status}) {
+        # No HTTP response at all: DNS failure, refused connection, timeout.
+        $j->{probe_msg} ||= 'could not reach server';
+        return 0;
+    }
+
+    # AIDEV-NOTE: We always probe from byte 0, so a 416 here almost always
+    # means "this resource has zero bytes", not a client error - an empty
+    # file has no satisfiable range starting anywhere, let alone at 0. RFC
+    # 7233 asks a server to answer 416 with Content-Range: bytes */<size>;
+    # trust that size if present (it also covers the pathological case of a
+    # nonzero-size resource that genuinely rejects byte 0 for some other
+    # reason), otherwise assume empty, which single-stream/size-0 handles
+    # fine in prepare_job(). Pre-existing behaviour, before this file had a
+    # real GET to work with, was to treat 416 as fatal HTTP failure here -
+    # wrong for the empty-file case, and simply unreachable code for any
+    # other case since a HEAD already knew the size and never needed to ask.
+    if ($h->{status} == 416) {
+        my $size = 0;
+        $size = $1 + 0 if defined $h->{'content-range'} && $h->{'content-range'} =~ m{\*/(\d+)};
+        my $eurl = $j->{probe_eurl} || '';
+        $eurl =~ s/\s+//g;
+        $j->{eurl}    = $eurl if $eurl =~ m{^https?://\S+$};
+        $j->{size}    = $size;
+        $j->{ranges}  = 0;
+        $j->{etag}    = $h->{etag} || '';
+        $j->{lastmod} = $h->{'last-modified'} || '';
+        $j->{dispo}   = disposition_name($h);
+        return 1;
+    }
+
+    # AIDEV-NOTE: The probe is a real ranged GET now, so its status is as
+    # authoritative as any block fetch's: 206 proves ranges work, 200 proves
+    # the server ignored our Range header (whether or not the body got cut
+    # short by --max-filesize - see run_probe_batch/run_probe_each), and any
+    # other 4xx/5xx is a real error. There is no HEAD-only leniency to carry
+    # forward, because there is no HEAD any more.
+    my $fatal = $h->{status} >= 400 && $h->{status} < 500;
+    if ($fatal) {
+        $j->{status} = 'failed';
+        $j->{http}   = $h->{status};
+        $j->{err}    = "HTTP $h->{status}";
+        $j->{err}   .= ' (authentication required)' if $h->{status} == 401;
+        $j->{err}   .= ' (forbidden)'               if $h->{status} == 403;
+        $j->{err}   .= ' (not found)'               if $h->{status} == 404;
+        return 0;
+    }
+    return 0 if $h->{status} >= 400;
+
+    my $size   = -1;
+    my $ranges = 0;
+    if ($h->{status} == 206) {
+        $ranges = 1;
+        $size = $1 + 0 if defined $h->{'content-range'} && $h->{'content-range'} =~ m{/(\d+)};
+    } elsif (defined $h->{'content-length'} && $h->{'content-length'} =~ /^(\d+)$/) {
+        # Status 200 to a request that carried a Range header: the server
+        # ignored it and this is the whole file, truncated or not.
+        $size = $1 + 0;
+    }
+    $ranges = 0 if $size <= 0;
+
+    my $eurl = $j->{probe_eurl} || '';
+    $eurl =~ s/\s+//g;
+    $j->{eurl}    = $eurl if $eurl =~ m{^https?://\S+$};
+    $j->{size}    = $size;
+    $j->{ranges}  = $ranges;
+    $j->{etag}    = $h->{etag} || '';
+    $j->{lastmod} = $h->{'last-modified'} || '';
+    $j->{dispo}   = disposition_name($h);
+    return 1;
+}
+
+sub probe_all {
+    my @todo = grep { $_->{status} eq 'new' } @jobs;
+    return unless @todo;
+    # AIDEV-NOTE: sized once, from the whole run's URL count, and passed down
+    # so a batch's one-by-one fallback and the 5xx retry below use the same
+    # probe length as the first attempt rather than re-deciding from the size
+    # of whatever subset they happen to be retrying.
+    my $len = probe_request_size(scalar @todo);
+    run_probe_batch(\@todo, $len);
+    my @again;
+    for my $j (@todo) {
+        next if $j->{status} eq 'failed';
+        next if apply_probe($j);
+        # A transient 5xx during probing deserves one more attempt.
+        my $h = parse_headers($j->{probe_hdr} || '');
+        if (defined $h->{status} && $h->{status} >= 500) {
+            push @again, $j;
+        } else {
+            $j->{status} = 'failed';
+            $j->{err} = $j->{probe_msg} || 'could not reach server';
+        }
+    }
+    if (@again && !$interrupted) {
+        select(undef, undef, undef, 1.0);
+        run_probe_batch(\@again, $len);
+        for my $j (@again) {
+            next if $j->{status} eq 'failed';
+            next if apply_probe($j);
+            $j->{status} = 'failed';
+            $j->{err} = $j->{probe_msg} || 'could not reach server';
+        }
+    }
+    for my $j (@jobs) {
+        next unless $j->{status} eq 'new';
+        $j->{size}   = -1 unless defined $j->{size};
+        $j->{ranges} = 0  unless defined $j->{ranges};
+        $j->{status} = 'ready';
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Minimal JSON encoding (no modules; we only ever emit flat objects)
+# ---------------------------------------------------------------------------
+
+sub json_str {
+    my ($s) = @_;
+    $s = '' unless defined $s;
+    $s =~ s/([\\"])/\\$1/g;
+    $s =~ s/\n/\\n/g;
+    $s =~ s/\r/\\r/g;
+    $s =~ s/\t/\\t/g;
+    $s =~ s/([\x00-\x1f])/sprintf('\\u%04x', ord($1))/ge;
+    return '"' . $s . '"';
+}
+
+# AIDEV-NOTE: Types are explicit, never guessed. A bare scalar is a JSON
+# string; wrap numbers in num() and literals like true/false in raw(). Guessing
+# from the value used to emit the block bitmap ("1110000...") as a number.
+sub num {
+    my ($v) = @_;
+    return \'0' unless defined $v && $v =~ /^-?\d+(?:\.\d+)?$/;
+    return \"$v";
+}
+sub raw { my ($v) = @_; return \"$v" }
+
+sub json_obj {
+    my (@kv) = @_;
+    my @out;
+    while (@kv) {
+        my $k = shift @kv;
+        my $v = shift @kv;
+        next unless defined $v;
+        push @out, json_str($k) . ':' . (ref($v) eq 'SCALAR' ? ${$v} : json_str($v));
+    }
+    return '{' . join(',', @out) . '}';
+}
+
+# ---------------------------------------------------------------------------
+# Resume state
+#
+# <output>.part holds the bytes (sparse, preallocated to the full size) and
+# <output>.part.state records which blocks are complete plus enough identity
+# (size, etag, last-modified, block size) to prove the remote file has not
+# changed underneath us.
+# ---------------------------------------------------------------------------
+
+sub state_save {
+    my ($j) = @_;
+    return unless $j->{statef} && !$j->{single};
+    my $tmp = $j->{statef} . '.tmp';
+    open(my $fh, '>', $tmp) or return;
+    print $fh json_obj(
+        v       => num(1),
+        url     => $j->{url},
+        size    => num($j->{size}),
+        etag    => $j->{etag},
+        lastmod => $j->{lastmod},
+        bs      => num($j->{bs}),
+        bits    => $j->{bits},
+    ), "\n";
+    close $fh;
+    rename($tmp, $j->{statef});
+}
+
+sub state_load {
+    my ($j) = @_;
+    return undef unless -f $j->{statef};
+    my $raw = slurp($j->{statef});
+    return undef unless $raw =~ /^\s*\{/;
+    my %s;
+    while ($raw =~ /"([a-z]+)"\s*:\s*(?:"((?:[^"\\]|\\.)*)"|(-?\d+))/g) {
+        # AIDEV-NOTE: grab the key before the unescaping s/// runs - it clobbers
+        # $1 and would otherwise file the value under the wrong name.
+        my ($k, $quoted, $v) = ($1, $2, defined $2 ? $2 : $3);
+        $v =~ s/\\(.)/$1/g if defined $quoted;
+        $s{$k} = $v;
+    }
+    return undef unless ($s{v} || 0) == 1;
+    return \%s;
+}
+
+sub state_clear {
+    my ($j) = @_;
+    unlink $j->{statef} if $j->{statef};
+}
+
+# ---------------------------------------------------------------------------
+# Preparing a job for download
+# ---------------------------------------------------------------------------
+
+# Copy $len bytes already fetched by probe_all() (see probe_files() /
+# apply_probe()) into $j's just-opened filehandle at offset $off. Used only
+# for a fresh, non-resuming start - see the AIDEV-NOTE in prepare_job().
+sub reuse_probe_bytes {
+    my ($j, $off, $len) = @_;
+    return 0 unless $len > 0 && $j->{probe_piece} && open(my $pf, '<', $j->{probe_piece});
+    binmode $pf;
+    local $/;
+    my $buf = <$pf>;
+    close $pf;
+    return 0 unless defined $buf && length($buf) >= $len;
+    return 0 unless defined sysseek($j->{fh}, $off, 0);
+    my $written = 0;
+    while ($written < $len) {
+        my $k = syswrite($j->{fh}, $buf, $len - $written, $written);
+        return 0 unless defined $k;
+        $written += $k;
+    }
+    return 1;
+}
+
+sub prepare_job {
+    my ($j) = @_;
+
+    # Where does it land?
+    if (defined $opt_out) {
+        $j->{out} = $opt_out;
+    } else {
+        my $name = $j->{dispo} || url_basename($j->{url});
+        $j->{out} = defined $opt_dir ? "$opt_dir/$name" : $name;
+    }
+    $j->{name}   = $j->{out};
+    $j->{name}   =~ s{^.*/}{};
+    $j->{part}   = $j->{out} . '.part';
+    $j->{statef} = $j->{part} . '.state';
+
+    # Already there and complete?
+    if (-f $j->{out} && !$opt_force) {
+        my $have = -s $j->{out};
+        if ($j->{size} < 0 || $have == $j->{size}) {
+            $j->{status} = 'skipped';
+            $j->{reason} = 'already complete';
+            return 1;
+        }
+    }
+
+    if (defined $opt_dir && !-d $opt_dir) {
+        my $path = '';
+        for my $part (split m{/}, $opt_dir) {
+            $path .= (length $path ? '/' : '') . $part;
+            next if $path eq '' || -d $path;
+            mkdir $path;
+        }
+        unless (-d $opt_dir) {
+            $j->{status} = 'failed';
+            $j->{disk}   = 1;
+            $j->{err}    = "cannot create directory $opt_dir";
+            return 0;
+        }
+    }
+
+    $j->{single} = ($j->{ranges} && $j->{size} > 0) ? 0 : 1;
+
+    if ($j->{single}) {
+        # No range support (or unknown size): one stream, no resume.
+        unlink $j->{part};
+        state_clear($j);
+        $j->{bs}       = 0;
+        $j->{nblocks}  = 1;
+        $j->{bits}     = '0';
+        $j->{done}     = 0;
+    } else {
+        $j->{bs}      = $opt_block ? $opt_block : block_size($j->{size});
+        $j->{nblocks} = int(($j->{size} + $j->{bs} - 1) / $j->{bs});
+        my $st = $opt_restart ? undef : state_load($j);
+        my $ok = 0;
+        if ($st && -f $j->{part}) {
+            $ok = 1;
+            $ok = 0 if ($st->{size} || -1) != $j->{size};
+            $ok = 0 if ($st->{bs}   || 0)  != $j->{bs};
+            $ok = 0 if length($j->{etag})    && ($st->{etag}    || '') ne $j->{etag};
+            $ok = 0 if length($j->{lastmod}) && ($st->{lastmod} || '') ne $j->{lastmod};
+            $ok = 0 if !defined $st->{bits} || length($st->{bits}) != $j->{nblocks};
+            $ok = 0 if $st->{bits} && $st->{bits} =~ /[^01]/;
+        }
+        if ($ok) {
+            $j->{bits}   = $st->{bits};
+            $j->{resume} = 1;
+        } else {
+            unlink $j->{part};
+            state_clear($j);
+            $j->{bits} = '0' x $j->{nblocks};
+        }
+        $j->{done} = ($j->{bits} =~ tr/1//) * $j->{bs};
+        $j->{done} = $j->{size} if $j->{done} > $j->{size};
+    }
+
+    # AIDEV-NOTE: When a fresh (non-resuming) job's probe already covers
+    # everything this job needs - the whole file for a single-stream job, or
+    # a whole number of leading blocks for a ranged one - $j->{probe_piece}
+    # already holds exactly those bytes, written by curl's own -o. The naive
+    # way to get them into .part is to truncate a fresh .part to size and
+    # then have reuse_probe_bytes() read the piece back off disk and write it
+    # in again: one spurious read plus one spurious write of every reused
+    # byte, on top of the write curl already did. rename() moves the piece
+    # into place for the cost of one syscall instead. It only works within a
+    # filesystem, so it can fail (piece and destination on different mounts,
+    # permissions, etc.); when it does, $renamed stays false and every line
+    # below behaves exactly as it did before this file had a rename attempt
+    # at all, including the reuse_probe_bytes() copy. Measured (local
+    # loopback instrument, not the origin used for bench/bigcurl/ numbers) on
+    # the 200x1MB case: this phase dropped from ~107ms to ~28ms total across
+    # all 200 files with the rename path taken for every one of them.
+    my $reuse_want   = 0;  # probe covers this job's fresh start
+    my $reuse_bytes  = 0;  # bytes to credit if reuse (by rename or copy) succeeds
+    my $reuse_blocks = 0;  # ...counted in blocks (unused for a single-stream job)
+    if ($j->{probe_piece} && !$j->{resume}) {
+        my $got = $j->{probe_got} || 0;
+        if ($j->{single}) {
+            if ($j->{size} > 0 && $got == $j->{size}) { $reuse_want = 1; $reuse_bytes = $got; }
+        } else {
+            # AIDEV-NOTE: int($got / $bs) alone is wrong at the end of the
+            # file. A probe that delivered the whole file covers every block
+            # including the short final one, but flooring by block size
+            # returns 0 for any file smaller than one block (block_size() is
+            # 256KB below 100MB), so the probe body of a small ranged file
+            # was thrown away and its bytes fetched a second time - measured:
+            # a lone 4KB file cost two HTTP requests. Credit whole blocks
+            # normally, all of them once the probe covers the whole file, and
+            # clamp the byte count to what the piece actually holds so the
+            # short final block never claims bytes that aren't there.
+            my $nfull = $got >= $j->{size} ? $j->{nblocks} : int($got / $j->{bs});
+            $nfull = $j->{nblocks} if $nfull > $j->{nblocks};
+            if ($nfull > 0) {
+                $reuse_want   = 1;
+                $reuse_blocks = $nfull;
+                $reuse_bytes  = $nfull * $j->{bs};
+                $reuse_bytes  = $got if $reuse_bytes > $got;
+            }
+        }
+    }
+    # Fresh-start branches above always unlink any stale $j->{part} first, so
+    # it cannot exist here - safe to attempt the rename unconditionally.
+    my $renamed = $reuse_want && rename($j->{probe_piece}, $j->{part});
+
+    # AIDEV-NOTE: capture open()'s own return value, not $fh's truthiness.
+    # open($fh, ...) autovivifies $fh into a defined (but unopened) glob as a
+    # side effect of binding the argument, *whether or not the open succeeds*
+    # - so a bare `unless ($fh)` here never fires, on any Perl. Verified
+    # (measured) with a minimal repro matching this exact shape (my $fh;
+    # declared separately, then open($fh, ...) inside a conditional branch)
+    # against a real permission failure: $fh was defined and true after a
+    # failed open, so the old guard silently proceeded with a dead
+    # filehandle. Symptom without this fix: a real open() failure on .part
+    # (permission denied, ENOSPC, EROFS, ...) is never reported as "cannot
+    # open $j->{part}: $!" / EX_DISK - it silently falls through and
+    # surfaces later, misclassified, wherever the bogus $fh first breaks
+    # (observed: a worker's sysseek() on it fails with EBADF, reported as
+    # "seek failed: Bad file descriptor", exit 1, not exit 5). Predates the
+    # rename fast path above (present already before this file had a
+    # $renamed branch at all) - unrelated to it.
+    my $fh;
+    my $open_ok;
+    if ($renamed)          { $open_ok = open($fh, '+<', $j->{part}) }
+    elsif (-f $j->{part})  { $open_ok = open($fh, '+<', $j->{part}) }
+    else                   { $open_ok = open($fh, '+>', $j->{part}) }
+    unless ($open_ok) {
+        $j->{status} = 'failed';
+        $j->{disk}   = 1;
+        $j->{err}    = "cannot open $j->{part}: $!";
+        return 0;
+    }
+    binmode $fh;
+    if (!$j->{single}) {
+        truncate($fh, $j->{size});      # sparse: grows a renamed piece to full size,
+                                         # no-ops an exact resume, zero-fills either way
+    } elsif (!$renamed) {
+        truncate($fh, 0);
+    }
+    $j->{fh}       = $fh;
+    $j->{inflight} = {};
+    $j->{hold}     = {};
+    $j->{attempts} = {};
+    $j->{scan}     = 0;
+    # Start small and let the tuner grow it once per-connection throughput is
+    # known: a big first request is a static commitment, and on a lossy link
+    # the slowest connection would own it for the whole download.
+    $j->{coalesce} = 4;
+    $j->{status}   = 'pending';
+    $j->{started}  = 0;
+
+    # AIDEV-NOTE: probe_all() already fetched up to probe_request_size()
+    # bytes from offset 0 for every job (see probe_files()/apply_probe()).
+    # On a fresh start that payload becomes block 0 - or, for a single-stream
+    # file small enough to fit inside it whole, the entire file - instead of
+    # being thrown away. A valid resume keeps trusting its own bitmap instead
+    # (the probe body is simply unused bytes we already paid for); a resume
+    # that turned out invalid fell through to the fresh-start branch above,
+    # so it is covered here too, since $j->{resume} is only set when resume
+    # actually applied. $renamed already moved the bytes into place above;
+    # otherwise reuse_probe_bytes() copies them, exactly as before rename()
+    # was tried at all.
+    if ($reuse_want && ($renamed || reuse_probe_bytes($j, 0, $reuse_bytes))) {
+        if ($j->{single}) {
+            $j->{bits} = '1';
+            $j->{done} = $j->{size};
+        } else {
+            my $nfull = $reuse_blocks;
+            substr($j->{bits}, 0, $nfull) = '1' x $nfull;
+            $j->{done} = ($j->{bits} =~ tr/1//) * $j->{bs};
+            $j->{done} = $j->{size} if $j->{done} > $j->{size};
+        }
+    }
+    unlink $j->{probe_piece} if $j->{probe_piece} && !$renamed;
+    delete $j->{probe_piece};
+
+    # A probe that already delivered the whole file (small file, or a server
+    # that ignores Range and answered 200 with the whole body) needs no
+    # worker at all - finish it here the same way a worker finishing the
+    # last block would. A -l consumer still sees a complete start/progress/
+    # done sequence for this file: the 100%-done snapshot is real (there is
+    # no meaningful transfer duration left to sample), not synthesized to
+    # satisfy anything downstream.
+    if ($j->{bits} !~ /0/) {
+        $j->{status}  = 'active';
+        $j->{started} = now();
+        emit_start($j);
+        jlog(event => 'progress', file => $j->{out}, done => num($j->{size}),
+             size => num($j->{size}), pct => num('100.00'),
+             speed => num(0), conns => num(0), eta => num(-1));
+        maybe_complete($j);
+    }
+    return 1;
+}
+
+# ---------------------------------------------------------------------------
+# Scheduling
+#
+# One block queue across all files. Workers always take blocks from the
+# earliest-listed unfinished file, so files complete roughly in the order they
+# were given and a small trailing file never strands the connection budget.
+# ---------------------------------------------------------------------------
+
+my $total_bytes = 0;       # bytes pulled off the wire this run
+my $fixed_conns = 0;
+
+sub job_active { my ($j) = @_; return $j->{status} eq 'pending' || $j->{status} eq 'active' }
+
+sub pick_work {
+    my ($t) = @_;
+    for my $j (@jobs) {
+        next unless job_active($j);
+        if ($j->{single}) {
+            next if %{ $j->{inflight} } || $j->{bits} eq '1';
+            $j->{inflight}{0} = 1;
+            return ($j, 0, 1);
+        }
+        my $n = $j->{nblocks};
+        my $start;
+        $j->{scan}++ while $j->{scan} < $n && substr($j->{bits}, $j->{scan}, 1) eq '1';
+        for (my $i = $j->{scan}; $i < $n; $i++) {
+            next if substr($j->{bits}, $i, 1) eq '1';
+            next if $j->{inflight}{$i};
+            next if ($j->{hold}{$i} || 0) > $t;
+            $start = $i;
+            last;
+        }
+        next unless defined $start;
+
+        # AIDEV-NOTE: Each request costs a fresh TCP (and TLS) handshake plus a
+        # slow start, so ask for as much as we can without starving the other
+        # connections: an even share of everything still outstanding. Early on
+        # that is a large slice; near the end it collapses to single blocks,
+        # which is what stops one slow connection owning the tail of the file.
+        #
+        # Blocks already in flight are deliberately NOT subtracted. They were,
+        # once, and because the pool is filled one worker at a time that made
+        # each successive worker's share smaller than the last (4, 3, 3, 2,
+        # 2...), so the file needed several extra rounds of connections to
+        # finish. At 250ms RTT that cost 40% of the achievable throughput.
+        my $undone = $n - ($j->{bits} =~ tr/1//);
+        my $cap = int(($undone + $conns_limit - 1) / ($conns_limit || 1));
+        # ...but never carve a request smaller than $MIN_REQ bytes. The fair
+        # share is meant to split one big file across the pool; applied to a
+        # 1MB file it split *that* into four 256KB requests, so a directory of
+        # small files cost four processes each (808 for 200 files).
+        my $floor = int(($MIN_REQ + $j->{bs} - 1) / $j->{bs});
+        $cap = $floor if $cap < $floor;
+        $cap = 1 if $cap < 1;
+        # AIDEV-NOTE: Request size comes from the *latest* speed sample, not
+        # the 2s tuner. On a fast link the tuner's first window let the tiny
+        # opening spans persist for two seconds - 27 curl processes and 27
+        # TCP slow starts for one 256MB file at -n 4 - and each one is a
+        # round trip plus a cold congestion window.
+        # Per-connection rate: the latest aggregate sample split across the
+        # pool, or - before the first sample exists - the rate of the most
+        # recently completed request, which on a fast link arrives well inside
+        # the first half second and stops us issuing a dozen tiny requests.
+        my $cz  = $j->{coalesce};
+        my $per = @history && $history[-1] > 0 ? $history[-1] / (scalar(@workers) || 1)
+                : $req_rate;
+        if ($per > 0 && $j->{bs}) {
+            $cz = int($per * $REQ_TARGET_SECS / $j->{bs} + 0.5);
+            $cz = $COALESCE_MIN if $cz < $COALESCE_MIN;
+            $cz = $COALESCE_MAX if $cz > $COALESCE_MAX;
+        }
+        $cap = $cz if $cz < $cap;
+
+        my $span = 1;
+        while ($span < $cap && $start + $span < $n) {
+            my $i = $start + $span;
+            last if substr($j->{bits}, $i, 1) eq '1';
+            last if $j->{inflight}{$i};
+            last if ($j->{hold}{$i} || 0) > $t;
+            $span++;
+        }
+        $j->{inflight}{ $start + $_ } = 1 for 0 .. $span - 1;
+        return ($j, $start, $span);
+    }
+    return ();
+}
+
+# AIDEV-NOTE: Large spans amortise connection setup (which dominates on a
+# high-RTT link) but they commit the whole file up front, so when connections
+# progress at different rates - exactly what packet loss causes - the quick
+# ones finish and idle while one straggler owns the tail. So when there is
+# nothing left to hand out, an idle connection takes the back half of the
+# busiest worker's span. The donor is told to stop at the new boundary and is
+# killed once it gets there, rather than spending bandwidth on bytes we have
+# already handed to someone else.
+sub steal_work {
+    my ($best, $bestleft);
+    my $t = now();
+    for my $w (@workers) {
+        next if $w->{dead};
+        my $j = $w->{job};
+        next if $j->{single};
+        # A worker already racing a hedge peer for the same bytes has nothing
+        # spare to give up - its span is the tail hedge_work chose, and
+        # shrinking it here would leave the peer racing for bytes a third,
+        # unrelated worker now also owns. See hedge_work()'s AIDEV-NOTE.
+        next if $w->{hedge_peer};
+        my $left = $w->{span} - $w->{marked};
+        next if $left < 3;                  # too small to be worth splitting
+        # A donor that will be done in a moment is not worth a new connection;
+        # stealing then just churned processes at the tail of fast downloads.
+        my $age  = $t - $w->{t0};
+        next if $age < 0.5;                 # no rate yet: it may be about to finish
+        my $rate = $w->{got} / $age;
+        next unless $rate > 0;
+        my $remaining = ($w->{span} * $j->{bs} - $w->{got}) / $rate;
+        next if $remaining < $STEAL_MIN_SECS;
+        ($best, $bestleft) = ($w, $left) if !$best || $left > $bestleft;
+    }
+    return () unless $best;
+    my $keep  = $best->{marked} + int(($best->{span} - $best->{marked}) / 2);
+    my $start = $best->{start} + $keep;
+    my $span  = $best->{span} - $keep;
+    return () if $span < 1;
+    $best->{span} = $keep;
+    return ($best->{job}, $start, $span);
+}
+
+# AIDEV-NOTE: Hedging is deliberately the LAST thing fill_workers tries, after
+# pick_work (fresh blocks) and steal_work (splitting a big straggler) have
+# both come up empty - i.e. it only ever spends a connection that would
+# otherwise sit idle, never one that could have done new or stolen work. That
+# is what keeps it from re-creating the reverted tuner regression: it never
+# asks for a bigger pool and never competes with ordinary transfers for a
+# slot within the existing one, so under packet loss the pool still climbs to
+# $CONNS_MAX exactly as before and this code never runs until the very end.
+#
+# "The tail" is a fixed block count ($HEDGE_TAIL_BLOCKS), not a fraction of
+# the file or a time budget: the ask's own language ("the last few blocks")
+# and block_size()'s own AIDEV-NOTE both frame the tail as block-denominated,
+# and a count is invariant to file size where a fraction would hedge huge
+# swaths of a multi-terabyte file. Whether a given worker is actually worth
+# duplicating right now, though, IS derived from its measured per-connection
+# rate (the same estimate steal_work uses) rather than a blind delay: hedging
+# a request that is about to finish anyway only spends a connection for
+# nothing, and $HEDGE_MIN_SECS is that estimate's cutoff.
+#
+# $HEDGE_MAX bounds the blast radius against a server that meters connections
+# per IP: fill_workers already never exceeds $conns_limit (which the tuner
+# has already shrunk to whatever a 429/503 taught it), so a hedge duplicate
+# can never itself push the total over a cap already being respected - but
+# on a small file, most of a fresh, unthrottled pool can be "idle" (nothing
+# left to hand out) from the very first block, and without a cap every
+# eligible worker across every job would get a duplicate at once. $HEDGE_MAX
+# holds that to a small, fixed number regardless of file count or size.
+sub hedge_work {
+    return () unless $HEDGE_TAIL_BLOCKS > 0;
+    return () if $hedge_pairs >= $HEDGE_MAX;
+    my $t = now();
+    for my $j (@jobs) {
+        next unless job_active($j);
+        next if $j->{single};               # no block granularity to hedge
+        my $undone = $j->{nblocks} - ($j->{bits} =~ tr/1//);
+        next if $undone == 0 || $undone > $HEDGE_TAIL_BLOCKS;
+        for my $w (@workers) {
+            next if $w->{dead} || $w->{job} != $j;
+            next if $w->{hedge_peer};        # already paired
+            my $age = $t - $w->{t0};
+            next if $age < 0.5;              # no rate yet: it may be about to finish
+            my $rate = $w->{got} / $age;
+            next unless $rate > 0;
+            my $done_span  = $w->{marked} * $j->{bs};
+            my $left_bytes = $w->{span} * $j->{bs} - $done_span - ($w->{got} - $done_span);
+            next if $left_bytes <= 0;
+            next if $left_bytes / $rate < $HEDGE_MIN_SECS;
+            my $start = $w->{start} + $w->{marked};
+            my $span  = $w->{span} - $w->{marked};
+            next if $span < 1;
+            # See $HEDGE_MAX_BUF: the duplicate side buffers its whole span
+            # in memory rather than streaming it to disk, so a remaining
+            # span this large is refused rather than hedged at all. A large
+            # -B otherwise disables hedging with no visible sign why - warn
+            # once per job (not once per candidate or per tick, which a
+            # busy pool would repeat every fill_workers() call) rather than
+            # let it read as the feature silently doing nothing.
+            if ($span * $j->{bs} > $HEDGE_MAX_BUF) {
+                unless ($j->{hedge_buf_warned}++) {
+                    printf STDERR
+                        "bigcurl: hedging disabled for %s: block span %.0fMiB exceeds \$HEDGE_MAX_BUF (%.0fMiB)\n",
+                        jname($j), ($span * $j->{bs}) / (1<<20), $HEDGE_MAX_BUF / (1<<20);
+                }
+                next;
+            }
+            return ($j, $start, $span, $w);
+        }
+    }
+    return ();
+}
+
+# spawn_worker()'s failure paths delete $j->{inflight} for the span they were
+# given, on the assumption that the caller (normally pick_work) just claimed
+# those blocks and nobody else is depending on them. A hedge duplicate's span
+# is NOT freshly claimed - it duplicates blocks the peer being hedged already
+# holds inflight - so on failure here that deletion would strip the peer's
+# still-live claim too and let pick_work re-issue a third, independent
+# attempt at the same bytes. Save and restore across the call instead.
+sub hedge_spawn {
+    my ($j, $start, $span) = @_;
+    my @held = grep { $j->{inflight}{$_} } ($start .. $start + $span - 1);
+    my $ok = spawn_worker($j, $start, $span);
+    unless ($ok) { $j->{inflight}{$_} = 1 for @held }
+    return $ok;
+}
+
+sub work_remaining {
+    for my $j (@jobs) {
+        next unless job_active($j);
+        return 1 if $j->{bits} =~ /0/;
+    }
+    return 0;
+}
+
+sub spawn_worker {
+    my ($j, $start, $span) = @_;
+    my $t   = now();
+    my $id  = ++$worker_seq;
+    my $hdr = "$tmpdir/h.$id";
+    my $err = "$tmpdir/e.$id";
+    my ($off, $end, $want);
+    if ($j->{single}) {
+        $off  = 0;
+        $end  = undef;
+        $want = $j->{size} > 0 ? $j->{size} : undef;
+    } else {
+        $off  = $start * $j->{bs};
+        $end  = $off + $span * $j->{bs} - 1;
+        $end  = $j->{size} - 1 if $end > $j->{size} - 1;
+        $want = $end - $off + 1;
+    }
+    my @cmd = defined $end ? curl_cmd($j, $off, $end, $hdr)
+                           : curl_cmd($j, undef, undef, $hdr);
+
+    # AIDEV-NOTE: A hand-made pipe rather than open('-|'), because close() on
+    # a '-|' handle blocks in waitpid for the child. On a contended box that
+    # was 37ms per curl exit during which nobody's pipe was being read.
+    # Children are reaped without blocking by reap_workers() instead.
+    my ($fh, $wr);
+    unless (pipe($fh, $wr)) {
+        delete $j->{inflight}{ $start + $_ } for 0 .. $span - 1;
+        return 0;
+    }
+    my $pid = fork();
+    if (!defined $pid) {
+        close $fh; close $wr;
+        delete $j->{inflight}{ $start + $_ } for 0 .. $span - 1;
+        return 0;
+    }
+    if ($pid == 0) {                       # child
+        close $fh;
+        open(STDOUT, '>&', $wr) or exit 127;
+        open(STDERR, '>', $err);
+        open(STDIN, '<', '/dev/null');
+        exec { $cmd[0] } @cmd;
+        exit 127;
+    }
+    close $wr;
+    binmode $fh;
+    # AIDEV-NOTE: A pipe defaults to 64KB, so curl (which writes 16KB at a
+    # time) fills it and blocks four writes in, and the parent wakes for every
+    # 64KB. On a fast link that wake-up rate was the ceiling. F_SETPIPE_SZ is
+    # fcntl 1031 on Linux; anywhere else the call fails and nothing changes.
+    # Hardcoded rather than imported so the script still needs no modules.
+    my $psz = 65536;
+    if ($^O eq 'linux') {
+        my $r = eval { fcntl($fh, 1031, $PIPE_SIZE) };
+        $psz = $r if $r && $r > $psz;
+    }
+    my $w = {
+        hold => ($psz >= 512 << 10 ? $HOLD_BIG : $HOLD_SMALL), hold_until => 0,
+        id => $id, pid => $pid, fh => $fh, job => $j,
+        start => $start, span => $span, off => $off, end => $end,
+        want => $want, got => 0, marked => 0,
+        hdr => $hdr, errf => $err, t0 => $t, last_data => $t,
+    };
+    push @workers, $w;
+    if ($j->{status} eq 'pending') {
+        $j->{status}  = 'active';
+        $j->{started} = $t;
+        emit_start($j);
+    }
+    return 1;
+}
+
+sub fill_workers {
+    my ($t) = @_;
+    while (scalar(@workers) < $conns_limit) {
+        my ($j, $start, $span) = pick_work($t);
+        ($j, $start, $span) = steal_work() unless $j;
+        if ($j) {
+            last unless spawn_worker($j, $start, $span);
+            next;
+        }
+        # Neither fresh nor stealable work exists: this slot would otherwise
+        # sit idle, so see if it's worth hedging a straggler instead.
+        my ($hj, $hstart, $hspan, $hw) = hedge_work();
+        last unless $hj;
+        last unless hedge_spawn($hj, $hstart, $hspan);
+        my $peer = $workers[-1];
+        $peer->{hedge_peer} = $hw;
+        $peer->{hedge_dup}  = 1;   # see worker_read()'s AIDEV-NOTE: this side
+                                   # buffers instead of writing directly
+        $hw->{hedge_peer}   = $peer;
+        $hedge_pairs++;
+    }
+}
+
+sub release_blocks {
+    my ($w, $t, $reason, $quick) = @_;
+    my $j = $w->{job};
+    # AIDEV-NOTE: A hedge duplicate does not own its blocks alone - the peer
+    # it was racing may still be working them. If that peer is still alive,
+    # releasing here would let pick_work re-issue a THIRD, independent
+    # attempt at bytes someone is already fetching - exactly the wrong
+    # direction for a server that meters connections, which a hedge is
+    # supposed to cost nothing extra on failure. Only when both copies have
+    # failed does anybody still need these blocks released (fall through).
+    # This does NOT touch tune_throttled/conns_limit - the caller in
+    # settle_worker updates those before calling release_blocks, and a 429/
+    # 503 is real signal about the connection regardless of which duplicate
+    # drew it.
+    if (my $peer = $w->{hedge_peer}) {
+        delete $w->{hedge_peer};
+        $hedge_pairs-- if $hedge_pairs > 0;
+        if (!$peer->{dead}) {
+            delete $peer->{hedge_peer};
+            return;
+        }
+    }
+    my $backoff;
+    my $released = 0;
+    for my $i ($w->{marked} .. $w->{span} - 1) {
+        my $bi = $w->{start} + $i;
+        delete $j->{inflight}{$bi};
+        # AIDEV-NOTE: A 429/503 from a per-IP connection cap is "too many at
+        # once", not "go away": the tuner has already shrunk the pool, so the
+        # refused blocks go straight back on the queue and do not burn a
+        # retry. Backing them off exponentially left slots idle for seconds.
+        if ($quick) {
+            $j->{hold}{$bi} = $t + 0.1;
+            $j->{scan} = $bi if $bi < $j->{scan};
+            $released++;
+            next;
+        }
+        my $n = ++$j->{attempts}{$bi};
+        if ($n > $MAX_RETRIES) {
+            fail_job($j, "block $bi failed after $MAX_RETRIES attempts: $reason", network => 1);
+            return;
+        }
+        $backoff = $BACKOFF_BASE * (2 ** ($n - 1));
+        $backoff = $BACKOFF_MAX if $backoff > $BACKOFF_MAX;
+        $backoff += rand() * 0.25 * $backoff;          # jitter
+        $j->{hold}{$bi} = $t + $backoff;
+        $j->{scan} = $bi if $bi < $j->{scan};
+        $released++;
+    }
+    return unless $released;
+    $retry_count++;
+    # A refusal is already counted as a throttle; counting it as an error as
+    # well tripped the error-rate shrink on every 503 and ratcheted the pool
+    # down past the cap the throttle logic had just found.
+    $tune_errors++ unless $quick;
+    emit_retry($j, $w->{start} + $w->{marked},
+               ($j->{attempts}{ $w->{start} + $w->{marked} } || 1), $reason, $backoff || 0);
+}
+
+sub finish_worker {
+    my ($w) = @_;
+    # AIDEV-NOTE: Retiring a worker rebuilds @workers, so every loop that can
+    # reach here iterates a snapshot and skips entries already marked dead.
+    # Reassigning the array a foreach is aliasing is undefined behaviour in
+    # perl - it crashed with "Use of freed value in iteration" once work
+    # stealing made mid-loop retirement common.
+    return if $w->{dead};
+    $w->{dead} = 1;
+    close($w->{fh}) if $w->{fh};
+    delete $w->{fh};
+    # AIDEV-NOTE: This is the one place every hedge pair resolves, because
+    # every path that retires a worker - self-completion in worker_read,
+    # stall in run_loop, kill_worker - ends up here. Whichever side of a
+    # pair arrives first takes the other one down immediately: the whole
+    # point of hedging is to stop paying wall-clock for the loser, so leaving
+    # it running would just recreate the tail the hedge was meant to cut.
+    # Both hash keys are cleared before the recursive kill_worker() call so
+    # the peer's own trip through here sees hedge_peer already gone and does
+    # not try to kill back.
+    if (my $peer = delete $w->{hedge_peer}) {
+        delete $peer->{hedge_peer};
+        $hedge_pairs-- if $hedge_pairs > 0;
+        kill_worker($peer, 'hedge: peer finished first') unless $peer->{dead};
+    }
+    @workers = grep { $_ != $w } @workers;
+    push @reaping, $w;
+    reap_workers();
+}
+
+# Non-blocking: collect exit statuses of retired workers and only then run
+# the success/failure bookkeeping, which needs the exit code.
+sub reap_workers {
+    return unless @reaping;
+    my @still;
+    for my $w (@reaping) {
+        my $r = waitpid($w->{pid}, 1);            # 1 == WNOHANG everywhere we run
+        if ($r == $w->{pid} || $r == -1) {
+            settle_worker($w, $r == -1 ? 0 : $?);
+        } else {
+            push @still, $w;
+        }
+    }
+    @reaping = @still;
+}
+
+sub settle_worker {
+    my ($w, $status) = @_;
+    my $t = now();
+    my $code = $status >> 8;
+    my $sig  = $status & 127;
+    my $j = $w->{job};
+
+    my $ok = (!$w->{fail} && $code == 0 && $sig == 0);
+    if ($ok && defined $w->{want} && $w->{got} != $w->{want}) {
+        $ok = 0;
+        $w->{fail} = "short transfer ($w->{got} of $w->{want} bytes)";
+    }
+
+    if ($ok) {
+        my $dur = $t - $w->{t0};
+        $req_rate = $w->{got} / $dur if $dur > 0.05 && $w->{got} > 0;
+        if ($j->{single}) {
+            substr($j->{bits}, 0, 1) = '1';
+            delete $j->{inflight}{0};
+            $j->{size} = $w->{got} if $j->{size} < 0;
+        } else {
+            for my $i (0 .. $w->{span} - 1) {
+                my $bi = $w->{start} + $i;
+                substr($j->{bits}, $bi, 1) = '1';
+                delete $j->{inflight}{$bi};
+            }
+        }
+        $tune_reqs++;
+        recompute_done($j);
+        maybe_complete($j);
+        return;
+    }
+
+    # Every block this worker was responsible for already landed - either it
+    # got there itself (marked reached span: the ordinary case, since
+    # worker_read kills a worker's own curl the moment its span is fully
+    # marked, before curl gets a chance to exit on its own, so a clean
+    # $ok above is actually the exception) or someone else got there for it:
+    # steal_work cut this span short, or a hedge peer racing for the very
+    # same bytes crossed the line first (see finish_worker's hedge handling -
+    # this worker was just SIGKILLed as the loser, and its bits are already
+    # '1' throughout). Whatever curl complained about afterwards does not
+    # matter either way.
+    if (!$j->{single}
+        && ($w->{marked} >= $w->{span}
+            || substr($j->{bits}, $w->{start}, $w->{span}) !~ /0/)) {
+        $tune_reqs++;
+        recompute_done($j);
+        maybe_complete($j);
+        return;
+    }
+
+    # Failure. Classify from the response headers curl dumped for us: a 4xx
+    # that is not 408/429 will never succeed, so fail the file immediately
+    # instead of burning retries.
+    my $h    = parse_headers($w->{hdr});
+    my $emsg = slurp($w->{errf});
+    my $why  = $w->{fail} || ($emsg ne '' ? $emsg : "curl exit $code");
+    $why = 'connection stalled' if $sig && $w->{fail} && $w->{fail} eq 'stalled';
+
+    my $refused = defined $h->{status} && ($h->{status} == 429 || $h->{status} == 503);
+    if ($refused) {
+        $tune_throttled++;
+        # AIDEV-NOTE: Each refusal is one connection over the server's cap, so
+        # the pool comes down by exactly one per refusal, right now, and that
+        # size becomes a ceiling. (Estimating the cap from how many workers
+        # were streaming at the moment of a refusal was wrong early in a
+        # storm, when almost none had bytes yet, and pinned the pool at 2.)
+        if ($conns_limit > $CONNS_MIN) {
+            $conns_limit--;
+            $throttle_ceiling = $conns_limit;
+        }
+        release_blocks($w, $t, "HTTP $h->{status}", 1);
+        return;
+    }
+
+    if (defined $h->{status} && ($h->{status} == 401 || $h->{status} == 403)
+        && $j->{eurl} && $j->{eurl} ne $j->{url} && ($j->{refresh} || 0) < 3) {
+        # Most likely the signed CDN URL expired mid-download.
+        $j->{refresh}++;
+        refresh_url($j);
+        release_blocks($w, $t, "HTTP $h->{status}, re-resolved redirect");
+        return;
+    }
+    # AIDEV-NOTE: Only a 4xx is permanent, and not even all of those. 5xx must
+    # be retried: a server with a per-IP connection cap answers the excess
+    # connections with 503, which is transient by definition - the tuner has
+    # already counted it and will shrink the pool. Failing the whole download
+    # on it meant bigcurl could not talk to a server it was merely being too
+    # enthusiastic with.
+    if (defined $h->{status} && $h->{status} >= 400 && $h->{status} < 500
+        && $h->{status} != 408 && $h->{status} != 429) {
+        fail_job($j, "HTTP $h->{status}", http => $h->{status});
+        return;
+    }
+    if ($w->{fatal}) {
+        fail_job($j, $why);
+        return;
+    }
+    release_blocks($w, $t, $why);
+}
+
+sub kill_worker {
+    my ($w, $why) = @_;
+    $w->{fail} = $why;
+    kill('KILL', $w->{pid});
+    finish_worker($w);
+}
+
+sub recompute_done {
+    my ($j) = @_;
+    if ($j->{single}) {
+        $j->{done} = ($j->{bits} eq '1' && $j->{size} > 0) ? $j->{size} : $j->{done};
+        return;
+    }
+    my $d = ($j->{bits} =~ tr/1//) * $j->{bs};
+    if (substr($j->{bits}, $j->{nblocks} - 1, 1) eq '1') {
+        my $lastlen = $j->{size} - ($j->{nblocks} - 1) * $j->{bs};
+        $d -= ($j->{bs} - $lastlen);
+    }
+    $j->{done} = $d;
+}
+
+# Bytes on disk for a job, including the partial block currently in flight.
+sub job_progress {
+    my ($j) = @_;
+    my $d = $j->{done};
+    for my $w (@workers) {
+        next unless $w->{job} == $j;
+        $d += $w->{got} - ($j->{single} ? 0 : $w->{marked} * $j->{bs});
+    }
+    return $d;
+}
+
+sub maybe_complete {
+    my ($j) = @_;
+    # Several workers can finish in the same pass; only the first one that sees
+    # a full bitmap gets to rename the file.
+    return unless job_active($j);
+    return if $j->{bits} =~ /0/;
+    close($j->{fh}) if $j->{fh};
+    delete $j->{fh};
+    if (!rename($j->{part}, $j->{out})) {
+        $j->{status} = 'failed';
+        $j->{disk}   = 1;
+        $j->{err}    = "cannot rename $j->{part} to $j->{out}: $!";
+        emit_error($j);
+        return;
+    }
+    state_clear($j);
+    $j->{status}   = 'complete';
+    $j->{finished} = now();
+    emit_done($j);
+}
+
+sub fail_job {
+    my ($j, $msg, %opt) = @_;
+    return unless job_active($j);
+    for my $w (grep { $_->{job} == $j } @{[ @workers ]}) {
+        next if $w->{dead};
+        $w->{dead} = 1;
+        kill('KILL', $w->{pid});
+        close($w->{fh}) if $w->{fh};
+        delete $w->{fh};
+        waitpid($w->{pid}, 0);
+    }
+    @workers = grep { !$_->{dead} } @workers;
+    state_save($j);
+    close($j->{fh}) if $j->{fh};
+    delete $j->{fh};
+    $j->{status} = 'failed';
+    $j->{err}    = $msg;
+    $j->{http}   = $opt{http}    if $opt{http};
+    $j->{net}    = $opt{network} if $opt{network};
+    emit_error($j);
+}
+
+sub tune {
+    my ($t) = @_;
+    return if $t - $tune_time < $TUNE_INTERVAL;
+    my $elapsed = $t - $tune_time;
+    my $speed   = $elapsed > 0 ? $tune_bytes / $elapsed : 0;
+    my ($reqs, $errs, $throttled) = ($tune_reqs, $tune_errors, $tune_throttled);
+    ($tune_bytes, $tune_reqs, $tune_errors, $tune_throttled) = (0, 0, 0, 0);
+    $tune_time = $t;
+
+    # AIDEV-NOTE: Back off on the error *rate*, never on a single retry. A
+    # server that hangs up on the odd connection would otherwise ratchet the
+    # pool down to the floor and never let it recover, which is exactly the
+    # case parallel downloading is supposed to survive. Growth is also
+    # deliberately faster than shrinkage, and only a saturated pool is allowed
+    # to conclude anything from a drop in throughput - if there were not enough
+    # blocks to fill the pool, the speed says nothing about the right size.
+    {
+        # AIDEV-NOTE: -n is a ceiling, not a pin. A server capping connections
+        # per IP answers the excess with 503; with the pool pinned that meant
+        # retrying into the wall until the download failed. And once a 503 has
+        # shrunk the pool, that size is remembered as a ceiling - otherwise the
+        # tuner grew straight back into the cap and oscillated, at half the
+        # throughput of simply staying under it.
+        my $total     = $reqs + $errs;
+        my $err_rate  = $total > 0 ? $errs / $total : 0;
+        # "Saturated" allows for one worker between requests at the sampling
+        # instant; requiring every slot busy meant a churning pool was never
+        # saturated, the best-speed memory never decayed, and the pool sat at
+        # its opening size for the whole download (18 MB/s against a server
+        # that would have given 32).
+        my $saturated = scalar(@workers) + scalar(@reaping) >= $conns_limit - 1;
+
+        # AIDEV-NOTE: On a lossy link throughput is noisy, and comparing one
+        # 2s window against the best ever seen made the pool shrink on
+        # ordinary variance - measurably worse than just pinning -n 16. So a
+        # drop has to persist for two consecutive windows before it counts,
+        # and an explicit server complaint (429/503) is the only thing that
+        # shrinks the pool immediately. Growth is also front-loaded: the first
+        # few steps are cheap and the gain from more connections is largest
+        # while the pool is small.
+        if ($throttled) {                       # server said 429/503: obey it
+            # The fewest workers seen streaming alongside a refusal bounds the
+            # server's cap, and that is the pool; a lingering connection from a
+            # previous request costs one instant retry, not a smaller pool. (Counting refusals per
+            # window instead went negative under retries and pinned the pool at
+            # one. Shrinking by a fixed step landed exactly on the cap, where the
+            # next lingering connection drew another 503 and another shrink.)
+            # Already shrunk one per refusal as they arrived; just hold here.
+            $throttle_ceiling = $conns_limit;
+            $tune_best   *= 0.8;
+            $tune_down_streak = 0;
+        } elsif ($fixed_conns) {
+            # pinned by -n: no growth, and no shrinking on mere noise
+        } elsif ($err_rate > $TUNE_ERR_RATE) {
+            $conns_limit -= $CONNS_STEP_DOWN;
+            $tune_best   *= 0.9;
+            $tune_down_streak = 0;
+        } elsif (!$saturated) {
+            $tune_best = $speed if $speed > $tune_best;
+            $tune_best *= $TUNE_DECAY;
+            $tune_down_streak = 0;
+        } elsif ($speed > $tune_best * $TUNE_GAIN) {
+            # Growth also needs two consecutive better windows once the pool
+            # is past its opening size: one lucky sample on a noisy link was
+            # enough to add processes a one-core box could not afford.
+            $tune_best = $speed;
+            if ($conns_limit < 16 || ++$tune_up_streak >= 2) {
+                $conns_limit += ($conns_limit < 16 ? $CONNS_STEP * 2 : $CONNS_STEP);
+                $tune_up_streak = 0;
+            }
+            $tune_down_streak = 0;
+        } elsif ($speed < $tune_best * $TUNE_LOSS) {
+            $tune_up_streak = 0;
+            if (++$tune_down_streak >= 2) {
+                $conns_limit -= $CONNS_STEP_DOWN;
+                $tune_best   *= $TUNE_DECAY;
+                $tune_down_streak = 0;
+            } else {
+                $tune_best *= $TUNE_DECAY;
+            }
+        } else {
+            $tune_best = $speed if $speed > $tune_best;
+            $tune_best *= $TUNE_DECAY;
+            $tune_down_streak = 0;
+        }
+        $conns_limit = $CONNS_MAX if $conns_limit > $CONNS_MAX;
+        $conns_limit = $throttle_ceiling
+            if $throttle_ceiling && $conns_limit > $throttle_ceiling;
+        $conns_limit = $CONNS_MIN if $conns_limit < $CONNS_MIN;
+    }
+
+    # Per-connection throughput sets how many adjacent blocks we ask for in a
+    # single request, so fast links use big requests without changing the
+    # resume granularity.
+    my $per = $speed / (scalar(@workers) || 1);
+    for my $j (@jobs) {
+        next unless $j->{bs};
+        my $cz = int($per * $REQ_TARGET_SECS / $j->{bs} + 0.5);
+        # Floor of $COALESCE_MIN: on a slow or lossy link the speed-derived
+        # figure collapses to one block per request, which then spends all its
+        # time in connection setup and slow start instead of transferring.
+        $cz = $COALESCE_MIN if $cz < $COALESCE_MIN;
+        $cz = $COALESCE_MAX if $cz > $COALESCE_MAX;
+        $j->{coalesce} = $cz;
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Output: silent / log / pretty
+# ---------------------------------------------------------------------------
+
+my $UNI      = 1;          # terminal can render the box-drawing characters
+my $last_log = 0;
+
+sub jlog {
+    my (@kv) = @_;
+    return unless $mode eq 'log';
+    printf("%s\n", json_obj(ts => num(sprintf('%.3f', now() - $t_start)), @kv));
+}
+
+sub jname { my ($j) = @_; return defined $j->{out} ? $j->{out} : $j->{url} }
+
+sub emit_start {
+    my ($j) = @_;
+    jlog(event => 'start', file => $j->{out}, url => $j->{url},
+         size => num($j->{size}), blocks => num($j->{nblocks}),
+         block_size => num($j->{bs}),
+         resume => raw($j->{resume} ? 'true' : 'false'),
+         ranges => raw($j->{single} ? 'false' : 'true'));
+}
+
+sub emit_skip {
+    my ($j) = @_;
+    jlog(event => 'skip', file => jname($j), reason => $j->{reason} || 'skipped');
+}
+
+sub emit_retry {
+    my ($j, $blk, $attempt, $reason, $backoff) = @_;
+    jlog(event => 'retry', file => $j->{out}, block => num($blk),
+         attempt => num($attempt), reason => $reason,
+         backoff => num(sprintf('%.2f', $backoff)));
+}
+
+sub emit_done {
+    my ($j) = @_;
+    my $secs = ($j->{finished} || now()) - ($j->{started} || now());
+    jlog(event => 'done', file => $j->{out}, bytes => num($j->{size}),
+         seconds => num(sprintf('%.2f', $secs)),
+         speed => num(int($secs > 0 ? $j->{size} / $secs : 0)));
+}
+
+sub emit_error {
+    my ($j) = @_;
+    jlog(event => 'error', file => jname($j), message => $j->{err},
+         ($j->{http} ? (http => num($j->{http})) : ()));
+    # In pretty mode the dashboard row and the final report carry this; writing
+    # to stderr as well would scribble over the dashboard and duplicate it.
+    print STDERR 'bigcurl: ' . jname($j) . ": $j->{err}\n" unless $mode eq 'pretty';
+}
+
+sub emit_progress {
+    my ($t) = @_;
+    return unless $mode eq 'log';
+    return if $t - $last_log < $LOG_INTERVAL;
+    $last_log = $t;
+    for my $j (@jobs) {
+        next unless $j->{status} eq 'active';
+        my $d    = job_progress($j);
+        my $pct  = $j->{size} > 0 ? 100 * $d / $j->{size} : 0;
+        my $left = $j->{size} > 0 ? $j->{size} - $d : -1;
+        my $conns = scalar grep { $_->{job} == $j } @workers;
+        jlog(event => 'progress', file => $j->{out}, done => num($d),
+             size => num($j->{size}), pct => num(sprintf('%.2f', $pct)),
+             speed => num(int($speed_ema)), conns => num($conns),
+             eta => num($speed_ema > 0 && $left >= 0 ? int($left / $speed_ema) : -1));
+    }
+}
+
+sub emit_summary {
+    my ($exit) = @_;
+    my $ok      = scalar grep { $_->{status} eq 'complete' } @jobs;
+    my $failed  = scalar grep { $_->{status} eq 'failed' }   @jobs;
+    my $skipped = scalar grep { $_->{status} eq 'skipped' }  @jobs;
+    my $secs    = now() - $t_start;
+    jlog(event => 'summary', files => num(scalar @jobs), ok => num($ok),
+         failed => num($failed), skipped => num($skipped),
+         bytes => num($total_bytes), seconds => num(sprintf('%.2f', $secs)),
+         speed => num(int($secs > 0 ? $total_bytes / $secs : 0)), exit => num($exit));
+}
+
+# ---------------------------------------------------------------------------
+# Pretty mode: full-screen dashboard
+# ---------------------------------------------------------------------------
+
+my @BLK8    = ("\x{258F}", "\x{258E}", "\x{258D}", "\x{258C}",
+               "\x{258B}", "\x{258A}", "\x{2589}", "\x{2588}");
+my @SPARK   = ("\x{2581}", "\x{2582}", "\x{2583}", "\x{2584}",
+               "\x{2585}", "\x{2586}", "\x{2587}", "\x{2588}");
+my @SPIN    = ("\x{280B}", "\x{2819}", "\x{2839}", "\x{2838}", "\x{283C}",
+               "\x{2834}", "\x{2826}", "\x{2827}", "\x{2807}", "\x{280F}");
+
+sub u { my ($uni, $ascii) = @_; return $UNI ? $uni : $ascii }
+
+sub pretty_begin {
+    return if $pretty_on;
+    $pretty_on = 1;
+    binmode(STDOUT, ':utf8') if $UNI;
+    print "\e[?1049h\e[?25l\e[2J";
+}
+
+sub pretty_end {
+    return unless $pretty_on;
+    $pretty_on = 0;
+    print "\e[?25h\e[?1049l";
+    binmode(STDOUT, ':raw') if $UNI;
+}
+
+# A proportional bar, `w` cells wide, using eighth-cell resolution and a
+# gradient across the filled portion.
+sub bar {
+    my ($w, $frac, $plain) = @_;
+    $frac = 0 if !defined $frac || $frac < 0;
+    $frac = 1 if $frac > 1;
+    my $units  = int($frac * $w * 8 + 0.5);
+    my $full   = int($units / 8);
+    my $rem    = $units % 8;
+    my $out    = '';
+    for my $i (0 .. $full - 1) {
+        $out .= ($plain ? c($C_OK) : ramp($w > 1 ? $i / ($w - 1) : 1)) . u($BLK8[7], '#');
+    }
+    if ($rem && $full < $w) {
+        $out .= ($plain ? c($C_OK) : ramp($w > 1 ? $full / ($w - 1) : 1)) . u($BLK8[$rem - 1], '=');
+        $full++;
+    }
+    $out .= c($C_DIM) . u("\x{2591}", '.') x ($w - $full) if $w > $full;
+    return $out . rst();
+}
+
+sub sparkline {
+    my ($w) = @_;
+    my @v = @history;
+    @v = @v[-$w .. -1] if @v > $w;
+    return '' unless @v;
+    my $max = 0;
+    for (@v) { $max = $_ if $_ > $max }
+    return c($C_DIM) . (u("\x{2581}", '_') x scalar(@v)) . rst() if $max <= 0;
+    my $out = '';
+    for my $v (@v) {
+        my $t = $v / $max;
+        my $i = int($t * 7 + 0.5);
+        $out .= ramp($t) . u($SPARK[$i], '.');
+    }
+    return $out . rst();
+}
+
+# Speedtest-style gauge: current rate as a bar, a marker at the session peak,
+# and a labelled scale underneath.
+sub gauge_lines {
+    my ($w) = @_;
+    my $scale = $peak_speed > 0 ? $peak_speed * 1.25 : 1 << 20;
+    $scale = 1 << 20 if $scale < 1 << 20;
+    my $bw = $w - 4;
+    $bw = 10 if $bw < 10;
+
+    my $head = sprintf('%s%s%s%s', bold(), c($C_LIVE), fmt_rate($speed_ema), rst());
+    my $peak = $peak_speed > 0
+        ? sprintf('%speak %s%s', c($C_DIM), fmt_rate($peak_speed), rst())
+        : '';
+    my $pad  = $bw - vlen($head) - vlen($peak);
+    $pad = 1 if $pad < 1;
+    my $l1 = '  ' . $head . axis($pad) . $peak;
+
+    my $frac = $scale > 0 ? $speed_ema / $scale : 0;
+    my $b    = bar($bw, $frac);
+    my $l2 = '  ' . u("\x{2595}", '[') . $b . u("\x{258F}", ']');
+
+    # Scale ticks: each label is its own span, joined by dim rules.
+    my ($ticks, $vis) = ('', 0);
+    my $n = 5;
+    for my $i (0 .. $n - 1) {
+        my $val = $scale * $i / ($n - 1);
+        my $lbl = $i == 0 ? '0' : $i == $n - 1 ? fmt_rate($val) : fmt_bytes($val);
+        my $pos = int($bw * $i / ($n - 1));
+        $pos = $bw - length($lbl) if $pos + length($lbl) > $bw;
+        $pos = 0 if $pos < 0;
+        next if $vis > $pos;
+        $ticks .= axis($pos - $vis);
+        $ticks .= c($C_DIM) . $lbl . rst();
+        $vis = $pos + length($lbl);
+    }
+    my $l3 = '   ' . $ticks;
+    return ($l1, $l2, $l3);
+}
+
+# AIDEV-NOTE: Two rules govern every padded column in this UI, learned the hard
+# way from renderers that normalise whitespace (tmux -> SVG screenshots):
+#   1. A coloured span must never START with whitespace - it gets stripped and
+#      that span's text slides left.
+#   2. A run of two or more spaces must be followed immediately by a colour
+#      change, because spans are positioned absolutely but a run inside one
+#      collapses to a single space.
+# leader() and axis() therefore emit their own colour codes with the padding
+# spaces sitting outside the span. Returned width is always exactly $n.
+sub leader {
+    my ($n, $ch) = @_;
+    return '' if $n <= 0;
+    return ' ' x $n if $n < 4 || !$UNI;
+    $ch = "\x{00B7}" unless defined $ch;
+    return ' ' . c($C_DIM) . ($ch x ($n - 2)) . rst() . ' ';
+}
+sub axis { return leader($_[0], "\x{2500}") }
+
+# Truncate to n visible columns, stepping over ANSI escapes so a row can never
+# wrap and push the rest of the frame down.
+sub clip {
+    my ($s, $n) = @_;
+    my ($out, $seen, $i, $len) = ('', 0, 0, length $s);
+    while ($i < $len) {
+        if (substr($s, $i, 2) eq "\e[") {
+            my $j = $i + 2;
+            $j++ while $j < $len && substr($s, $j, 1) =~ /[0-9;?]/;
+            $j++ if $j < $len;
+            $out .= substr($s, $i, $j - $i);
+            $i = $j;
+            next;
+        }
+        last if $seen >= $n;
+        $out .= substr($s, $i, 1);
+        $seen++;
+        $i++;
+    }
+    return $out;
+}
+
+# Visible length, ignoring ANSI escapes.
+sub vlen {
+    my ($s) = @_;
+    $s =~ s/\e\[[0-9;]*m//g;
+    return length $s;
+}
+
+sub big_meter {
+    my ($w, $frac, $label) = @_;
+    my $inner = $w - 2;
+    my $txt   = sprintf('%.1f%%', 100 * $frac);
+    my $lblw  = 9;
+    my $bw    = $inner - $lblw;
+    $bw = 4 if $bw < 4;
+    my @l;
+    push @l, c($C_HEAD) . u("\x{259B}", '+') . (u("\x{2580}", '-') x $inner) . u("\x{259C}", '+') . rst();
+    push @l, c($C_HEAD) . u("\x{258C}", '|') . rst() . bar($bw, $frac)
+           . (' ' x ($lblw - length($txt) - 1))
+           . bold() . c($C_TEXT) . $txt . rst() . ' '
+           . c($C_HEAD) . u("\x{2590}", '|') . rst();
+    push @l, c($C_HEAD) . u("\x{2599}", '+') . (u("\x{2584}", '-') x $inner) . u("\x{259F}", '+') . rst();
+    return @l;
+}
+
+# Map a file's block bitmap onto `w` cells: shade by how complete each cell is,
+# highlight cells with a live connection in them.
+sub chunk_map {
+    my ($j, $w) = @_;
+    return '' unless $j && !$j->{single} && $j->{nblocks};
+    my %live;
+    for my $w2 (grep { $_->{job} == $j } @workers) {
+        $live{ $w2->{start} + $_ } = 1 for 0 .. $w2->{span} - 1;
+    }
+    my $per = $j->{nblocks} / $w;
+    my $out = '';
+    for my $cell (0 .. $w - 1) {
+        my $a = int($cell * $per);
+        my $b = int(($cell + 1) * $per);
+        $b = $a + 1 if $b <= $a;
+        $b = $j->{nblocks} if $b > $j->{nblocks};
+        my ($done, $act, $tot) = (0, 0, 0);
+        for my $i ($a .. $b - 1) {
+            $tot++;
+            $done++ if substr($j->{bits}, $i, 1) eq '1';
+            $act++  if $live{$i};
+        }
+        my $f = $tot ? $done / $tot : 0;
+        my $ch = $f >= 1     ? u("\x{2588}", '#')
+               : $f >= 0.66  ? u("\x{2593}", '+')
+               : $f >= 0.33  ? u("\x{2592}", '-')
+               : $act        ? u("\x{2592}", '-')
+               :               u("\x{2591}", '.');
+        my $col = $f >= 1 ? c($C_OK) : $act ? c($C_LIVE) : c($C_DIM);
+        $out .= $col . $ch;
+    }
+    return $out . rst();
+}
+
+sub render_frame {
+    my ($t) = @_;
+    my $w = $term_w;
+    my $spin = $SPIN[ int($t * 12) % scalar(@SPIN) ];
+
+    # AIDEV-NOTE: Files that failed or were skipped are excluded from the
+    # totals - otherwise one 404 (whose size is unknown) makes the whole run
+    # report "? bytes" and no ETA.
+    my ($tot_size, $tot_done, $known, $counted) = (0, 0, 1, 0);
+    for my $j (@jobs) {
+        next if $j->{status} eq 'failed' || $j->{status} eq 'skipped';
+        $counted++;
+        if (($j->{size} || -1) > 0) { $tot_size += $j->{size} } else { $known = 0 }
+        $tot_done += $j->{status} eq 'complete' ? ($j->{size} > 0 ? $j->{size} : 0)
+                                                : job_progress($j);
+    }
+    my $frac = ($known && $tot_size > 0) ? $tot_done / $tot_size : 0;
+    my $left = $tot_size - $tot_done;
+    my $eta  = ($speed_ema > 0 && $known && $left > 0) ? $left / $speed_ema : -1;
+
+    my @L;
+    my $nfiles = scalar @jobs;
+    my $hdr_r  = sprintf('%d file%s %s %s', $nfiles, ($nfiles == 1 ? '' : 's'),
+                         u("\x{00B7}", '-'), ($known ? fmt_bytes($tot_size) : 'unknown size'));
+    my $nfail = scalar grep { $_->{status} eq 'failed' }  @jobs;
+    my $nskip = scalar grep { $_->{status} eq 'skipped' } @jobs;
+    $hdr_r .= sprintf(' %s %d failed',  u("\x{00B7}", '-'), $nfail) if $nfail;
+    $hdr_r .= sprintf(' %s %d skipped', u("\x{00B7}", '-'), $nskip) if $nskip;
+    my $hdr_l  = bold() . c($C_HEAD) . 'bigcurl' . rst();
+    my $gap    = $w - 2 - vlen($hdr_l) - length($hdr_r) - 20;
+    $gap = 1 if $gap < 1;
+    push @L, ' ' . $hdr_l . axis($gap) . c($C_GRAY) . $hdr_r . rst()
+           . ' ' . c($C_DIM) . u("\x{00B7}", '-') . ' elapsed '
+           . fmt_dur($t - $t_start) . rst();
+    push @L, '';
+
+    # Speed history
+    push @L, ' ' . sparkline($w - 2);
+    push @L, '';
+
+    # Bandwidth gauge
+    push @L, gauge_lines($w - 2);
+    push @L, '';
+
+    # Giant total progress meter
+    push @L, map { ' ' . $_ } big_meter($w - 3, $frac);
+    my $stat = sprintf('%s of %s', fmt_bytes($tot_done), ($known ? fmt_bytes($tot_size) : '?'));
+    my $conns = scalar @workers;
+    my $sep = ' ' . u("\x{00B7}", '-') . ' ';
+    push @L, '  ' . c($C_TEXT) . $stat . rst()
+           . ' ' . c($C_DIM) . u("\x{00B7}", '-')
+           . ' ETA ' . ($eta >= 0 ? fmt_dur($eta) : '--:--') . $sep
+           . sprintf('%d/%d conns', $conns, $conns_limit)
+           . ($retry_count ? $sep . sprintf('%d retr%s', $retry_count,
+                                            ($retry_count == 1 ? 'y' : 'ies')) : '')
+           . rst();
+    push @L, '';
+
+    # Per-file rows
+    my $namew = 0;
+    for my $j (@jobs) { $namew = length($j->{name}) if length($j->{name}) > $namew }
+    $namew = 32 if $namew > 32;
+    my $rowbar = $w - $namew - 32;
+    $rowbar = 8 if $rowbar < 8;
+    for my $j (@jobs) {
+        my $nm = $j->{name};
+        $nm = substr($nm, 0, $namew - 1) . u("\x{2026}", '~') if length($nm) > $namew;
+        my $d  = $j->{status} eq 'complete' ? $j->{size} : job_progress($j);
+        my $f  = ($j->{size} || 0) > 0 ? $d / $j->{size} : 0;
+        my ($icon, $note);
+        if    ($j->{status} eq 'complete') { $icon = c($C_OK)   . u("\x{2714}", 'v'); $f = 1; $note = 'done' }
+        elsif ($j->{status} eq 'failed')   { $icon = c($C_ERR)  . u("\x{2718}", 'x'); $note = $j->{err} || 'failed' }
+        elsif ($j->{status} eq 'skipped')  { $icon = c($C_DIM)  . u("\x{2013}", '-'); $note = $j->{reason} || 'skipped' }
+        elsif ($j->{status} eq 'active')   {
+            $icon = c($C_LIVE) . $spin;
+            my $n = scalar grep { $_->{job} == $j } @workers;
+            $note = sprintf('%d conn%s', $n, ($n == 1 ? '' : 's'));
+        }
+        else { $icon = ' '; $note = 'queued' }
+        my $pct = sprintf('%.1f%%', 100 * $f);
+        my $row = ' ' . $icon . rst() . ' '
+                . c($C_TEXT) . $nm . rst()
+                . leader($namew - length($nm) + 1)
+                . bar($rowbar, $f, 1)
+                . (' ' x (7 - length($pct)))
+                . c($C_TEXT) . $pct . rst()
+                . ' ' . c($C_DIM) . u("\x{00B7}", '-') . ' ';
+        my $room = $w - vlen($row) - 1;
+        $note = substr($note, 0, $room - 1) . u("\x{2026}", '~')
+            if $room > 1 && length($note) > $room;
+        push @L, $row . $note . rst();
+    }
+
+    # Chunk map for the file currently being worked on
+    my ($act) = grep { $_->{status} eq 'active' && !$_->{single} } @jobs;
+    if ($act) {
+        push @L, '';
+        push @L, '  ' . c($C_DIM) . 'chunks ' . u("\x{00B7}", '-') . ' ' . $act->{name}
+               . sprintf('  (%d blocks of %s)', $act->{nblocks}, fmt_bytes($act->{bs})) . rst();
+        push @L, ' ' . chunk_map($act, $w - 2);
+    }
+
+    # Trim to the terminal, dropping the least important sections first.
+    my $max = $term_h - 1;
+    if (@L > $max) {
+        splice(@L, 2, 2) if @L > $max;                  # sparkline
+        splice(@L, 2, 4) if @L > $max;                  # gauge
+        pop @L while @L > $max;
+    }
+
+    my $out = "\e[H";
+    $out .= clip($_, $w) . "\e[K\n" for @L;
+    $out .= "\e[J";
+    print $out;
+}
+
+my $last_frame  = 0;
+my $last_sample = 0;
+my $last_state  = 0;
+
+sub sample_speed {
+    my ($t) = @_;
+    return if $t - $last_sample < $SAMPLE_INTERVAL;
+    my $dt = $t - $last_sample;
+    $last_sample = $t;
+    my $inst = $dt > 0 ? ($total_bytes - ($main::sample_prev || 0)) / $dt : 0;
+    $main::sample_prev = $total_bytes;
+    $speed_ema  = $speed_ema <= 0 ? $inst : $speed_ema + $SPEED_EMA * ($inst - $speed_ema);
+    $peak_speed = $speed_ema if $speed_ema > $peak_speed;
+    push @history, $inst;
+    shift @history while @history > $HISTORY_MAX;
+}
+
+# ---------------------------------------------------------------------------
+# Event loop
+#
+# AIDEV-NOTE: Single process, no threads. select() over the curl pipes drives
+# everything: reads, progress accounting, stall detection, connection tuning
+# and redraws. Adding work here means adding it to this loop.
+# ---------------------------------------------------------------------------
+
+sub run_loop {
+    # AIDEV-NOTE: $t_start is set by main() *before* probing and must not be
+    # reset here - doing so hid the probe phase from the summary's elapsed
+    # time and from the dashboard clock, so the tool under-reported its own
+    # runtime (badly, for a long list of URLs).
+    $tune_time = $last_sample = now();
+    while (1) {
+        my $t = now();
+        last if $interrupted;
+        reap_workers();
+        fill_workers($t);
+        last if !@workers && !@reaping && !work_remaining();
+
+        if (@workers) {
+            # AIDEV-NOTE: An fd whose last read came back short is left alone
+            # for a few ms so the pipe can fill. Reading eagerly meant a wake-up
+            # and two syscalls per 16KB curl write, which on a CPU-starved box
+            # was the throughput ceiling; a 1MB pipe only helps if the reader
+            # lets it accumulate.
+            my $rin = '';
+            my $wait = $FRAME_INTERVAL;
+            for my $w (@workers) {
+                if ($w->{hold_until} > $t) {
+                    my $left = $w->{hold_until} - $t;
+                    $wait = $left if $left < $wait;
+                    next;
+                }
+                vec($rin, fileno($w->{fh}), 1) = 1;
+            }
+            my $rout = $rin;
+            my $n = select($rout, undef, undef, $wait);
+            if (defined $n && $n > 0) {
+                for my $w (@{[ @workers ]}) {
+                    next if $w->{dead};
+                    next unless defined $w->{fh};
+                    next unless vec($rout, fileno($w->{fh}), 1);
+                    worker_read($w);
+                }
+            }
+        } else {
+            select(undef, undef, undef, @reaping ? 0.01 : 0.1);   # backoff, or awaiting a reap
+        }
+
+        $t = now();
+        for my $w (@{[ @workers ]}) {
+            next if $w->{dead};
+            kill_worker($w, 'stalled') if $t - $w->{last_data} > $STALL_SECS;
+        }
+        sample_speed($t);
+        tune($t);
+        if ($t - $last_state > $STATE_INTERVAL) {
+            $last_state = $t;
+            state_save($_) for grep { $_->{status} eq 'active' } @jobs;
+        }
+        if ($mode eq 'pretty' && $t - $last_frame >= $FRAME_INTERVAL) {
+            $last_frame = $t;
+            render_frame($t);
+        }
+        emit_progress($t);
+    }
+}
+
+# AIDEV-NOTE: Commits a hedge duplicate's buffered span to the real file in
+# one uninterrupted pass, and only if it is still the case that nobody else
+# has already finished this span - see worker_read()'s hedge_dup branch for
+# why the write was buffered instead of applied as it arrived. Writing the
+# WHOLE span here, not just newly-arrived bytes, means whatever the peer
+# already wrote at these same offsets (from a possibly different origin
+# response - see the AIDEV-NOTE below) is fully replaced by one internally
+# consistent response, never interleaved with it. Single process, no
+# threads: nothing else runs between this loop starting and the caller
+# killing the peer immediately afterward, so the peer cannot write again
+# once this has started.
+sub hedge_flush {
+    my ($w) = @_;
+    return if $w->{dead};
+    my $j = $w->{job};
+    unless (defined sysseek($j->{fh}, $w->{off}, 0)) {
+        fail_job($j, "seek failed: $!");
+        return 0;
+    }
+    my $buf   = $w->{buf};
+    my $total = length($buf);
+    my $written = 0;
+    while ($written < $total) {
+        my $k = syswrite($j->{fh}, $buf, $total - $written, $written);
+        if (!defined $k) {
+            next if $! == $EINTR;
+            $j->{disk} = 1;
+            fail_job($j, "write failed: $!");
+            return 0;
+        }
+        $written += $k;
+    }
+    delete $w->{buf};
+    for my $i (0 .. $w->{span} - 1) {
+        my $bi = $w->{start} + $i;
+        substr($j->{bits}, $bi, 1) = '1';
+        delete $j->{inflight}{$bi};
+    }
+    $w->{marked} = $w->{span};
+    recompute_done($j);
+    return 1;
+}
+
+sub worker_read {
+    my ($w) = @_;
+    my $buf;
+    my $n = sysread($w->{fh}, $buf, $READ_CHUNK);
+    if (!defined $n) {
+        return if $! == $EINTR;
+        $w->{fail} = "read error: $!";
+        finish_worker($w);
+        return;
+    }
+    if ($n == 0) { finish_worker($w); return }
+
+    # A server that ignores Range answers 200 with the whole file; catch it
+    # before it scribbles over the rest of the output.
+    if (defined $w->{want} && $w->{got} + $n > $w->{want}) {
+        $w->{fail}  = 'server ignored the Range header';
+        $w->{fatal} = 1;
+        finish_worker($w);
+        return;
+    }
+
+    my $j = $w->{job};
+    if ($w->{hedge_dup}) {
+        # AIDEV-NOTE: A hedge duplicate targets bytes its peer already owns,
+        # fetched from a second, independent request to the same origin for
+        # the same range. curl_cmd() sends no If-Range/ETag conditioning on
+        # any block request (hedge or not - see its own AIDEV-NOTE), and
+        # nothing here ever compared the two peers' bytes before this was
+        # added: if the origin's answer to the second request differs at
+        # all from the first - a redeploy mid-download, a CDN edge out of
+        # sync with the one the peer hit, a non-deterministic origin - then
+        # writing both streams into the same offsets as they each arrive
+        # interleaves two different versions into one file. The result has
+        # the right length and a complete bitmap and passes every check
+        # except comparing actual bytes, which is exactly how this was
+        # found (measured: a server that flips content on a range's second
+        # request produced a downloaded file matching neither version,
+        # reported as a clean success, before this buffering existed).
+        # So a duplicate's bytes are held here instead, bounded by one
+        # hedge's tail-sized span, and only committed - via hedge_flush(),
+        # in one pass - if this copy turns out to be the winner. The
+        # loser's buffer is simply dropped, never touching the file.
+        $w->{buf} .= $buf;
+    } else {
+        unless (defined sysseek($j->{fh}, $w->{off} + $w->{got}, 0)) {
+            fail_job($j, "seek failed: $!");
+            return;
+        }
+        my $written = 0;
+        while ($written < $n) {
+            my $k = syswrite($j->{fh}, $buf, $n - $written, $written);
+            if (!defined $k) {
+                next if $! == $EINTR;
+                $j->{disk} = 1;
+                fail_job($j, "write failed: $!");
+                return;
+            }
+            $written += $k;
+        }
+    }
+    $w->{got} += $n;
+    $w->{last_data} = now();
+    $w->{hold_until} = $w->{last_data} + $w->{hold} if $n < $SMALL_READ;
+    $total_bytes += $n;
+    $tune_bytes  += $n;
+
+    return if $j->{single};
+
+    if ($w->{hedge_dup}) {
+        # Bits/inflight/done stay owned by the peer until a winner is
+        # declared here: marking them early too would let recompute_done
+        # double-count these blocks, and freeing inflight early would let
+        # pick_work hand the same bytes to a third, independent worker while
+        # the peer that actually owns them is still streaming.
+        if (defined $w->{want} && $w->{got} >= $w->{want}) {
+            # AIDEV-NOTE: This ordering - flush this side's buffer to the
+            # real file, THEN tear down (which is what kills the peer, via
+            # finish_worker's existing hedge_peer handling) - only stays
+            # correct because nothing between the two can let the peer write
+            # again. Single process, no threads: everything from here to
+            # finish_worker()'s kill_worker($peer) call is a straight chain
+            # of ordinary sub calls with no select() (the only place another
+            # worker's fd ever gets read) in between, so control cannot pass
+            # to the peer's own worker_read mid-sequence. If this ever grows
+            # a yield point (a signal-driven callback, a future switch to
+            # threads or async I/O), this invariant breaks silently and
+            # re-opens the interleaving hedge_flush() exists to close.
+            hedge_flush($w);
+            kill('KILL', $w->{pid});
+            finish_worker($w);
+            return;
+        }
+        return;
+    }
+
+    # Mark whole blocks complete as their last byte lands, so an interruption
+    # only ever loses the one block still in flight.
+    my $full = int($w->{got} / $j->{bs});
+    $full = $w->{span} if $full > $w->{span};
+    while ($w->{marked} < $full) {
+        my $bi = $w->{start} + $w->{marked};
+        substr($j->{bits}, $bi, 1) = '1';
+        delete $j->{inflight}{$bi};
+        $w->{marked}++;
+    }
+    recompute_done($j);
+    # Span was cut short by steal_work: stop pulling bytes someone else
+    # now owns.
+    if ($w->{marked} >= $w->{span}) {
+        kill('KILL', $w->{pid});
+        finish_worker($w);
+        return;
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Cleanup and exit
+# ---------------------------------------------------------------------------
+
+sub cleanup_workers {
+    for my $w (@workers) {
+        next if $w->{dead};
+        $w->{dead} = 1;
+        kill('KILL', $w->{pid});
+        close($w->{fh}) if $w->{fh};
+        delete $w->{fh};
+        waitpid($w->{pid}, 0);
+    }
+    @workers = ();
+    waitpid($_->{pid}, 0) for @reaping;
+    @reaping = ();
+    for my $j (@jobs) {
+        next unless $j->{status} eq 'active';
+        state_save($j);
+        close($j->{fh}) if $j->{fh};
+        delete $j->{fh};
+    }
+}
+
+sub rmtree_flat {
+    my ($dir) = @_;
+    return unless $dir && -d $dir;
+    if (opendir(my $dh, $dir)) {
+        while (my $e = readdir($dh)) {
+            next if $e eq '.' || $e eq '..';
+            unlink "$dir/$e";
+        }
+        closedir $dh;
+    }
+    rmdir $dir;
+}
+
+END {
+    pretty_end();
+    rmtree_flat($tmpdir);
+}
+
+sub exit_code {
+    return $EX_INTERRUPT if $interrupted;
+    my @bad = grep { $_->{status} eq 'failed' } @jobs;
+    return $EX_OK unless @bad;
+    return $EX_HTTP    if @bad == scalar grep { $_->{http} } @bad;
+    return $EX_DISK    if @bad == scalar grep { $_->{disk} } @bad;
+    return $EX_NETWORK if @bad == scalar grep { $_->{net}  } @bad;
+    return $EX_FAIL;
+}
+
+sub final_report {
+    my ($code) = @_;
+    return if $mode eq 'silent' || $mode eq 'log';
+    my $ok      = scalar grep { $_->{status} eq 'complete' } @jobs;
+    my $failed  = scalar grep { $_->{status} eq 'failed' }   @jobs;
+    my $skipped = scalar grep { $_->{status} eq 'skipped' }  @jobs;
+    my $secs    = now() - $t_start;
+    my $rate    = $secs > 0 ? $total_bytes / $secs : 0;
+    printf("bigcurl: %d ok, %d failed%s - %s in %s (%s)\n",
+        $ok, $failed, ($skipped ? ", $skipped skipped" : ''),
+        fmt_bytes($total_bytes), fmt_dur($secs), fmt_rate($rate));
+    for my $j (grep { $_->{status} eq 'failed' } @jobs) {
+        printf("  %s: %s\n", $j->{name} || $j->{url}, $j->{err} || 'failed');
+    }
+    if ($interrupted) {
+        my @part = grep { $_->{status} eq 'active' || ($_->{status} eq 'pending' && -f $_->{part}) } @jobs;
+        printf("bigcurl: interrupted; rerun the same command to resume%s\n",
+               (@part ? ' (' . scalar(@part) . ' partial)' : ''));
+    }
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+sub main {
+    parse_args(@ARGV);
+
+    # Output mode
+    if (!defined $opt_mode) { $mode = (-t STDOUT) ? 'pretty' : 'log' }
+    else                    { $mode = $opt_mode }
+    $| = 1;
+    term_size();
+    $use_color = ($mode eq 'pretty' && -t STDOUT && !$ENV{NO_COLOR}
+                  && ($ENV{TERM} || '') ne 'dumb') ? 1 : 0;
+    my $loc = ($ENV{LC_ALL} || $ENV{LC_CTYPE} || $ENV{LANG} || '');
+    $UNI = ($loc =~ /utf-?8/i) ? 1 : 0;
+
+    # URLs from -i
+    if (defined $opt_input) {
+        my $fh;
+        if ($opt_input eq '-') { $fh = \*STDIN }
+        else { open($fh, '<', $opt_input) or die_usage("cannot read $opt_input: $!") }
+        while (my $line = <$fh>) {
+            $line =~ s/^\s+|\s+$//g;
+            next if $line eq '' || $line =~ /^#/;
+            push @urls, $line;
+        }
+        close $fh unless $opt_input eq '-';
+    }
+
+    die_usage('no URLs given') unless @urls;
+    die_usage('-o cannot be used with more than one URL') if defined $opt_out && @urls > 1;
+    die_usage('-o - is not supported: chunks arrive out of order')
+        if defined $opt_out && $opt_out eq '-';
+    for my $u (@urls) {
+        die_usage("unsupported URL '$u' (only http and https)")
+            unless $u =~ m{^https?://}i;
+    }
+    if (defined $opt_conns) {
+        die_usage('-n must be a positive integer') unless $opt_conns =~ /^\d+$/ && $opt_conns > 0;
+        $conns_limit = $CONNS_MAX = $CONNS_START = $opt_conns + 0;
+        $CONNS_MIN   = 1;
+        $fixed_conns = 1;
+    } else {
+        # AIDEV-NOTE: Every connection is a curl process. On a one-core VPS
+        # whose network is userspace WireGuard, 32 of them starved the
+        # tunnel itself - measured 29 MB/s against 51 for four. Scale the
+        # opening pool with the cores available; the tuner can still grow it.
+        my $cap = 4 * cpu_count();
+        $cap = 4  if $cap < 4;
+        $conns_limit = $CONNS_START = $cap if $cap < $CONNS_START;
+    }
+    if (defined $opt_block) {
+        my $b = parse_size($opt_block);
+        die_usage("-B: cannot parse size '$opt_block'") unless $b && $b >= 4096;
+        $opt_block = $BLOCK_SIZE = $b;
+    }
+    die_usage('--retries must be a non-negative integer') unless $MAX_RETRIES =~ /^\d+$/;
+    die_usage('--stall must be a positive number')        unless $STALL_SECS =~ /^[\d.]+$/ && $STALL_SECS > 0;
+
+    unless (have_curl()) {
+        print STDERR "bigcurl: curl not found on PATH\n";
+        return $EX_NOCURL;
+    }
+
+    my $base = $ENV{TMPDIR} || '/tmp';
+    $base =~ s{/+$}{};
+    # AIDEV-NOTE: $$ alone does not make this path unique across runs - PIDs
+    # wrap and get reused, a killed run can leave "$base/bigcurl.$$" behind,
+    # and low-PID containers make a same-PID collision between two unrelated
+    # bigcurl invocations plausible rather than exotic. A collision must not
+    # be fatal: retry with an added random suffix a bounded number of times.
+    # Any error other than EEXIST (full disk, read-only fs, permissions) is
+    # a real problem and must still fail loudly and immediately as EX_DISK -
+    # do not let this loop turn a genuine disk error into a silent retry.
+    my $TMPDIR_MKDIR_RETRIES = 5;
+    my $attempt = 0;
+    while (1) {
+        $tmpdir = $attempt == 0 ? "$base/bigcurl.$$"
+                                 : "$base/bigcurl.$$." . int(rand(1_000_000));
+        last if mkdir($tmpdir, 0700);
+        if ($!{EEXIST} && $attempt < $TMPDIR_MKDIR_RETRIES) {
+            $attempt++;
+            next;
+        }
+        print STDERR "bigcurl: cannot create $tmpdir: $!\n";
+        return $EX_DISK;
+    }
+
+    my $idx = 0;
+    for my $u (@urls) {
+        push @jobs, { url => $u, idx => $idx++, status => 'new', done => 0, name => url_basename($u) };
+    }
+
+    $t_start = now();
+    probe_all();
+    if ($interrupted) {
+        emit_summary($EX_INTERRUPT);
+        return $EX_INTERRUPT;
+    }
+
+    my %seen;
+    for my $j (@jobs) {
+        next if $j->{status} eq 'failed';
+        prepare_job($j);
+        next unless $j->{out};
+        if ($seen{ $j->{out} }++) {
+            # Two URLs landing on the same name: keep both.
+            my $n = $seen{ $j->{out} } - 1;
+            $j->{out}   .= ".$n";
+            $j->{part}   = $j->{out} . '.part';
+            $j->{statef} = $j->{part} . '.state';
+            $j->{name}   = $j->{out};
+            $j->{name}   =~ s{^.*/}{};
+        }
+    }
+    emit_error($_)  for grep { $_->{status} eq 'failed' }  @jobs;
+    emit_skip($_)   for grep { $_->{status} eq 'skipped' } @jobs;
+
+    pretty_begin() if $mode eq 'pretty';
+    run_loop();
+    for my $j (@jobs) {
+        maybe_complete($j) if $j->{status} eq 'active' && $j->{bits} !~ /0/;
+    }
+    cleanup_workers();
+    pretty_end();
+
+    my $code = exit_code();
+    emit_summary($code);
+    final_report($code);
+    return $code;
+}
+
+exit main();
