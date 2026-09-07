@@ -1,0 +1,3 @@
+label,reps,mbs,mbs_lo,mbs_hi,retry_per_mb,retry_per_mb_lo,retry_per_mb_hi,retries,stall_frac,speed_cv,speed_cv_lo,speed_cv_hi,conns_mean,conns_max,conns_final,conns_drops,tail_frac,tail_frac_lo,tail_frac_hi
+clean-rtt250-loss0,5,12.7341,12.4622,12.7341,0.00000,0.00000,0.00000,0.0,0.0000,0.3195,0.2801,0.3301,21.22,36,1,5.0,0.2165,0.2162,0.2322
+lossy-rtt100-loss0.5,5,12.9679,9.7898,14.2331,0.00000,0.00000,0.00000,0.0,0.0000,0.4444,0.3708,0.5400,20.90,36,1,6.0,0.3676,0.3055,0.4011

@@ -3,3 +3,6 @@
 *.db-wal
 .DS_Store
 __pycache__/
+.verdict
+bench/bigcurl/charts.json
+bench/bigcurl/tables.json

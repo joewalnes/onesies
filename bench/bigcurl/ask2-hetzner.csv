@@ -1,0 +1,13 @@
+label,tool,rep,seconds,mbps,cpu_user,cpu_sys,ok,timeout,bytes
+hetzner/loopback/n4,curl,1,0.817,1253.321,0.04,0.78,1,0,1073741824
+hetzner/loopback/n4,bigcurl-4,1,0.761,1346.031,0.15,1.34,1,0,1073741824
+hetzner/loopback/n4,curlo-4,1,1.267,808.001,0.04,1.66,1,0,1073741824
+hetzner/loopback/n4,curldd-4,1,0.613,1671.343,0.08,3.09,1,0,1073741824
+hetzner/loopback/n4,curl,2,0.846,1210.150,0.04,0.80,1,0,1073741824
+hetzner/loopback/n4,bigcurl-4,2,0.819,1251.045,0.16,1.45,1,0,1073741824
+hetzner/loopback/n4,curlo-4,2,1.361,752.307,0.05,1.72,1,0,1073741824
+hetzner/loopback/n4,curldd-4,2,0.531,1929.239,0.09,2.75,1,0,1073741824
+hetzner/loopback/n4,curl,3,0.796,1286.684,0.03,0.76,1,0,1073741824
+hetzner/loopback/n4,bigcurl-4,3,0.787,1301.642,0.15,1.38,1,0,1073741824
+hetzner/loopback/n4,curlo-4,3,1.286,795.964,0.05,1.67,1,0,1073741824
+hetzner/loopback/n4,curldd-4,3,0.568,1802.715,0.06,2.91,1,0,1073741824

@@ -1,0 +1,17 @@
+label,tool,rep,seconds,mbps,cpu_user,cpu_sys,ok,timeout,bytes
+steady/rtt100ms/loss0pct,curl,1,45.769,22.373,0.34,2.24,1,0,1073741824
+steady/rtt100ms/loss0pct,aria2-8,1,47.040,21.769,2.27,5.23,1,0,1073741824
+steady/rtt100ms/loss0pct,bigcurl-8,1,47.502,21.557,2.76,8.59,1,0,1073741824
+steady/rtt100ms/loss0pct,bigcurl-auto,1,45.840,22.338,6.28,14.19,1,0,1073741824
+steady/rtt100ms/loss0pct,curl,2,45.768,22.374,0.38,2.41,1,0,1073741824
+steady/rtt100ms/loss0pct,aria2-8,2,47.319,21.640,2.28,5.41,1,0,1073741824
+steady/rtt100ms/loss0pct,bigcurl-8,2,47.226,21.683,2.66,8.49,1,0,1073741824
+steady/rtt100ms/loss0pct,bigcurl-auto,2,46.458,22.041,6.12,13.87,1,0,1073741824
+steady/rtt250ms/loss0pct,curl,1,82.433,12.422,0.46,2.96,1,0,1073741824
+steady/rtt250ms/loss0pct,aria2-8,1,48.968,20.912,2.41,5.43,1,0,1073741824
+steady/rtt250ms/loss0pct,bigcurl-8,1,63.583,16.105,2.56,8.22,1,0,1073741824
+steady/rtt250ms/loss0pct,bigcurl-auto,1,51.543,19.867,5.95,13.02,1,0,1073741824
+steady/rtt250ms/loss0pct,curl,2,82.618,12.394,0.34,2.40,1,0,1073741824
+steady/rtt250ms/loss0pct,aria2-8,2,50.113,20.434,1.99,4.99,1,0,1073741824
+steady/rtt250ms/loss0pct,bigcurl-8,2,60.318,16.977,2.71,8.29,1,0,1073741824
+steady/rtt250ms/loss0pct,bigcurl-auto,2,51.443,19.905,5.83,12.85,1,0,1073741824

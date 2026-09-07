@@ -1,0 +1,12 @@
+== hetzner: server behaviours ==
+  ok   no-range server: exit 0
+  ok   no-range server: bytes intact
+  ok   conn-capped server: exit 0
+  ok   conn-capped server: bytes intact
+  ok   404 exit code
+== hetzner: chaos resume (10 kills on a 128MB file) ==
+  ok   chaos: final bytes intact
+== hetzner: 200 x 1MB files ==
+  xargs -P8 curl : 0.26s (200 files)
+  bigcurl -i     : 0.11s (200 files)
+== hetzner: 6 passed, 0 failed ==

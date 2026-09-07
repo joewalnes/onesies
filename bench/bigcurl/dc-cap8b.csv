@@ -1,0 +1,5 @@
+label,tool,rep,seconds,mbps,cpu_user,cpu_sys,ok,timeout,bytes
+do-sfo>hz-ore/rate4m+cap8,bigcurl-auto,1,33.525,30.545,1.52,4.35,1,0,1073741824
+do-sfo>hz-ore/rate4m+cap8,bigcurl-16,1,32.330,31.673,1.69,4.26,1,0,1073741824
+do-sfo>hz-ore/rate4m+cap8,bigcurl-auto,2,33.297,30.753,1.56,4.14,1,0,1073741824
+do-sfo>hz-ore/rate4m+cap8,bigcurl-16,2,32.465,31.542,1.57,4.03,1,0,1073741824

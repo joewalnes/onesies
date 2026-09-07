@@ -1,0 +1,894 @@
+<title>bigcurl Under Loss</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap">
+<style>
+:root{
+  color-scheme: light;
+  --ground:#f2f5f8; --surface:#ffffff; --surface-2:#eef2f6;
+  --ink:#0f1720; --ink-2:#46545f; --ink-3:#78868f;
+  --rule:#dbe2e9; --rule-2:#c6d0d9;
+  --accent:#0a6a86; --accent-soft:#e2f0f5;
+  --good:#0f7a55; --bad:#b23c30;
+  --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100;
+  --sans:"IBM Plex Sans",ui-sans-serif,system-ui,sans-serif;
+  --cond:"IBM Plex Sans Condensed","IBM Plex Sans",ui-sans-serif,system-ui,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  --measure:34rem;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    color-scheme: dark;
+    --ground:#0b1015; --surface:#131820; --surface-2:#182029;
+    --ink:#e7eef5; --ink-2:#a1b0bd; --ink-3:#6e7d8a;
+    --rule:#222d38; --rule-2:#31404d;
+    --accent:#54c8e6; --accent-soft:#122b34;
+    --good:#3ec08c; --bad:#e5796a;
+    --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme: dark;
+  --ground:#0b1015; --surface:#131820; --surface-2:#182029;
+  --ink:#e7eef5; --ink-2:#a1b0bd; --ink-3:#6e7d8a;
+  --rule:#222d38; --rule-2:#31404d;
+  --accent:#54c8e6; --accent-soft:#122b34;
+  --good:#3ec08c; --bad:#e5796a;
+  --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500;
+}
+*{box-sizing:border-box}
+body{background:var(--ground);color:var(--ink);font-family:var(--sans);
+  font-size:16px;line-height:1.6;-webkit-font-smoothing:antialiased}
+.wrap{max-width:70rem;margin:0 auto;padding:0 1.5rem 6rem}
+.col{max-width:var(--measure);margin-inline:auto}
+p{margin:0 0 1.1em}
+a{color:var(--accent)}
+h1,h2,h3{font-family:var(--cond);text-wrap:balance;margin:0}
+strong{font-weight:600}
+code,.mono{font-family:var(--mono);font-size:.88em}
+
+/* masthead */
+header{padding:4rem 0 2rem;border-bottom:1px solid var(--rule)}
+.eyebrow{font-family:var(--mono);font-size:.7rem;letter-spacing:.16em;
+  text-transform:uppercase;color:var(--accent);margin:0 0 1rem}
+h1{font-size:clamp(2.4rem,6vw,3.6rem);line-height:1.02;font-weight:700;letter-spacing:-.02em}
+.standfirst{font-size:1.16rem;color:var(--ink-2);margin:1.2rem 0 0;max-width:38rem}
+.byline{font-family:var(--mono);font-size:.74rem;color:var(--ink-3);
+  margin-top:1.6rem;display:flex;flex-wrap:wrap;gap:.5rem 1.4rem}
+
+/* the finding up front */
+.verdict{display:grid;gap:1px;background:var(--rule);border:1px solid var(--rule);
+  grid-template-columns:repeat(auto-fit,minmax(13rem,1fr));margin:2.5rem 0 0}
+.verdict>div{background:var(--surface);padding:1.1rem 1.2rem}
+.verdict .n{font-family:var(--cond);font-size:2.1rem;font-weight:700;line-height:1;
+  letter-spacing:-.01em;font-variant-numeric:tabular-nums}
+.verdict .n.up{color:var(--accent)}
+.verdict .n.down{color:var(--bad)}
+.verdict .l{font-size:.83rem;color:var(--ink-2);margin-top:.5rem;line-height:1.4}
+
+section{padding-top:3.4rem}
+h2{font-size:1.65rem;font-weight:600;letter-spacing:-.01em;margin-bottom:.2rem}
+.kicker{font-family:var(--mono);font-size:.7rem;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--ink-3);margin-bottom:.55rem}
+h3{font-size:1.06rem;font-weight:600;margin:2rem 0 .5rem}
+.lede{color:var(--ink-2);margin-bottom:1.4rem}
+
+/* run card: conditions strip + result */
+.run{background:var(--surface);border:1px solid var(--rule);margin:1.8rem 0}
+.run>.spec{font-family:var(--mono);font-size:.72rem;color:var(--ink-2);
+  padding:.6rem .95rem;border-bottom:1px solid var(--rule);background:var(--surface-2);
+  display:flex;flex-wrap:wrap;gap:.3rem 1.1rem}
+.run>.spec b{font-weight:500;color:var(--ink-3)}
+.run>.body{padding:1.1rem .95rem 1.2rem}
+.panels{display:grid;gap:1.6rem;grid-template-columns:repeat(auto-fit,minmax(19rem,1fr))}
+.panel h4{font-family:var(--cond);font-size:.92rem;font-weight:600;margin:0 0 .1rem;
+  color:var(--ink)}
+.panel .sub{font-family:var(--mono);font-size:.7rem;color:var(--ink-3);margin-bottom:.5rem}
+
+/* chart bits */
+.chart{display:block;overflow:visible}
+.chart .grid{stroke:var(--rule);stroke-width:1}
+.chart .ref{stroke:var(--ink-3);stroke-width:2;stroke-dasharray:4 4}
+.chart .tick{fill:var(--ink-3);font-family:var(--mono);font-size:9.5px}
+.chart .reflab{fill:var(--ink-2);font-family:var(--mono);font-size:9.5px}
+.chart .axtitle{fill:var(--ink-3);font-family:var(--mono);font-size:9.5px}
+.chart .glab{fill:var(--ink-2);font-family:var(--mono);font-size:10.5px}
+.chart .vlab{fill:var(--ink);font-family:var(--mono);font-size:10px;
+  font-variant-numeric:tabular-nums}
+.legend{display:flex;flex-wrap:wrap;gap:.4rem 1.1rem;margin:.9rem 0 0;
+  font-family:var(--mono);font-size:.72rem;color:var(--ink-2)}
+.key{display:inline-flex;align-items:center;gap:.42rem}
+.key i{width:11px;height:11px;border-radius:3px;display:inline-block}
+
+/* tables */
+.tw{overflow-x:auto;margin:1.2rem 0}
+table{border-collapse:collapse;width:100%;font-family:var(--mono);font-size:.78rem;
+  font-variant-numeric:tabular-nums;white-space:nowrap}
+th{text-align:right;font-weight:500;color:var(--ink-3);padding:.42rem .6rem;
+  border-bottom:1px solid var(--rule-2);font-size:.72rem}
+th:first-child,td.k{text-align:left}
+td{text-align:right;padding:.36rem .6rem;border-bottom:1px solid var(--rule);color:var(--ink)}
+td.k{color:var(--ink-2)}
+tr.win td{background:var(--accent-soft)}
+td.sp{color:var(--accent);font-weight:600}
+caption{caption-side:bottom;text-align:left;font-family:var(--sans);font-size:.8rem;
+  color:var(--ink-3);padding-top:.7rem;white-space:normal;line-height:1.5}
+
+/* defect list */
+.defects{display:grid;gap:1px;background:var(--rule);border:1px solid var(--rule);margin:1.4rem 0}
+.defect{background:var(--surface);padding:.85rem 1rem;display:grid;
+  grid-template-columns:minmax(0,1fr) auto;gap:.3rem 1rem;align-items:start}
+.defect .d{font-size:.9rem;line-height:1.5}
+.defect .d b{font-family:var(--cond);font-size:1rem;display:block;margin-bottom:.15rem}
+.defect .g{font-family:var(--mono);font-size:.74rem;color:var(--accent);
+  white-space:nowrap;font-weight:500;padding-top:.15rem}
+.defect .g.fix{color:var(--good)}
+.asks{display:grid;gap:1px;background:var(--rule);border:1px solid var(--rule);margin:1.4rem 0}
+.ask{background:var(--surface);padding:1rem 1.1rem}
+.ask>.h{display:flex;align-items:baseline;gap:.6rem;flex-wrap:wrap;margin-bottom:.45rem}
+.ask>.h b{font-family:var(--cond);font-size:1.05rem}
+.ask>.h .t{font-family:var(--mono);font-size:.66rem;letter-spacing:.1em;
+  text-transform:uppercase;padding:.16rem .42rem;border:1px solid currentColor}
+.t.no{color:var(--bad)} .t.yes{color:var(--good)} .t.hold{color:var(--ink-3)}
+.ask p{font-size:.9rem;line-height:1.55;margin:.45rem 0 0;color:var(--ink-2)}
+.ask p:first-of-type{color:var(--ink)}
+.prov{font-family:var(--mono);font-size:.68rem;color:var(--ink-3);
+  border-top:1px dotted var(--rule-2);margin-top:.6rem;padding-top:.4rem}
+.instr{background:var(--surface-2);border-left:3px solid var(--accent);
+  padding:.8rem 1rem;margin:1.4rem 0;font-size:.88rem;line-height:1.55}
+
+.checks{list-style:none;padding:0;margin:1rem 0;display:grid;gap:.3rem}
+.checks li{font-family:var(--mono);font-size:.79rem;color:var(--ink-2);
+  display:flex;gap:.6rem;align-items:baseline}
+.checks .ok{color:var(--good);font-weight:600}
+
+.note{border-left:2px solid var(--rule-2);padding:.1rem 0 .1rem 1rem;
+  color:var(--ink-2);font-size:.94rem;margin:1.4rem 0}
+.dnf{color:var(--bad);font-weight:600}
+pre{background:var(--surface);border:1px solid var(--rule);padding:.9rem 1rem;
+  overflow-x:auto;font-family:var(--mono);font-size:.76rem;line-height:1.65;margin:1rem 0}
+footer{margin-top:4rem;padding-top:1.6rem;border-top:1px solid var(--rule);
+  font-family:var(--mono);font-size:.73rem;color:var(--ink-3)}
+</style>
+
+<div class="wrap">
+<header class="col">
+  <p class="eyebrow">Measurement note · onesies/cli</p>
+  <h1>bigcurl Under Loss</h1>
+  <p class="standfirst">Parallel chunked downloading is worth almost nothing on a
+  clean link and roughly fifteenfold on a lossy one. Here is where the line falls,
+  measured against curl, aria2c and axel across a controlled network and three real
+  ones — and what it took to make one small tool win there.</p>
+  <div class="byline">
+    <span>6 September 2026 · final pass, build <span class="mono">8066b6a</span></span>
+    <span>333 runs of the final build · every one checksum-verified</span>
+    <span>Hetzner Oregon · DO Santa Clara · Starlink</span>
+  </div>
+  <div class="verdict">
+    <div><div class="n up">14.9×</div><div class="l">bigcurl over curl at
+      250 ms RTT with 0.5 % packet loss — the cell where both tools are stable
+      across repetitions</div></div>
+    <div><div class="n up">13.2×</div><div class="l">over curl against a server
+      capping each connection at 4 MB/s</div></div>
+    <div><div class="n up">11 / 12</div><div class="l">controlled-network cells
+      where the default mode is within 5 % of the best tool, or is the best</div></div>
+    <div><div class="n down">0.66×</div><div class="l">of curl on a one-core client
+      already at 90 % CPU — the machine, not the network</div></div>
+  </div>
+</header>
+
+<section class="col">
+  <p class="kicker">Summary</p>
+  <h2>What the numbers say</h2>
+  <p class="lede">Four findings, in the order they matter.</p>
+  <p><strong>Packet loss is the variable, not latency.</strong> A single TCP stream
+  gets roughly <span class="mono">MSS / (RTT · √p)</span>, so loss hurts it
+  quadratically while N streams each get their own share. At 0.5 % loss and 100 ms
+  RTT curl manages 1.10 MB/s; bigcurl manages 9.04, aria2c
+  4.88. At 250 ms and the same loss it is 0.23 against
+  3.42. On the same paths with no loss they are level. Curl's figure in the
+  100 ms cell is not a stable number — see the caveat under the sweep table.</p>
+  <p><strong>A per-connection rate cap is the other clean win.</strong> Against
+  nginx with <span class="mono">limit_rate 4m</span>, curl gets exactly 4.00 MB/s
+  <p><strong>A per-connection rate cap is the other clean win.</strong> Against
+  nginx with <span class="mono">limit_rate 4m</span>, curl gets exactly 4.00 MB/s
+  and everything parallel gets as much as the client can take: bigcurl
+  44.88 MB/s in adaptive mode from a one-core box, aria2c
+  52.67. Add a cap of eight connections per IP and both settle at the
+  cap's 32 (31.55 and 32.20).</p>
+  <p><strong>Real Starlink behaves like the lossy lab, not the clean one.</strong>
+  Single-stream curl to an origin 50 ms away got 1.23 MB/s on the night of
+  this run; bigcurl got 4.00 and aria2c 3.15. The same suite on an
+  earlier pass measured curl at 3.60 on the same path — Starlink's baseline moves by
+  a factor of two or three between nights, which is exactly the kind of link that
+  rewards not depending on one stream.</p>
+  <p><strong>On a machine with no CPU to spare, bigcurl is the slowest tool
+  tested.</strong> A one-core VPS whose network is userspace WireGuard gives curl
+  73.38 MB/s and bigcurl 48.38. That is the price of running a scheduler and a process per
+  connection on a box already at 90 %, and it is measured below rather than
+  glossed.</p>
+</section>
+
+<section class="col">
+  <p class="kicker">Second pass · what changed</p>
+  <h2>Why many small requests beat few big ones</h2>
+  <p class="lede">The first report left bigcurl at half of aria2's throughput under
+  loss and at 0.56× curl on a fast link. Tracing both to root cause took one
+  experiment each.</p>
+  <p><strong>Under loss, granularity is everything.</strong> At 100 ms and 0.5 %
+  loss, aria2c with its default 1 MB pieces managed 5.72 MB/s; the same aria2c told
+  to use 4 MB pieces managed 2.81 — identical to eight raw curls doing one 4 MB range
+  each. And thirty-two independent curls fetching 1 MB each scored 6.61, the fastest
+  configuration measured. Per-connection throughput under random loss varies
+  wildly, so small work units let the lucky connections do more; a big static span
+  hands the whole tail to the unlucky one. bigcurl now opens 32 connections
+  (scaled down with CPU count) and sizes requests from the measured per-connection
+  rate, so they are small under loss and large on a clean link.</p>
+  <p><strong>On a fast link, the parent process was the ceiling.</strong>
+  <span class="mono">close()</span> on a perl pipe blocks in <span class="mono">waitpid</span>
+  for the child — 37 ms per curl exit on a contended box during which nobody's pipe
+  was read. A hand-made pipe with a non-blocking reap, a 1 MB pipe buffer, and
+  request sizing that no longer spends the first two seconds on tiny opening spans
+  took loopback from 1231 to 1487 MB/s, past curl's 1394.</p>
+  <p><strong>And 200 small files were costing 808 processes.</strong> One HEAD
+  probe per file, then a span cap meant for one big file splitting each 1 MB file
+  into four requests. Probes are now batched 25 to a curl over one connection, and
+  no request is ever smaller than 1 MB.</p>
+</section>
+
+<section>
+  <div class="col">
+    <p class="kicker">Experiment 1 · controlled network</p>
+    <h2>Where the line falls</h2>
+    <p class="lede">A veth pair into a network namespace with <span class="mono">netem</span>
+    on both ends, so RTT and loss are exact numbers rather than whatever the internet
+    was doing. Both panels share a scale.</p>
+  </div>
+  <div class="run">
+    <div class="spec">
+      <span><b>file</b> 32 MB</span><span><b>link</b> 200 Mbit</span>
+      <span><b>loss</b> per direction</span><span><b>reps</b> 3, median</span>
+      <span><b>client</b> netns on Hetzner Oregon</span>
+    </div>
+    <div class="body">
+      <div class="panels">
+        <div class="panel">
+          <h4>100 ms round trip</h4>
+          <div class="sub">transatlantic-ish</div>
+          <svg viewBox="0 0 560 256" width="100%" height="auto" role="img" class="chart"><line x1="104.0" y1="18" x2="104.0" y2="246" class="grid"/><text x="104.0" y="13" class="tick" text-anchor="middle">0</text><line x1="187.8" y1="18" x2="187.8" y2="246" class="grid"/><text x="187.8" y="13" class="tick" text-anchor="middle">5</text><line x1="271.5" y1="18" x2="271.5" y2="246" class="grid"/><text x="271.5" y="13" class="tick" text-anchor="middle">10</text><line x1="355.2" y1="18" x2="355.2" y2="246" class="grid"/><text x="355.2" y="13" class="tick" text-anchor="middle">15</text><line x1="439.0" y1="18" x2="439.0" y2="246" class="grid"/><text x="439.0" y="13" class="tick" text-anchor="middle">20</text><text x="92" y="13" class="tick" text-anchor="end">MB/s</text><text x="92" y="55.0" class="glab" text-anchor="end" dominant-baseline="middle">no loss</text><rect x="104" y="26" width="237.0" height="13" rx="4" fill="var(--s1)"/><text x="348.0" y="32.5" class="vlab" dominant-baseline="middle">14.15</text><rect x="104" y="41" width="182.2" height="13" rx="4" fill="var(--s2)"/><text x="293.2" y="47.5" class="vlab" dominant-baseline="middle">10.88</text><rect x="104" y="56" width="163.0" height="13" rx="4" fill="var(--s3)"/><text x="274.0" y="62.5" class="vlab" dominant-baseline="middle">9.73</text><rect x="104" y="71" width="229.5" height="13" rx="4" fill="var(--s4)"/><text x="340.5" y="77.5" class="vlab" dominant-baseline="middle">13.70</text><text x="92" y="135.0" class="glab" text-anchor="end" dominant-baseline="middle">0.1% loss</text><rect x="104" y="106" width="163.3" height="13" rx="4" fill="var(--s1)"/><text x="274.3" y="112.5" class="vlab" dominant-baseline="middle">9.75</text><rect x="104" y="121" width="158.3" height="13" rx="4" fill="var(--s2)"/><text x="269.3" y="127.5" class="vlab" dominant-baseline="middle">9.45</text><rect x="104" y="136" width="148.2" height="13" rx="4" fill="var(--s3)"/><text x="259.2" y="142.5" class="vlab" dominant-baseline="middle">8.85</text><rect x="104" y="151" width="186.1" height="13" rx="4" fill="var(--s4)"/><text x="297.1" y="157.5" class="vlab" dominant-baseline="middle">11.11</text><text x="92" y="215.0" class="glab" text-anchor="end" dominant-baseline="middle">0.5% loss</text><rect x="104" y="186" width="18.4" height="13" rx="4" fill="var(--s1)"/><text x="129.4" y="192.5" class="vlab" dominant-baseline="middle">1.10</text><rect x="104" y="201" width="81.7" height="13" rx="4" fill="var(--s2)"/><text x="192.7" y="207.5" class="vlab" dominant-baseline="middle">4.88</text><rect x="104" y="216" width="119.6" height="13" rx="4" fill="var(--s3)"/><text x="230.6" y="222.5" class="vlab" dominant-baseline="middle">7.14</text><rect x="104" y="231" width="151.4" height="13" rx="4" fill="var(--s4)"/><text x="262.4" y="237.5" class="vlab" dominant-baseline="middle">9.04</text></svg>
+        </div>
+        <div class="panel">
+          <h4>250 ms round trip</h4>
+          <div class="sub">intercontinental, or a bad satellite minute</div>
+          <svg viewBox="0 0 560 256" width="100%" height="auto" role="img" class="chart"><line x1="104.0" y1="18" x2="104.0" y2="246" class="grid"/><text x="104.0" y="13" class="tick" text-anchor="middle">0</text><line x1="187.8" y1="18" x2="187.8" y2="246" class="grid"/><text x="187.8" y="13" class="tick" text-anchor="middle">5</text><line x1="271.5" y1="18" x2="271.5" y2="246" class="grid"/><text x="271.5" y="13" class="tick" text-anchor="middle">10</text><line x1="355.2" y1="18" x2="355.2" y2="246" class="grid"/><text x="355.2" y="13" class="tick" text-anchor="middle">15</text><line x1="439.0" y1="18" x2="439.0" y2="246" class="grid"/><text x="439.0" y="13" class="tick" text-anchor="middle">20</text><text x="92" y="13" class="tick" text-anchor="end">MB/s</text><text x="92" y="55.0" class="glab" text-anchor="end" dominant-baseline="middle">no loss</text><rect x="104" y="26" width="113.4" height="13" rx="4" fill="var(--s1)"/><text x="224.4" y="32.5" class="vlab" dominant-baseline="middle">6.77</text><rect x="104" y="41" width="80.7" height="13" rx="4" fill="var(--s2)"/><text x="191.7" y="47.5" class="vlab" dominant-baseline="middle">4.82</text><rect x="104" y="56" width="72.7" height="13" rx="4" fill="var(--s3)"/><text x="183.7" y="62.5" class="vlab" dominant-baseline="middle">4.34</text><rect x="104" y="71" width="110.4" height="13" rx="4" fill="var(--s4)"/><text x="221.4" y="77.5" class="vlab" dominant-baseline="middle">6.59</text><text x="92" y="135.0" class="glab" text-anchor="end" dominant-baseline="middle">0.1% loss</text><rect x="104" y="106" width="102.7" height="13" rx="4" fill="var(--s1)"/><text x="213.7" y="112.5" class="vlab" dominant-baseline="middle">6.13</text><rect x="104" y="121" width="77.4" height="13" rx="4" fill="var(--s2)"/><text x="188.4" y="127.5" class="vlab" dominant-baseline="middle">4.62</text><rect x="104" y="136" width="74.9" height="13" rx="4" fill="var(--s3)"/><text x="185.9" y="142.5" class="vlab" dominant-baseline="middle">4.47</text><rect x="104" y="151" width="100.8" height="13" rx="4" fill="var(--s4)"/><text x="211.8" y="157.5" class="vlab" dominant-baseline="middle">6.02</text><text x="92" y="215.0" class="glab" text-anchor="end" dominant-baseline="middle">0.5% loss</text><rect x="104" y="186" width="3.9" height="13" rx="4" fill="var(--s1)"/><text x="114.9" y="192.5" class="vlab" dominant-baseline="middle">0.23</text><rect x="104" y="201" width="37.0" height="13" rx="4" fill="var(--s2)"/><text x="148.0" y="207.5" class="vlab" dominant-baseline="middle">2.21</text><rect x="104" y="216" width="47.7" height="13" rx="4" fill="var(--s3)"/><text x="158.7" y="222.5" class="vlab" dominant-baseline="middle">2.85</text><rect x="104" y="231" width="57.3" height="13" rx="4" fill="var(--s4)"/><text x="168.3" y="237.5" class="vlab" dominant-baseline="middle">3.42</text></svg>
+        </div>
+      </div>
+      <div class="legend"><span class="key"><i style="background:var(--s1)"></i>curl</span><span class="key"><i style="background:var(--s2)"></i>aria2c -x8</span><span class="key"><i style="background:var(--s3)"></i>axel -n8</span><span class="key"><i style="background:var(--s4)"></i>bigcurl</span></div>
+    </div>
+  </div>
+  <div class="col">
+    <p>The pattern is the same in both panels and holds across the full sweep: with
+    no loss the parallel tools sit level with curl, and as soon as there is loss curl
+    falls off a cliff none of them go near. Against the other <em>multi-connection</em>
+    tools — the like-for-like comparison, and the one where both sides are stable
+    across repetitions — bigcurl leads in 11 of 12 cells, by
+    2 % to 37 %. The one it loses, 25 ms at 0.1 % loss,
+    it loses to axel by 11 %. Its default adaptive mode is within
+    5 % of the best tool of any kind in 11 of 12 cells.</p>
+    <p class="note"><b>Read "N× curl" in the lossy cells with care.</b> A single TCP
+    stream under netem's per-connection loss either survives slow start or collapses
+    into repeated timeouts, and which one happens is close to a coin flip. At 100 ms
+    and 0.5 % loss curl's three repetitions measured 0.32,
+    1.10 and 11.62 MB/s — a 36× spread
+    inside one cell — so the median there is whichever rep landed in the middle, not
+    an estimate of anything. Every other tool in that cell has a rep spread under
+    2.6×. The 250 ms / 0.5 % cell is quoted in the summary instead because curl is
+    stable there (1.2× spread) and so is bigcurl (1.5×).</p>
+  </div>
+  <div class="tw">
+    <table>
+      <caption>Full sweep, median MB/s of 3 runs, every run checksum-verified.
+      Shaded rows are where parallelism earns its keep; the speedup column is the
+      best parallel tool over curl. curl's figures at 0.1 % loss vary enormously
+      between grids (0.94 to 6.40 MB/s at 250 ms — one lost packet in a 32 MB
+      transfer is the difference), so read that row as a coin toss.</caption>
+      <thead><tr><th>RTT</th><th>loss</th><th>curl</th><th>aria2c -x8</th>
+      <th>axel -n8</th><th>bigcurl -n8</th><th>bigcurl -n16</th><th>bigcurl</th>
+      <th>best/curl</th></tr></thead>
+      <tbody><tr><td class="k">0 ms</td><td class="k">—</td><td>22.64</td><td>21.25</td><td>20.09</td><td>21.78</td><td>22.02</td><td>21.94</td><td class="sp">1.0×</td></tr><tr><td class="k">25 ms</td><td class="k">—</td><td>20.29</td><td>19.51</td><td>18.76</td><td>18.62</td><td>20.02</td><td>20.41</td><td class="sp">1.0×</td></tr><tr><td class="k">100 ms</td><td class="k">—</td><td>14.15</td><td>10.88</td><td>9.73</td><td>7.39</td><td>9.40</td><td>13.70</td><td class="sp">1.0×</td></tr><tr><td class="k">250 ms</td><td class="k">—</td><td>6.77</td><td>4.82</td><td>4.34</td><td>4.13</td><td>4.19</td><td>6.59</td><td class="sp">1.0×</td></tr><tr><td class="k">0 ms</td><td class="k">0.1%</td><td>22.59</td><td>21.31</td><td>20.68</td><td>21.83</td><td>21.82</td><td>21.76</td><td class="sp">1.0×</td></tr><tr><td class="k">25 ms</td><td class="k">0.1%</td><td>20.00</td><td>16.04</td><td>19.18</td><td>16.25</td><td>16.89</td><td>17.13</td><td class="sp">1.0×</td></tr><tr><td class="k">100 ms</td><td class="k">0.1%</td><td>9.75</td><td>9.45</td><td>8.85</td><td>6.74</td><td>8.77</td><td>11.11</td><td class="sp">1.1×</td></tr><tr><td class="k">250 ms</td><td class="k">0.1%</td><td>6.13</td><td>4.62</td><td>4.47</td><td>3.98</td><td>4.05</td><td>6.02</td><td class="sp">1.0×</td></tr><tr><td class="k">0 ms</td><td class="k">0.5%</td><td>22.64</td><td>21.59</td><td>20.84</td><td>21.82</td><td>22.10</td><td>21.84</td><td class="sp">1.0×</td></tr><tr class="win"><td class="k">25 ms</td><td class="k">0.5%</td><td>2.39</td><td>13.42</td><td>15.15</td><td>10.84</td><td>13.17</td><td>16.89</td><td class="sp">7.1×</td></tr><tr class="win"><td class="k">100 ms</td><td class="k">0.5%</td><td>1.10</td><td>4.88</td><td>7.14</td><td>4.73</td><td>6.56</td><td>9.04</td><td class="sp">8.2×</td></tr><tr class="win"><td class="k">250 ms</td><td class="k">0.5%</td><td>0.23</td><td>2.21</td><td>2.85</td><td>2.21</td><td>2.48</td><td>3.42</td><td class="sp">14.9×</td></tr></tbody>
+    </table>
+  </div>
+  <div class="col">
+    <div class="note"><strong>A caveat on the clean rows.</strong> 32 MB at 250 ms
+    RTT is mostly TCP slow start, which flatters a single stream. Repeating the
+    no-loss cells with a 1 GB file changes the picture: at 250 ms curl gets 12.39
+    MB/s and bigcurl 19.46. Fixture size is a confound, so both are reported.</div>
+  </div>
+  <div class="tw">
+    <table>
+      <caption>Steady state: the same clean path with a 1 GB file, median of 2 runs.</caption>
+      <thead><tr><th>condition</th><th>curl</th><th>aria2c -x8</th><th>bigcurl -n8</th><th>bigcurl</th><th>best/curl</th></tr></thead>
+      <tbody><tr><td class="k">100 ms RTT · no loss · 1 GB</td><td>22.37</td><td>21.70</td><td>21.62</td><td>22.19</td><td class="sp">1.0×</td></tr><tr><td class="k">250 ms RTT · no loss · 1 GB</td><td>12.41</td><td>20.67</td><td>16.54</td><td>19.89</td><td class="sp">1.7×</td></tr></tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <p class="kicker">Experiment 2 · real Starlink</p>
+    <h2>The link you actually have</h2>
+    <p class="lede">Desktop on Starlink to two origins. Both paths were verified
+    direct rather than relayed, and add no measurable RTT over the public route.
+    <b>Read the ratios, not the absolute numbers.</b> This suite was remeasured on
+    a night when the link was running at roughly a third to a half of its previous
+    capacity — single-stream curl fell to 31–52% of what the same suite measured on
+    the earlier pass, and every tool fell with it. That is weather and contention on
+    a real shared link, not a change in any downloader, and it is exactly why the
+    netem lab exists alongside this table rather than instead of it. At n=2 per cell
+    on a link this variable, treat small differences between the parallel tools as
+    unresolved.</p>
+  </div>
+  <div class="run">
+    <div class="spec">
+      <span><b>file</b> 96 MB</span><span><b>reps</b> 2 + warm-up, interleaved</span>
+      <span><b>transport</b> tailnet, direct</span>
+    </div>
+    <div class="body"><svg viewBox="0 0 560 256" width="100%" height="auto" role="img" class="chart"><line x1="104.0" y1="18" x2="104.0" y2="246" class="grid"/><text x="104.0" y="13" class="tick" text-anchor="middle">0</text><line x1="168.8" y1="18" x2="168.8" y2="246" class="grid"/><text x="168.8" y="13" class="tick" text-anchor="middle">1</text><line x1="233.7" y1="18" x2="233.7" y2="246" class="grid"/><text x="233.7" y="13" class="tick" text-anchor="middle">2</text><line x1="298.5" y1="18" x2="298.5" y2="246" class="grid"/><text x="298.5" y="13" class="tick" text-anchor="middle">3</text><line x1="363.4" y1="18" x2="363.4" y2="246" class="grid"/><text x="363.4" y="13" class="tick" text-anchor="middle">4</text><line x1="428.2" y1="18" x2="428.2" y2="246" class="grid"/><text x="428.2" y="13" class="tick" text-anchor="middle">5</text><line x1="493.0" y1="18" x2="493.0" y2="246" class="grid"/><text x="493.0" y="13" class="tick" text-anchor="middle">6</text><text x="92" y="13" class="tick" text-anchor="end">MB/s</text><text x="92" y="55.0" class="glab" text-anchor="end" dominant-baseline="middle">Hetzner Oregon, 50 ms</text><rect x="104" y="26" width="79.8" height="13" rx="4" fill="var(--s1)"/><text x="190.8" y="32.5" class="vlab" dominant-baseline="middle">1.23</text><rect x="104" y="41" width="195.2" height="13" rx="4" fill="var(--s2)"/><text x="306.2" y="47.5" class="vlab" dominant-baseline="middle">3.01</text><rect x="104" y="56" width="204.2" height="13" rx="4" fill="var(--s2)"/><text x="315.2" y="62.5" class="vlab" dominant-baseline="middle">3.15</text><rect x="104" y="71" width="192.6" height="13" rx="4" fill="var(--s4)"/><text x="303.6" y="77.5" class="vlab" dominant-baseline="middle">2.97</text><text x="92" y="135.0" class="glab" text-anchor="end" dominant-baseline="middle">DO Santa Clara, 24 ms</text><rect x="104" y="106" width="145.9" height="13" rx="4" fill="var(--s1)"/><text x="256.9" y="112.5" class="vlab" dominant-baseline="middle">2.25</text><rect x="104" y="121" width="260.7" height="13" rx="4" fill="var(--s2)"/><text x="371.7" y="127.5" class="vlab" dominant-baseline="middle">4.02</text><rect x="104" y="136" width="263.9" height="13" rx="4" fill="var(--s2)"/><text x="374.9" y="142.5" class="vlab" dominant-baseline="middle">4.07</text><rect x="104" y="151" width="341.7" height="13" rx="4" fill="var(--s4)"/><text x="452.7" y="157.5" class="vlab" dominant-baseline="middle">5.27</text><text x="92" y="215.0" class="glab" text-anchor="end" dominant-baseline="middle">Oregon, 4 MB/s per conn</text><rect x="104" y="186" width="66.8" height="13" rx="4" fill="var(--s1)"/><text x="177.8" y="192.5" class="vlab" dominant-baseline="middle">1.03</text><rect x="104" y="201" width="260.7" height="13" rx="4" fill="var(--s2)"/><text x="371.7" y="207.5" class="vlab" dominant-baseline="middle">4.02</text><rect x="104" y="216" width="304.1" height="13" rx="4" fill="var(--s2)"/><text x="415.1" y="222.5" class="vlab" dominant-baseline="middle">4.69</text><rect x="104" y="231" width="329.4" height="13" rx="4" fill="var(--s4)"/><text x="440.4" y="237.5" class="vlab" dominant-baseline="middle">5.08</text></svg><div class="legend"><span class="key"><i style="background:var(--s1)"></i>curl</span><span class="key"><i style="background:var(--s2)"></i>aria2c -x8</span><span class="key"><i style="background:var(--s2)"></i>aria2c -x16</span><span class="key"><i style="background:var(--s4)"></i>bigcurl</span></div></div>
+  </div>
+  <div class="tw">
+    <table>
+      <caption>Starlink, median MB/s, every run verified. The third row adds a
+      4 MB/s per-connection cap at the server — curl lands below the cap because the
+      link is the tighter constraint.</caption>
+      <thead><tr><th>path</th><th>curl</th><th>aria2c -x8</th><th>aria2c -x16</th><th>bigcurl -n8</th><th>bigcurl -n16</th><th>bigcurl</th><th>best/curl</th></tr></thead>
+      <tbody><tr><td class="k">Hetzner Oregon · 50 ms · no server limit</td><td>1.23</td><td>3.01</td><td>3.15</td><td>3.42</td><td>4.00</td><td>2.97</td><td class="sp">3.3×</td></tr><tr><td class="k">DO Santa Clara · 24 ms · no server limit</td><td>2.25</td><td>4.02</td><td>4.07</td><td>3.81</td><td>4.28</td><td>5.27</td><td class="sp">2.3×</td></tr><tr><td class="k">Hetzner Oregon · 50 ms · 4 MB/s per connection</td><td>1.03</td><td>4.02</td><td>4.69</td><td>4.00</td><td>4.53</td><td>5.08</td><td class="sp">4.9×</td></tr></tbody>
+    </table>
+  </div>
+  <div class="col">
+    <h3>How many connections?</h3>
+    <p>The same 48 MB file over Starlink at every connection count. Most of the
+    gain arrives by the second connection, the peak is at sixteen, and thirty-two is
+    past it — more streams start competing with each other for the same bottleneck.
+    The adaptive mode opens at thirty-two on this sixteen-core desktop; on this
+    pass's degraded link it landed at the top of the range on two of the three
+    paths and at the bottom on the third, which n=2 does not separate.</p>
+  </div>
+  <div class="run">
+    <div class="spec"><span><b>file</b> 48 MB</span>
+      <span><b>path</b> Starlink → Hetzner Oregon, 50 ms</span>
+      <span><b>reps</b> 2, median</span></div>
+    <div class="body"><svg viewBox="0 0 560 210" width="100%" height="auto" role="img" class="chart"><line x1="44" y1="168.0" x2="538" y2="168.0" class="grid"/><text x="36" y="168.0" class="tick" text-anchor="end" dominant-baseline="middle">0</text><line x1="44" y1="143.7" x2="538" y2="143.7" class="grid"/><text x="36" y="143.7" class="tick" text-anchor="end" dominant-baseline="middle">1</text><line x1="44" y1="119.3" x2="538" y2="119.3" class="grid"/><text x="36" y="119.3" class="tick" text-anchor="end" dominant-baseline="middle">2</text><line x1="44" y1="95.0" x2="538" y2="95.0" class="grid"/><text x="36" y="95.0" class="tick" text-anchor="end" dominant-baseline="middle">3</text><line x1="44" y1="70.7" x2="538" y2="70.7" class="grid"/><text x="36" y="70.7" class="tick" text-anchor="end" dominant-baseline="middle">4</text><line x1="44" y1="46.3" x2="538" y2="46.3" class="grid"/><text x="36" y="46.3" class="tick" text-anchor="end" dominant-baseline="middle">5</text><line x1="44" y1="22.0" x2="538" y2="22.0" class="grid"/><text x="36" y="22.0" class="tick" text-anchor="end" dominant-baseline="middle">6</text><line x1="44" y1="128.8" x2="538" y2="128.8" class="ref"/><text x="538" y="121.8" class="reflab" text-anchor="end">curl, one stream — 1.61</text><polyline points="44.0,141.2 142.8,94.5 241.6,91.6 340.4,77.5 439.2,54.1 538.0,69.0" fill="none" stroke="var(--s4)" stroke-width="2" stroke-linejoin="round"/><circle cx="44.0" cy="141.2" r="4.5" fill="var(--s4)" stroke="var(--surface)" stroke-width="2"/><text x="44.0" y="129.2" class="vlab" text-anchor="middle">1.10</text><text x="44.0" y="186.0" class="tick" text-anchor="middle">1</text><circle cx="142.8" cy="94.5" r="4.5" fill="var(--s4)" stroke="var(--surface)" stroke-width="2"/><text x="142.8" y="82.5" class="vlab" text-anchor="middle">3.02</text><text x="142.8" y="186.0" class="tick" text-anchor="middle">2</text><circle cx="241.6" cy="91.6" r="4.5" fill="var(--s4)" stroke="var(--surface)" stroke-width="2"/><text x="241.6" y="79.6" class="vlab" text-anchor="middle">3.14</text><text x="241.6" y="186.0" class="tick" text-anchor="middle">4</text><circle cx="340.4" cy="77.5" r="4.5" fill="var(--s4)" stroke="var(--surface)" stroke-width="2"/><text x="340.4" y="65.5" class="vlab" text-anchor="middle">3.72</text><text x="340.4" y="186.0" class="tick" text-anchor="middle">8</text><circle cx="439.2" cy="54.1" r="4.5" fill="var(--s4)" stroke="var(--surface)" stroke-width="2"/><text x="439.2" y="42.1" class="vlab" text-anchor="middle">4.68</text><text x="439.2" y="186.0" class="tick" text-anchor="middle">16</text><circle cx="538.0" cy="69.0" r="4.5" fill="var(--s4)" stroke="var(--surface)" stroke-width="2"/><text x="538.0" y="57.0" class="vlab" text-anchor="middle">4.07</text><text x="538.0" y="186.0" class="tick" text-anchor="middle">32</text><text x="291.0" y="202" class="axtitle" text-anchor="middle">connections</text><text x="36" y="13" class="tick" text-anchor="end">MB/s</text></svg></div>
+  </div>
+  <div class="col">
+    <p>An earlier run had a single bigcurl connection beating curl; this one has it
+    well behind (2.33 to 4.45). Two runs, two answers — the honest reading is that
+    one connection over Starlink is a coin toss and the gain from four or more is
+    not.</p>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <p class="kicker">Experiment 3 · datacentre to datacentre</p>
+    <h2>Where bigcurl loses</h2>
+    <p class="lede">DO Santa Clara to Hetzner Oregon: 16 ms, no loss, a one-core
+    client whose network is userspace WireGuard — the machine, not the link, is the
+    bottleneck.</p>
+  </div>
+  <div class="tw">
+    <table>
+      <caption>1 GB file, median MB/s, single-core client. The first row is the
+      unflattering one; the third is a server that both rate-caps each connection
+      and refuses more than eight per IP with 503.</caption>
+      <thead><tr><th>server</th><th>curl</th><th>aria2c -x8</th><th>aria2c -x16</th><th>bigcurl -n8</th><th>bigcurl -n16</th><th>bigcurl</th><th>best/curl</th></tr></thead>
+      <tbody><tr><td class="k">no server limit</td><td>73.38</td><td>72.59</td><td>55.26</td><td>59.65</td><td>41.68</td><td>48.38</td><td class="sp">1.0×</td></tr><tr><td class="k">4 MB/s per connection</td><td>3.99</td><td>31.86</td><td>52.67</td><td>31.27</td><td>52.61</td><td>44.88</td><td class="sp">13.2×</td></tr><tr><td class="k">4 MB/s per connection, 8 connections per IP</td><td>4.00</td><td>31.71</td><td>32.20</td><td>31.55</td><td>27.91</td><td>28.94</td><td class="sp">8.1×</td></tr></tbody>
+    </table>
+  </div>
+  <div class="col">
+    <p>On the uncapped path curl gets 73.38 MB/s, aria2c
+    72.59 and bigcurl 48.38 in adaptive mode
+    (59.65 pinned at eight). The box runs at 85–90 % CPU during
+    every one of these — WireGuard is eating the core — and each bigcurl connection
+    is a process. Eight raw curls writing to their own files reach 81.6 MB/s here,
+    <span class="mono">curl | cat</span> reaches 73, and a minimal perl reader with
+    bigcurl's pipe pattern reaches 62: the remaining gap is the cost of running any
+    scheduler at all on a machine with nothing to spare. A Linux-only path that has
+    <span class="mono">dd</span> do the copying was measured at 71 MB/s and is the
+    obvious next step; it is not implemented.</p>
+    <p>Against a per-connection cap the same box gets 44.88 MB/s from
+    bigcurl in adaptive mode to aria2c's 52.67 — the adaptive pool starts
+    at four connections on one core and has to grow while the download is already under
+    way; pinned at sixteen it reaches 52.61. Against a cap of eight
+    connections per IP, where the first report's tuner oscillated at 18, it finds the
+    cap and sits on it: 31.55 against a theoretical ceiling of 32, with
+    aria2c at 32.20.</p>
+  </div>
+  <div class="col">
+    <h3>What the first pass got wrong about connection reuse</h3>
+    <p>The first report blamed bigcurl's loss-cell deficit on connection reuse:
+    aria2c keeps persistent connections and bigcurl spawns a fresh curl per range,
+    paying a handshake and a cold congestion window each time. It named
+    <span class="mono">curl --next</span> — several ranges over one connection in a
+    single process — as the biggest fix left. That was tested and it is not so:
+    eight curls each fetching four 1 MB ranges over one kept-alive connection
+    scored 3.02 MB/s at 100 ms and 0.5 % loss, against 3.10 for eight separate
+    single-range curls. Reuse bought nothing. What bought 2× was request
+    <em>granularity</em> handed out dynamically, which is the change that shipped.
+    <span class="mono">--next</span> still has a use — a static chain of small
+    pieces on a clean high-RTT link where handshakes dominate — but it is not the
+    lever it looked like.</p>
+  </div>
+  <div class="tw">
+    <table>
+      <caption>Loopback on a 16-core box, no network limit — pure orchestration cost.
+      CPU is child user+system time per GB, median of 3.</caption>
+      <thead><tr><th>tool</th><th>MB/s</th><th>CPU s/GB</th></tr></thead>
+      <tbody><tr><td class="k">curl</td><td>1327</td><td>0.76</td></tr><tr><td class="k">aria2c -x8</td><td>767</td><td>1.14</td></tr><tr><td class="k">axel -n8</td><td>897</td><td>1.04</td></tr><tr><td class="k">bigcurl -n8</td><td>1480</td><td>1.54</td></tr><tr><td class="k">bigcurl</td><td>1449</td><td>1.80</td></tr></tbody>
+    </table>
+  </div>
+  <div class="col">
+    <p>With CPU to spare the pipe design is not the slow one: on loopback bigcurl
+    now beats curl (1449 vs 1326 MB/s) and doubles aria2c. What it costs is CPU —
+    1.86 seconds per gigabyte against curl's 0.77 — which is exactly the resource
+    the one-core box did not have.</p>
+  </div>
+</section>
+
+<section class="col">
+  <p class="kicker">Experiment 4 · behaviour</p>
+  <h2>Does it do the right thing</h2>
+  <p class="lede">Speed is only half of it. Against an origin configured to
+  misbehave, on both hosts:</p>
+  <ul class="checks">
+    <li><span class="ok">pass</span> server with no Range support → falls back to a
+      single stream, bytes intact</li>
+    <li><span class="ok">pass</span> server capping connections per IP at 4, asked
+      for 24 → backs off, completes, bytes intact</li>
+    <li><span class="ok">pass</span> missing file → exit 4, no output file left behind</li>
+    <li><span class="ok">pass</span> ten consecutive <span class="mono">kill -9</span>
+      mid-transfer → resumes each time, final sha256 correct</li>
+    <li><span class="ok">pass</span> 401 without credentials → exit 4; with
+      <span class="mono">-u</span> → completes</li>
+  </ul>
+  <p>The one place it is still beaten fairly: 200 files of 1 MB each take
+  <span class="mono">xargs -P8 curl</span> 0.20 s and bigcurl 0.36 s (down from
+  0.75 during this pass). Probes are batched and requests are never split below 1
+  MB now; what remains is one curl process per file plus bookkeeping the shell loop
+  does not do. For a directory of small files, use the shell loop.</p>
+</section>
+
+<section>
+  <div class="col">
+    <p class="kicker">Experiment 5 · ASK 4, does HTTP/2 multiplexing pay</p>
+    <h2>One connection, many streams: not worth building</h2>
+    <p class="lede">ASK 4 proposed HTTP/2 multiplexing — one connection, many
+    streams, chosen by the tuner on clean high-RTT links only — on the theory
+    that a shared congestion window would make it worse under loss. That was
+    unmeasured before this pass. <strong>Instrument, named plainly:</strong> this
+    is curl's own HTTP/1.1 (8 parallel connections) against curl's own HTTP/2
+    (one connection, 8 ranges multiplexed via <span class="mono">-Z
+    --http2-prior-knowledge</span>) — <em>not</em> bigcurl, which was not
+    modified for this measurement. RTT and loss come from the same
+    <span class="mono">netem</span> lab as Experiment 1, not Starlink or the
+    real internet.</p>
+  </div>
+  <div class="run">
+    <div class="spec">
+      <span><b>file</b> 32 MB</span><span><b>streams/conns</b> 8</span>
+      <span><b>loss</b> per direction</span><span><b>reps</b> 3, median</span>
+      <span><b>origin</b> h2c, cleartext prior-knowledge, port 8085</span>
+    </div>
+    <div class="body">
+      <div class="tw">
+        <table>
+          <caption>netem RTT × loss grid, 32 MB file, 3 interleaved reps, every
+          run sha256-verified against a hash computed fresh on the host
+          (<span class="mono">h2-vs-h1-lab.csv</span>). This file is small
+          enough that the clean-RTT cells are mostly TCP slow start — see the
+          steady-state table below for the case that matters most. A cell
+          marked "did not finish" hit its time cap on every rep and is a
+          failure, not a slow measurement.</caption>
+          <thead><tr><th>RTT</th><th>loss</th><th>H1 x8 conn (MB/s)</th>
+          <th>H2 x8 stream (MB/s)</th><th>H2/H1</th></tr></thead>
+          <tbody><tr><td class="k">0 ms</td><td class="k">—</td><td>22.30</td><td>22.15</td><td class="sp">0.99×</td></tr><tr><td class="k">25 ms</td><td class="k">—</td><td>20.87</td><td>19.57</td><td class="sp">0.94×</td></tr><tr class="win"><td class="k">100 ms</td><td class="k">—</td><td>11.90</td><td>13.53</td><td class="sp">1.14×</td></tr><tr><td class="k">250 ms</td><td class="k">—</td><td>7.05</td><td>6.56</td><td class="sp">0.93×</td></tr><tr><td class="k">0 ms</td><td class="k">0.1%</td><td>22.18</td><td>22.18</td><td class="sp">1.00×</td></tr><tr><td class="k">25 ms</td><td class="k">0.1%</td><td>19.17</td><td>19.53</td><td class="sp">1.02×</td></tr><tr class="win"><td class="k">100 ms</td><td class="k">0.1%</td><td>9.15</td><td>12.82</td><td class="sp">1.40×</td></tr><tr><td class="k">250 ms</td><td class="k">0.1%</td><td>4.13</td><td>0.76</td><td class="sp">0.18×</td></tr><tr><td class="k">0 ms</td><td class="k">0.5%</td><td>22.21</td><td>22.06</td><td class="sp">0.99×</td></tr><tr><td class="k">25 ms</td><td class="k">0.5%</td><td>8.92</td><td>2.87</td><td class="sp">0.32×</td></tr><tr><td class="k">100 ms</td><td class="k">0.5%</td><td>2.14</td><td>0.44</td><td class="sp">0.21×</td></tr><tr><td class="k">250 ms</td><td class="k">0.5%</td><td>1.19</td><td>0.36</td><td class="sp"><span class="dnf">H2 did not finish (0/3 verified)</span></td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div class="col">
+    <p>(measured) At 100 ms clean, H2 wins by 14%; at 100 ms/0.1% loss it wins
+    by 40%. Under any real loss beyond that, H1 pulls ahead — by 3 to 5× at
+    0.5% loss, and outright at 250 ms/0.5% loss, where every H2 rep hit the
+    90 s cap incomplete while H1 completed all of them. The 100 ms wins sit in
+    a 32 MB file that is mostly slow start on both arms (the same caveat
+    Experiment 1 makes about its own clean-RTT rows); the steady-state retest
+    below is what decides whether that win survives past slow start.</p>
+  </div>
+  <div class="tw">
+    <table>
+      <caption>Steady state: 1 GB file, clean link only (0% loss), 2 reps,
+      every run sha256-verified (<span class="mono">h2-vs-h1-steady.csv</span>).
+      This isolates exactly the case ASK 4's premise is about — clean,
+      high-RTT, past slow start.</caption>
+      <thead><tr><th>RTT</th><th>H1 x8 conn (MB/s)</th>
+      <th>H2 x8 stream (MB/s)</th><th>H2/H1</th></tr></thead>
+      <tbody><tr><td class="k">100 ms</td><td>22.43</td><td>22.27</td><td class="sp">0.99×</td></tr><tr><td class="k">250 ms</td><td>21.70</td><td>12.34</td><td class="sp">0.57×</td></tr></tbody>
+    </table>
+  </div>
+  <div class="col">
+    <p>(measured) At 100 ms, past slow start, H1 and H2 are tied. At 250 ms —
+    the one RTT large and clean enough to reach steady state — H2 is
+    1.8× <em>slower</em>, reproduced tightly across both reps
+    (47.2 s vs 83.0 s, twice). That is the opposite of the 100 ms/32 MB grid
+    row above winning by 14–40%: the short-file win does not survive to
+    steady state, which is the signature of a slow-start artefact rather than
+    a real multiplexing advantage. (assumed mechanism, not chased further)
+    curl's HTTP/2 flow-control window is shared across all 8 streams on one
+    connection; as RTT grows, the bandwidth-delay product likely outgrows that
+    shared window before it outgrows 8 independent H1 congestion windows.
+    That would be a second, RTT-driven failure mode distinct from the
+    loss-driven shared-congestion-window one ASK 4 named — confirming it would
+    need packet captures, which this pass did not do.</p>
+    <p><strong>Verdict: do not build ASK 4.</strong> There is no regime
+    measured here where H2 wins by a margin worth a day of implementation —
+    tied or slower on every clean-link point large enough to reach steady
+    state, and increasingly worse under loss up to outright failure to finish.
+    Full method, the <span class="mono">--max-time</span>-per-<span
+    class="mono">--next</span> bug this measurement caught and fixed, and the
+    complete verdict are in <span class="mono">REPRODUCE.md</span>.</p>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <p class="kicker">Experiment 6 · ASK 2, is perl worth taking out of the byte path</p>
+    <h2>Perl costs real CPU, but not the 45-vs-71 gap the roadmap assumed</h2>
+    <p class="lede">ASK 2 proposed removing perl from bigcurl's byte path,
+    citing a droplet ceiling of curl 77 / dd 71 / perl 45 MB/s. That 45 was
+    measured against whatever pool size the tuner happened to pick, and on
+    this CPU-bound one-core droplet the tuner overshoots badly — pinning
+    connection count, not the tuner's choice, is what this section measures
+    perl's cost against.</p>
+  </div>
+  <div class="col">
+    <h3>The old 45 MB/s number was the tuner, not perl</h3>
+    <p>(measured, historical — <span class="mono">ask1-parallel</span> merge
+    commit, one-core droplet, 1 GB, 3 reps median MB/s; not reproduced from a
+    CSV committed to this pass, see <span class="mono">REPRODUCE.md</span> for
+    the source) Pinned ladder on the same CPU-bound droplet: curl 71.9, auto
+    41.9, n2 61.9, n4 62.0, n8 57.7, n16 43.1, n20 38.4 — decreasing from n4
+    on (n2's 61.9 sits fractionally below n4's 62.0, a 0.16% inversion that is
+    noise, not a real optimum below n4). Auto's 41.9 falls between the pinned
+    n16 and n20 figures, so pinning bigcurl to the size the tuner actually
+    picks reproduces the old 45-ish number — the tuner's <em>choice</em> of
+    pool size accounts for the gap, not some separate cost that appears only
+    at high connection counts. <span class="mono">tuner-knee.pl</span>, new
+    this pass, reproduces the shape of that overshoot deterministically and
+    locally (pool trace climbing to a ceiling and only slowly correcting back
+    down) so the mechanism can be checked without the droplet; its own header
+    is explicit that its magnitudes are not hardware numbers, only the
+    direction is transferable, which is why the ladder above is quoted from
+    the droplet measurement and not from that script.</p>
+  </div>
+  <div class="run">
+    <div class="spec">
+      <span><b>file</b> 1 GB</span><span><b>client</b> DO droplet, 1 core</span>
+      <span><b>origin</b> Hetzner, over tailnet</span>
+      <span><b>N</b> 1, 2, 4 — pinned, tuner disabled</span>
+    </div>
+    <div class="body">
+      <p style="margin:0 0 1rem;color:var(--ink-2);font-size:.94rem">
+      <span class="mono">bigcurl -n N</span> is bigcurl itself, pinned.
+      <span class="mono">curlo-N</span> and <span class="mono">curldd-N</span>
+      (new this pass, <span class="mono">byteproxy.sh</span>) are <em>not</em>
+      bigcurl — ceiling instruments only, with zero perl in the byte path: N
+      curl processes fetching equal ranges, joined with <span
+      class="mono">cat</span> (<span class="mono">curlo</span>) or streamed
+      straight into place with <span class="mono">dd</span> (<span
+      class="mono">curldd</span>). Both were verified byte-correct before
+      touching real hardware.</p>
+      <div class="tw">
+        <table>
+          <caption>Throughput, median MB/s, matched N
+          (<span class="mono">ask2-droplet.csv</span>).</caption>
+          <thead><tr><th>N</th><th>curl</th><th>bigcurl -n N</th>
+          <th>curlo-N</th><th>curldd-N</th></tr></thead>
+          <tbody><tr><td class="k">N=1</td><td>81.23</td><td>57.17</td><td>57.31</td><td>65.78</td></tr><tr><td class="k">N=2</td><td>77.88</td><td>58.84</td><td>62.78</td><td>65.58</td></tr><tr><td class="k">N=4</td><td>69.63</td><td>57.64</td><td>57.77</td><td>74.18</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div class="col">
+    <p>(measured) <strong>Noise floor, not assumed:</strong> curl alone — a
+    single stream, N-independent by construction — ranged 64.1 to
+    81.8 MB/s across all 9 reps, median 74.4,
+    a spread of 24% of its own median. Any wall-clock difference
+    smaller than that is not distinguishable from this host+link's noise at
+    3–6 reps per cell, which is why CPU-seconds (below) carries more of this
+    section's weight than the throughput table above.</p>
+  </div>
+  <div class="tw">
+    <table>
+      <caption>CPU-seconds per GB transferred — cpu_user + cpu_sys, summed
+      across the parent and every reaped child process, median of 3–6 reps.
+      Every transfer in this table is exactly 1 GiB, so this is directly
+      cpu_user+cpu_sys per run.</caption>
+      <thead><tr><th>N</th><th>curl</th><th>bigcurl -n N</th>
+      <th>curlo-N</th><th>curldd-N</th></tr></thead>
+      <tbody><tr><td class="k">N=1</td><td>2.27</td><td>3.78</td><td>4.13</td><td>3.40</td></tr><tr><td class="k">N=2</td><td>2.29</td><td>4.32</td><td>4.44</td><td>3.62</td></tr><tr><td class="k">N=4</td><td>2.45</td><td>5.06</td><td>4.57</td><td>3.67</td></tr></tbody>
+    </table>
+  </div>
+  <div class="tw">
+    <table>
+      <caption>Perl's cost vs. the no-perl ceiling (curldd-N), matched N, both
+      metrics. Individual-rep CPU ranges overlap between bigcurl-N and
+      curldd-N at N=1 and N=2 (one contention event hit both instruments'
+      N=2 reps at once) but do not overlap at N=4 — N=4 is the only cell
+      where "perl costs more CPU" is established beyond noise rather than
+      just in the median, and it is also the pool size the ASK-1 ladder found
+      near-optimal on this host.</caption>
+      <thead><tr><th>N</th><th>wall-clock cost</th><th>CPU cost</th></tr></thead>
+      <tbody><tr><td class="k">N=1</td><td>13.1%</td><td>11.2%</td></tr><tr><td class="k">N=2</td><td>10.3%</td><td>19.2%</td></tr><tr><td class="k">N=4</td><td>22.3%</td><td>37.9%</td></tr></tbody>
+    </table>
+  </div>
+  <div class="col">
+    <p>(measured) Perl's overhead <strong>grows with N</strong> rather than
+    sitting at a fixed percentage, on both metrics. <span class="mono">curl
+    -o</span> per piece (<span class="mono">curlo-N</span>, candidate 1) is a
+    wash with bigcurl at every N on throughput and costs <em>more</em> CPU
+    than bigcurl at N=1 and N=2 — reject it regardless of how the dd question
+    resolves. <span class="mono">curl | dd</span> (<span
+    class="mono">curldd-N</span>, candidate 2) shows a real, directionally
+    consistent gap that grows with N, but lands in the decision rule's grey
+    zone (≲15% close / ≳40% build) rather than clearing the build bar: below
+    it on wall-clock at every N, at-or-near it only on CPU at N=4. It also has
+    a portability hole against the ask's own hard requirement — <span
+    class="mono">dd seek=</span> needs GNU's byte-offset seeking, which BSD/
+    macOS <span class="mono">dd</span> does not have. (measured, attempted
+    control, inconclusive) A CPU-abundant control on Hetzner loopback (16
+    cores, N=4) finished in under a second per run — too fast for per-byte
+    cost to dominate over process fork/exec cost — and showed curldd-4 costing
+    <em>more</em> CPU than bigcurl-4 there (2.97 vs
+    1.53 s/GiB), the opposite direction from the droplet, for a
+    reason unrelated to the ask (curldd spawns twice the processes bigcurl
+    does at the same N). Reported as a failed control, not as evidence the
+    effect reverses on abundant CPU.</p>
+    <p><strong>Verdict: do not build ASK 2 as specified.</strong> Candidate 1
+    is dead on this data. Candidate 2 shows a real, growing effect but neither
+    clears the build bar nor satisfies the ask's own cross-platform
+    requirement as measured. The CPU numbers do argue perl's
+    <span class="mono">sysread</span>/<span class="mono">syswrite</span> loop
+    is a real, growing cost worth shrinking directly (larger read chunks,
+    fewer wakeups) before spending a day removing it entirely — a smaller,
+    fully portable change, not scoped or measured here. Full method and the
+    byte-correctness verification are in <span class="mono">REPRODUCE.md</span>.</p>
+  </div>
+</section>
+
+<section class="col">
+  <p class="kicker">Outcomes</p>
+  <h2>Five asks, two builds, three rejections</h2>
+  <p class="lede">Three of the five items on the roadmap were closed by deciding
+  <em>not</em> to build them. Those rejections are the most valuable thing the
+  measurement produced, so they are recorded here as findings with their numbers,
+  not left as gaps in a changelog.</p>
+
+  <div class="instr">
+    <b>Name the instrument.</b> Two of the four links below are models, and they
+    do not agree with each other. <span class="mono">netem</span> applies loss
+    independently per connection on an otherwise idle 200 Mbit path — it is a
+    clean model of a lossy link, and it is <em>not</em> Starlink, which is a
+    shared, bandwidth-capped, weather-dependent real one. Loopback is not a
+    network at all: it measures orchestration cost with the link removed. Where
+    the model and the real link disagree, both numbers are given.
+  </div>
+
+  <div class="asks">
+    <div class="ask">
+      <div class="h"><b>ASK 1 — one curl per file, many ranges</b><span class="t no">rejected</span></div>
+      <p><span class="mono">curl --range</span> is a global option, not a
+      per-transfer one. With one <span class="mono">--range</span>/<span class="mono">-o</span>
+      pair per piece, the last range silently applies to every transfer: 16 pieces
+      produced 16 files, each exactly 1 MB, summing to the correct total size, and
+      <em>every one of them contained the same block</em>. Correct byte counts,
+      wrong bytes — a length check passes and the file is corrupt.</p>
+      <p>Confirmed with and without <span class="mono">-Z</span>, via a
+      <span class="mono">-K</span> config file, and independently against macOS
+      curl 8.7.1. The correct <span class="mono">--next</span> form works but is a
+      wash at matched connection count (63.9/54.5 vs 64.5/55.4 MB/s) while costing
+      the block bitmap and byte-exact progress reporting.</p>
+      <p class="prov">(inherited) — no CSV in this tree; figures carried from the
+      pass that measured them.</p>
+    </div>
+
+    <div class="ask">
+      <div class="h"><b>ASK 2 — take perl out of the byte path</b><span class="t hold">do not build</span></div>
+      <p>The premise did not survive measurement. curl's 77 MB/s and dd's 71 MB/s
+      reproduce; <b>the 45 MB/s attributed to perl does not</b>, at any matched
+      connection count — <span class="mono">bigcurl -n N</span> measured
+      57.2–58.8 MB/s at N=1/2/4, against
+      65.6–74.2 for the no-perl ceiling. The cited 45 was the
+      tuner's auto-picked pool size, not perl's cost at a sane N.</p>
+      <p>perl is not free: it costs 11.2% / 19.2% / 37.9% more
+      CPU than <span class="mono">curl | dd</span> at N=1/2/4, and that cost grows
+      with N. But it separates from noise only at N=4, and the replacement needs
+      GNU-only <span class="mono">oflag=seek_bytes</span> — failing the ask's own
+      Linux-and-macOS requirement. <span class="mono">curl -o</span> per piece is a
+      wash or worse.</p>
+      <p class="prov">(measured) — recomputed from <span class="mono">ask2-droplet.csv</span>.</p>
+    </div>
+
+    <div class="ask">
+      <div class="h"><b>ASK 3 — hedge the tail</b><span class="t yes">landed, off by default</span></div>
+      <p>The mechanism works and helps where loss is the problem: <b>+32%</b> at
+      250 ms/0.5% loss, <b>+23%</b> at 100 ms/0.5%, <b>+43%</b> against a
+      connection-capped origin, with complete rank separation — every hedged rep
+      beat every unhedged one.</p>
+      <p>It costs <b>−31%</b> on Starlink (median 4.01 s against 3.06 s), which is
+      the link the ask itself names as the measurement to use. A duplicate on a
+      fresh connection routes around an isolated straggler under netem's
+      per-connection loss model; on a real shared pipe it just competes with the
+      original for the same capacity. Ships as
+      <span class="mono">$HEDGE_TAIL_BLOCKS = 0</span>;
+      <span class="mono">--hedge N</span> enables it. Turning it on by default
+      needs a runtime signal to tell the two regimes apart — see below.</p>
+      <p class="prov">(inherited) — figures recorded in
+      <span class="mono">cli/bigcurl</span>'s own header, not as a CSV in this tree.
+      The default was re-read from the shipped build (measured).</p>
+    </div>
+
+    <div class="ask">
+      <div class="h"><b>ASK 4 — one connection, many H2 streams</b><span class="t no">rejected</span></div>
+      <p>At steady state on a clean 1 GB transfer, H2 ties H1 at 100 ms RTT
+      (22.43 vs 22.27 MB/s) and is <b>1.76× slower</b> at
+      250 ms (21.70 vs 12.34). Under loss it is
+      3.1–5.4× worse, and at 250 ms/0.5% all three H2 runs hit
+      the 90 s cap and are recorded 0/3 verified — a failure, not a slow
+      success.</p>
+      <p>The honest other half: on the shorter 32 MB grid H2 <em>does</em> win at
+      100 ms — 1.14× at no loss and 1.40× at 0.1%. That
+      advantage does not survive to steady state, which makes it a slow-start
+      artefact of the short transfer rather than a property of multiplexing. The
+      data does not support "H2 always loses"; it supports "H2's win is confined to
+      transfers short enough to be dominated by slow start".</p>
+      <p class="prov">(measured) — recomputed from
+      <span class="mono">h2-vs-h1-lab.csv</span> and
+      <span class="mono">h2-vs-h1-steady.csv</span>.</p>
+    </div>
+
+    <div class="ask">
+      <div class="h"><b>ASK 5 — beat the shell loop on many small files</b><span class="t yes">landed, target exceeded</span></div>
+      <p>The 200-file case went 0.371 s → 0.276 s → <b>0.11 s</b> against a
+      0.20 s bar set by <span class="mono">xargs -P8 curl</span>. On this build and
+      this host the shell loop measured 0.26 s for the same work, so bigcurl
+      is now the faster of the two rather than merely close to it.</p>
+      <p class="prov">(measured) — remeasured on this build; the two intermediate
+      figures are inherited from the passes that produced them.</p>
+    </div>
+
+    <div class="ask">
+      <div class="h"><b>Future work — a regime discriminator for the tuner</b><span class="t hold">not built</span></div>
+      <p>Parallel speedup separates a CPU- or contention-bound regime from a
+      link-bound one cleanly. The CPU-bound droplet reads <b>1.25</b> against
+      <b>3.74–5.88</b> in every other real cell — a 3× gap, with a
+      threshold of 2.0 pre-registered before measuring and landing inside
+      it. The clean cell replicates across passes to 0.12%. The synthetic
+      shared-cap control also reads low (1.05), which is what a contention
+      model should do and is a confirmation of the axis rather than a counterexample.
+      This signal is <em>not</em> in bigcurl's <span class="mono">-l</span> trace
+      today.</p>
+      <p>The other half did not resolve, and is reported rather than tuned into
+      shape. The straggler ratio that would decide whether to hedge separated
+      39% on one pass and 14% on the next, and a clean, non-lossy cell
+      read 1.54 on the second pass — across the 1.5 line
+      pre-registered for it, i.e. classified as "hedge" when it should not have
+      been. That threshold was left where it was registered and the result called
+      ambiguous, rather than moved to make the table separate.</p>
+      <p class="prov">(measured) — recomputed from
+      <span class="mono">regime-signal-probe*.csv</span> and
+      <span class="mono">regime-controls.csv</span>.</p>
+    </div>
+  </div>
+</section>
+
+<section class="col">
+  <p class="kicker">Findings</p>
+  <h2>Thirteen defects the benchmarks found</h2>
+  <p class="lede">Every one of these was invisible to the test suite and to casual
+  use. They only appeared under measurement — and half of them were introduced by
+  fixes to the other half, which is the argument for measuring again after every
+  change.</p>
+  <div class="defects">
+    <div class="defect"><div class="d"><b>Range requests shrank as the pool filled</b>
+      The span cap subtracted in-flight blocks, and the pool fills one worker at a
+      time, so each successive worker got a smaller share (4, 3, 3, 2, 2…).</div>
+      <div class="g">+53 % @ 250 ms</div></div>
+    <div class="defect"><div class="d"><b>Big spans handed the tail to the slowest connection</b>
+      Replaced by many connections and small requests sized from the measured rate,
+      plus work stealing from any donor with more than three seconds left.</div>
+      <div class="g">2× under loss</div></div>
+    <div class="defect"><div class="d"><b>The parent blocked on every curl exit</b>
+      <span class="mono">close()</span> on an <span class="mono">open('-|')</span>
+      pipe waits for the child. Hand-made pipe, non-blocking reap.</div>
+      <div class="g">+21 % loopback</div></div>
+    <div class="defect"><div class="d"><b>Opening spans persisted for two seconds</b>
+      Request size waited for the tuner's first window; on a fast link that was 27
+      processes for one 256 MB file. Now fed from the first completed request.</div>
+      <div class="g">fast links</div></div>
+    <div class="defect"><div class="d"><b>The tuner shrank on ordinary noise</b>
+      A single 2-second window below the best ever seen shrank the pool. A drop now
+      has to persist two windows; growth past 16 needs two better ones.</div>
+      <div class="g">+9 % to +51 %</div></div>
+    <div class="defect"><div class="d"><b>Tuner oscillated into a connection cap</b>
+      A 503 shrank the pool; the next good window grew it straight back into the cap.
+      Now each refusal takes exactly one connection off the pool as it arrives, that
+      size is a ceiling for the rest of the download, and refused blocks go straight
+      back on the queue instead of into exponential backoff.</div>
+      <div class="g">18 → 30.6 MB/s</div></div>
+    <div class="defect"><div class="d"><b>A churning pool never counted as saturated</b>
+      Growth needed every slot busy at the sampling instant; with requests turning
+      over, one was always between requests, so the pool sat at its opening size for
+      the whole download.</div>
+      <div class="g">+10 % rate-capped</div></div>
+    <div class="defect"><div class="d"><b><span class="mono">-n</span> was a pin, not a ceiling</b>
+      Pinned at 16 against a server allowing 8, bigcurl retried into 503s until the
+      download failed. A server complaint now lowers the pool regardless.</div>
+      <div class="g fix">correctness</div></div>
+    <div class="defect"><div class="d"><b>503 treated as fatal</b>
+      The classifier said "4xx except 408/429" but the condition caught 5xx too.</div>
+      <div class="g fix">correctness</div></div>
+    <div class="defect"><div class="d"><b>Crash under rapid connection churn</b>
+      Retiring a worker rebuilt <span class="mono">@workers</span> while a
+      <span class="mono">foreach</span> was aliasing it.</div>
+      <div class="g fix">correctness</div></div>
+    <div class="defect"><div class="d"><b>Small files split four ways</b>
+      The per-file fair-share cap carved 1 MB files into 256 KB requests: 808
+      processes for 200 files. Requests are floored at 1 MB.</div>
+      <div class="g">0.75 → 0.34 s</div></div>
+    <div class="defect"><div class="d"><b>One HEAD probe process per file</b>
+      Now batched 25 URLs per curl over one connection, with a fallback for curl
+      older than 7.84.</div>
+      <div class="g">200 → 8 probes</div></div>
+    <div class="defect"><div class="d"><b>Elapsed time excluded the probe phase</b>
+      The event loop reset the start timestamp.</div>
+      <div class="g fix">reporting</div></div>
+  </div>
+  <p>The test suite grew from 44 to 45 cases; the new one pins 503 as transient.</p>
+</section>
+
+<section class="col">
+  <p class="kicker">Method</p>
+  <h2>How to reproduce this</h2>
+  <p>The harness and every raw CSV behind these figures live in
+  <span class="mono">onesies/bench/bigcurl/</span>. Provision an origin, stand up the
+  controlled network, sweep it:</p>
+  <pre>ssh root@origin bash setup-server.sh      # nginx on 5 ports + fixtures + tools
+lab.sh up                                 # veth pair into a netns
+lab.sh set 100 0.5 200mbit                # RTT ms, loss %/direction, rate
+grid.sh                                   # sweep RTT x loss, write CSV
+analyze.py                                # median tables, speedup vs curl</pre>
+  <p>Four rules keep the numbers honest, and each of them cost something to learn:</p>
+  <ul class="checks">
+    <li><span class="ok">1</span> verify every run — sha256 against a reference, so a
+      fast wrong answer scores zero</li>
+    <li><span class="ok">2</span> delete the output between runs, or bigcurl correctly
+      skips a complete file and posts an absurd time</li>
+    <li><span class="ok">3</span> interleave repetitions across tools; batching charges
+      one tool for whatever the link was doing that minute</li>
+    <li><span class="ok">4</span> never run two suites against one box — one overlap
+      produced numbers 2.3× off, and they looked perfectly plausible</li>
+  </ul>
+  <p>The five origin ports model baseline, per-connection rate cap, per-IP connection
+  cap, no Range support, and both caps together. Both cloud hosts block inbound ports
+  at the provider, so client traffic runs over the tailnet; both paths were confirmed
+  direct, and the tailnet RTT matched the public RTT to within 0.2 ms.</p>
+</section>
+
+<footer class="col">
+  <p>Environment — clients: macOS 26.2 (curl 8.7.1, aria2 1.37.0, perl 5.34) and
+  Ubuntu 24.04 (curl 8.5.0, aria2 1.37.0, axel 2.17.13). Origins: nginx 1.24.0 on
+  Ubuntu 24.04, CUBIC, fq_codel, tcp_rmem max 6 MB. Hetzner Hillsboro OR, 16 core /
+  30 GB. DigitalOcean Santa Clara, 1 core / 1 GB. All figures are medians; warm-up
+  runs discarded.</p>
+</footer>
+</div>
